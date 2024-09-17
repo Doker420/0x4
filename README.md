@@ -26,11 +26,11 @@ Looking at where the event provider registration handle EtwThreatIntProvRegHandl
 Thanks for reading and until another time :)
 
 Links:
-https://www.pentesteracademy.com/
-https://repo.zenk-security.com/Reversing%20.%20cracking/Reversing%20-%20Secrets%20Of%20Reverse%20Engineering%20(2005).pdf
-https://malwareunicorn.org/workshops/re101.html#0
-https://0xresetti.github.io/reversing.html
-https://guyinatuxedo.github.io/
-https://p.ost2.fyi/courses/course-v1:OpenSecurityTraining2+Arch1001_x86-64_Asm+2021_v1/about
-https://class.malware.re/
+`https://www.pentesteracademy.com/`
+`https://repo.zenk-security.com/Reversing%20.%20cracking/Reversing%20-%20Secrets%20Of%20Reverse%20Engineering%20(2005).pdf`
+`https://malwareunicorn.org/workshops/re101.html#0`
+`https://0xresetti.github.io/reversing.html`
+`https://guyinatuxedo.github.io/`
+`https://p.ost2.fyi/courses/course-v1:OpenSecurityTraining2+Arch1001_x86-64_Asm+2021_v1/about`
+`https://class.malware.re/`
 
