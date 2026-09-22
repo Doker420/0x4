@@ -1,0 +1,9 @@
+aiogram==3.13.1
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+aiohttp==3.9.5
+python-dotenv==1.0.1
+pydantic==2.9.2
+# bip-utils removed: pure-Python BIP32 public derivation in core/bip32.py
+# (avoids a C-extension build and any private-key-capable code path)
+base58==2.1.1
