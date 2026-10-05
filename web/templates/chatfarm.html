@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block title %}Чат · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">Ответы и активность</p>
+    <h1>Чат-агенты</h1>
+    <p class="subtle">Выберите обычные ответы участникам или последовательный сценарий, в котором подключённые аккаунты общаются по заданной теме.</p>
+  </div>
+  <div class="actions">
+    <span id="farm_status_badge" class="badge badge-pending">Проверяю статус…</span>
+    <button id="btn_stop_farm" class="danger" type="button" onclick="stopFarm()" hidden>■ Остановить</button>
+  </div>
+</section>
+
+<div class="grid" style="grid-template-columns:minmax(300px,.9fr) minmax(350px,1.1fr)">
+  <section class="card">
+    <div class="card-head"><div><h2>Параметры запуска</h2><p class="subtle">Используются включённые Telegram-сессии.</p></div><span class="pill badge-ok">reply-to включён</span></div>
+    {% if accounts %}
+    <form id="farm_form" onsubmit="startFarm(event)">
+      <div class="field">
+        <label for="target_id_input">Chat ID</label>
+        <input id="target_id_input" name="target_id" type="number" placeholder="Например: -1001234567890" required>
+        <span class="help">ID группы/супергруппы, например начинается с <code>-100</code>.</span>
+      </div>
+      <div class="field">
+        <label for="topic_id_input">ID темы форума <span class="subtle">(необязательно)</span></label>
+        <input id="topic_id_input" name="topic_id" type="number" value="0" placeholder="0 — весь чат">
+        <span class="help">Если это группа с темами — укажите ID темы, иначе оставьте 0.</span>
+      </div>
+      <div class="field">
+        <label for="scenario_mode">Режим работы аккаунтов</label>
+        <select id="scenario_mode" name="scenario_mode" onchange="updateScenarioForm()">
+          <option value="reactive">Ответы на сообщения участников</option>
+          <option value="discussion">Диалог аккаунтов по общей теме</option>
+          <option value="roulette">Рулетка — случайные числа</option>
+        </select>
+        <span class="help">В сценарном режиме аккаунты говорят по очереди и связывают реплики ответами друг на друга.</span>
+      </div>
+      <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
+        <div class="notice warning" style="margin-bottom:12px">Сообщения будут отправлены в Telegram от выбранных аккаунтов. Используйте сценарии только в группе, которой управляете, и предупредите участников об автоматизации.</div>
+        <div class="field">
+          <label for="scenario_topic">Общая тема, вопрос или правила игры</label>
+          <textarea id="scenario_topic" name="scenario_topic" rows="4" maxlength="2000" placeholder="Например: Рулетка началась — выберите число от 0 до 36. Участвуют только числа, опубликованные в чате. Или задайте вопрос для обсуждения."></textarea>
+          <span class="help">Для новостной дискуссии вставьте заголовок/вопрос. Актуальные факты доступны только при установленном DeepSeek bridge и включённом веб-поиске.</span>
+        </div>
+        <div id="roulette_fields" class="field" hidden>
+          <label for="roulette_numbers">Числа для случайного выбора</label>
+          <input id="roulette_numbers" name="roulette_numbers" value="0-36" maxlength="256" placeholder="0-36 или 2, 7, 18">
+          <span class="help">Можно указать диапазон или список; аккаунты публикуют только числа.</span>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label for="scenario_turns">Ходов диалога</label><input id="scenario_turns" name="scenario_turns" type="number" min="0" max="500" step="1" value="20" required><span class="help">0 — работать до ручной остановки.</span></div>
+          <div class="field"><label for="joke_every">Анекдот каждые N ходов</label><input id="joke_every" name="joke_every" type="number" min="0" max="1000" step="1" value="5" required><span class="help">0 — выключить; в рулетке не используется.</span></div>
+          <div class="field"><label for="rest_every">Отдыхать после N ходов</label><input id="rest_every" name="rest_every" type="number" min="0" max="1000" step="1" value="6" required><span class="help">0 — без длинных перерывов.</span></div>
+          <div class="grid-2">
+            <div class="field"><label for="rest_min_sec">Отдых от, сек</label><input id="rest_min_sec" name="rest_min_sec" type="number" min="15" max="86400" step="1" value="60" required></div>
+            <div class="field"><label for="rest_max_sec">До, сек</label><input id="rest_max_sec" name="rest_max_sec" type="number" min="15" max="86400" step="1" value="120" required></div>
+          </div>
+        </div>
+        <div class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
+        <p class="help">В дискуссии медиа (GIF, стикеры, фото и голосовые) выбираются по весам аккаунта. Реплики чередуются по порядку списка аккаунтов.</p>
+      </div>
+      <div class="field">
+        <label>Аккаунты</label>
+        <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
+          {% for a in accounts %}
+            <label class="check-row">
+              <input type="checkbox" class="account-choice" value="{{ a.name }}" {% if a.enabled and a.session_status == 'authorized' %}checked{% endif %} {% if not a.enabled or a.session_status != 'authorized' %}disabled{% endif %}>
+              <span><strong>{{ a.name }}</strong> <small>{{ '@' + a.username if a.username else a.phone }}</small></span>
+              <span class="badge {{ 'badge-authorized' if a.session_status == 'authorized' else 'badge-unauthorized' }}" style="margin-left:auto">{{ 'готов' if a.session_status == 'authorized' else 'нужен вход' }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <input type="hidden" name="accounts" id="selected_accounts">
+      </div>
+      <div class="grid-2">
+        <div class="field"><label for="min_delay">Мин. пауза между ходами, сек</label><input id="min_delay" name="min_delay" type="number" min="0" max="86400" step="0.5" value="{{ settings.min_delay_sec }}" required></div>
+        <div class="field"><label for="max_delay">Макс. пауза между ходами, сек</label><input id="max_delay" name="max_delay" type="number" min="0" max="86400" step="0.5" value="{{ settings.max_delay_sec }}" required></div>
+      </div>
+      <span id="delay_help" class="help">В сценарном режиме минимум 5 секунд между сообщениями, чтобы не перегружать чат.</span>
+      <details id="reactive_options" style="margin:8px 0 16px">
+        <summary style="cursor:pointer;color:#b7c8dc;font-weight:700;font-size:13px">Вероятности для этого запуска</summary>
+        <div class="grid-2" style="margin-top:12px">
+          <div class="field"><label>Q&amp;A, 0–1</label><input name="qa_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.qa_probability }}"></div>
+          <div class="field"><label>Диалоги, 0–1</label><input name="clone_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.clone_probability }}"></div>
+          <div class="field"><label>Реакции, 0–1</label><input name="reaction_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.reaction_probability }}"></div>
+        </div>
+        <p class="help">Q&amp;A и диалоги используются только при включённом proactive-режиме в разделе «Поведение».</p>
+      </details>
+      <button id="btn_start_farm" type="submit" style="width:100%;min-height:46px">▶ Запустить ответы в чате</button>
+    </form>
+    {% else %}
+      <div class="empty">Сначала подключите и проверьте хотя бы одну сессию в разделе «Аккаунты».</div>
+    {% endif %}
+    <div id="farm_output" class="notice" hidden style="margin-top:14px"></div>
+  </section>
+
+  <section class="card" style="display:flex;flex-direction:column;min-height:580px">
+    <div class="card-head">
+      <div><h2>Лог работы</h2><p class="subtle">Сюда попадают подключения, полученные сообщения и результаты отправки.</p></div>
+      <div class="actions"><label class="check-row" style="margin:0"><input type="checkbox" id="autoscroll" checked><span>Автопрокрутка</span></label><button class="secondary small" type="button" onclick="loadLogs()">Обновить</button></div>
+    </div>
+    <pre id="log_viewer" style="flex:1;min-height:390px;max-height:620px;margin:0;color:#b6e4dc">Загружаю лог…</pre>
+  </section>
+</div>
+
+<script>
+let statusTimer;
+let logsTimer;
+let delayTouched = false;
+const reactiveDelayDefaults = {
+  min: {{ settings.min_delay_sec|tojson }},
+  max: {{ settings.max_delay_sec|tojson }},
+};
+function updateScenarioForm() {
+  const selector = document.getElementById('scenario_mode');
+  if (!selector) return;
+  const mode = selector.value;
+  const active = mode !== 'reactive';
+  document.getElementById('scenario_fields').hidden = !active;
+  document.getElementById('roulette_fields').hidden = mode !== 'roulette';
+  document.getElementById('reactive_options').hidden = active;
+  document.getElementById('scenario_topic').required = active;
+  document.getElementById('roulette_numbers').required = mode === 'roulette';
+  document.getElementById('min_delay').min = active ? '5' : '0';
+  if (!delayTouched) {
+    document.getElementById('min_delay').value = active ? '20' : reactiveDelayDefaults.min;
+    document.getElementById('max_delay').value = active ? '45' : reactiveDelayDefaults.max;
+  }
+  document.getElementById('delay_help').textContent = active
+    ? 'Пауза между репликами сценария; для такого режима минимум 5 секунд.'
+    : 'Задержка перед ответом на входящее сообщение.';
+  document.getElementById('btn_start_farm').textContent = active
+    ? '▶ Запустить сценарий по очереди'
+    : '▶ Запустить ответы в чате';
+}
+document.getElementById('min_delay')?.addEventListener('input', () => { delayTouched = true; });
+document.getElementById('max_delay')?.addEventListener('input', () => { delayTouched = true; });
+function updateSelectedAccounts() {
+  const names = [...document.querySelectorAll('.account-choice:checked')].map(item => item.value);
+  const target = document.getElementById('selected_accounts');
+  if (target) target.value = names.join(',');
+}
+document.querySelectorAll('.account-choice').forEach(item => item.addEventListener('change', updateSelectedAccounts));
+updateSelectedAccounts();
+updateScenarioForm();
+
+async function checkStatus() {
+  try {
+    const response = await fetch('/api/chatfarm/status');
+    const data = await response.json();
+    const badge = document.getElementById('farm_status_badge');
+    const stop = document.getElementById('btn_stop_farm');
+    const start = document.getElementById('btn_start_farm');
+    if (data.running) {
+      badge.className = 'badge badge-ok'; badge.textContent = `● Работает · PID ${data.pid}`;
+      stop.hidden = false; if (start) start.disabled = true;
+    } else {
+      badge.className = 'badge badge-pending'; badge.textContent = '○ Остановлено';
+      stop.hidden = true; if (start) start.disabled = false;
+    }
+  } catch (error) { console.error('farm status', error); }
+}
+async function loadLogs() {
+  try {
+    const response = await fetch('/api/chatfarm/logs');
+    const data = await response.json();
+    const viewer = document.getElementById('log_viewer');
+    viewer.textContent = (data.logs || []).join('\n');
+    if (document.getElementById('autoscroll').checked) viewer.scrollTop = viewer.scrollHeight;
+  } catch (error) { console.error('farm logs', error); }
+}
+async function startFarm(event) {
+  event.preventDefault();
+  updateSelectedAccounts();
+  const output = document.getElementById('farm_output');
+  const button = document.getElementById('btn_start_farm');
+  button.disabled = true; button.textContent = 'Запускаю…';
+  try {
+    const data = await postForm('/api/chatfarm/start', event.target);
+    showMessage(output, `Задача запуска №${data.task_id} добавлена. Подключение появится в логе.`, 'success');
+    setTimeout(checkStatus, 1000); setTimeout(loadLogs, 1000);
+  } catch (error) {
+    showMessage(output, error.message, 'error');
+    button.disabled = false; updateScenarioForm();
+  }
+  return false;
+}
+async function stopFarm() {
+  if (!confirm('Остановить чат-агенты?')) return;
+  const button = document.getElementById('btn_stop_farm'); button.disabled = true; button.textContent = 'Останавливаю…';
+  try {
+    const response = await fetch('/api/chatfarm/stop', {method:'POST'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось остановить');
+    await checkStatus(); await loadLogs();
+  } catch (error) { showMessage(document.getElementById('farm_output'), error.message, 'error'); }
+  finally { button.disabled = false; button.textContent = '■ Остановить'; }
+}
+checkStatus(); loadLogs();
+statusTimer = setInterval(checkStatus, 3000);
+logsTimer = setInterval(loadLogs, 2500);
+window.addEventListener('beforeunload', () => { clearInterval(statusTimer); clearInterval(logsTimer); });
+</script>
+{% endblock %}

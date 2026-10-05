@@ -1,36 +1,52 @@
-*Reverse Engineering 0x4 Fun*
-*Examining the user-mode APC injection sensor introduced in Windows 10 build 1809*
-`Yesterday I've read Microsoft's blog post about the new ATP kernel sensors added to log injection of user-mode APCs. That got me curious and I went to examine the changes in KeInsertQueueApc.`
+# 0x4 · Telegram control panel
 
-The instrumentation code invokes the function EtwTiLogQueueApcThread to log the event. The function's prototype looks like this :
-VOID EtwTiLogQueueApcThread(
-    BYTE PreviousMode,
-    PKTHREAD ApcThread, //Apc->Thread
-    PVOID NormalRoutine,
-    PVOID NormalContext,
-    PVOID SystemArgument1,
-    PVOID SystemArgument2);
+Веб-панель для подключения Pyrogram-сессий, настройки поведения агентов и управления ответами в целевом Telegram-чате. Панель отвечает **реплаем на входящее сообщение**; отправка GIF использует локальные медиа, список GIF в конфиге или настроенный GIPHY/Tenor-провайдер. Если медиа недоступно, агент отправит текст, а не промолчит.
 
-EtwTiLogQueueApcThread is only called when the queued APC is a user-mode APC and if KeInsertQueueApc successfully inserted the APC into the queue (Thread->ApcQueueable && !Apc->Inserted).
+> Приватный модуль DeepSeek не входит в репозиторий. Для генерации положите его в `vendor/Deepseek-API/` на сервере. Без него веб-панель запускается, а режим чата использует донорские сообщения или безопасный короткий текстовый fallback.
 
-EtwTiLogQueueApcThread first checks whether the user-mode APC has been queued to a remote process or not and only logs the event in the former case.
-It also distinguishes between remotely queued APCs from user-mode (NtQueueApcThread(Ex)) and those queued from kernel-mode; The former is used to detect user-mode injection techniques like this one.
+## Запуск
 
-As shown below, two event descriptors exist and the one to log is determined using the current thread's previous mode to know whether the APC was queued by a user process or by a kernel driver.
+```bash
+python -m venv .venv
+source .venv/bin/activate       # Windows: .venv\\Scripts\\activate
+python -m pip install -r requirements.txt
+cp .env.example .env            # Windows: Copy-Item .env.example .env
+python web_run.py
+```
 
+Откройте `http://127.0.0.1:8080`. При первом запуске создайте профиль владельца. Для Arena preview сервер по умолчанию слушает `0.0.0.0:8080`.
 
+Для Telegram-бота (отдельно от чат-агентов) задайте `BOT_TOKEN` и `ADMIN_IDS` в `.env`, затем запустите `python bot.py`. Ответы бота и агента оформляются как reply к исходному сообщению.
 
-Looking at where the event provider registration handle EtwThreatIntProvRegHandle is referenced, we see that not only remote user-mode APC injection is logged but also a bunch of events that are commonly used by threats.
+## Подключить Telegram-аккаунт
 
+1. В разделе **Аккаунты** укажите имя сессии, API ID/Hash из `my.telegram.org` и номер телефона.
+2. Введите код, присланный Telegram; при включённой двухэтапной проверке укажите пароль 2FA.
+3. Панель сохраняет авторизованную Pyrogram-сессию в `sessions/`, проверяет профиль и показывает статус. Также можно импортировать готовый Pyrogram-файл `.session`.
+4. Через **Настроить** редактируются прокси, persona, вероятность ответа, веса текста/GIF/стикеров/фото/голосовых и состояние аккаунта.
 
-Thanks for reading and until another time :)
+Добавьте выбранный аккаунт в целевой чат, иначе Telegram не даст ему читать или отвечать на сообщения. Сессии, ключи, база, журналы и пользовательские данные игнорируются Git.
 
-Links:
-`https://www.pentesteracademy.com/`
-`https://repo.zenk-security.com/Reversing%20.%20cracking/Reversing%20-%20Secrets%20Of%20Reverse%20Engineering%20(2005).pdf`
-`https://malwareunicorn.org/workshops/re101.html#0`
-`https://0xresetti.github.io/reversing.html`
-`https://guyinatuxedo.github.io/`
-`https://p.ost2.fyi/courses/course-v1:OpenSecurityTraining2+Arch1001_x86-64_Asm+2021_v1/about`
-`https://class.malware.re/`
+## Поведение и GIF
 
+- **Поведение**: общие инструкции, задержки, вероятности ответов/реакций, модель DeepSeek, DeepThink, поиск и веса типов сообщений.
+- **Чат**: укажите ID группы и, при необходимости, ID темы. По умолчанию включены только входящие ответы с `reply_to_message_id`; самостоятельные сообщения по таймеру выключены.
+- **GIF**: задайте GIPHY или Tenor API key в разделе **Поведение** и проверьте поисковый превью. В ферме GIF загружается на сервер и отправляется как Telegram animation.
+- **Сценарии в разделе «Чат»**: «Диалог аккаунтов» ведёт последовательную дискуссию по вашему вопросу, чередует выбранные аккаунты, периодически добавляет короткие анекдоты и медиа по весам аккаунта. «Рулетка» публикует случайное число из заданного диапазона/списка. Можно задать число ходов, паузы между репликами и длинные перерывы; `0` ходов означает работу до ручной остановки.
+- Для сценариев выберите минимум два аккаунта. Стартовая тема может публиковаться в чат, а последующие реплики отвечают на предыдущие. Используйте такие сценарии только в группе, которой управляете, и предупредите участников об автоматизации. Без DeepSeek bridge диалог использует локальные короткие шаблоны; для актуальных новостей нужен bridge с включённым веб-поиском.
+- Файл `farm_config.json` необязателен и предназначен для локальных приватных настроек/совместимости. Начните с `farm_config.example.json`; не коммитьте реальный конфиг.
+
+## Тесты и диагностика
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile bot.py farm.py web_run.py web/*.py
+```
+
+В разделе **Чат** доступны статус процесса и live-лог. Ошибки Telegram/GIF показываются в логе; сетевой тест прокси проверяет только доступность TCP-порта, не валидность прокси-логина.
+
+## Секреты и безопасность
+
+- Не коммитьте `.env`, `farm_config.json`, `sessions/*.session`, базу и данные чатов. Используйте `.env.example` только как шаблон.
+- Загруженный архив содержал локальные секреты и Telegram session-файл. Архив исключён из текущего дерева; если он когда-либо попадал в GitHub или передавался третьим лицам, отзовите Telegram-сессии и замените связанные API/бот-ключи. Удаление файла из текущей версии не стирает его из истории Git.
+- Авторизация панели нужна даже в доверенной сети; задайте сильный пароль и ограничьте доступ к порту.

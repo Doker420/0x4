@@ -1,0 +1,359 @@
+{% extends "base.html" %}
+{% block title %}Аккаунты · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">Сессии и доступ</p>
+    <h1>Аккаунты Telegram</h1>
+    <p class="subtle">Подключайте сессию прямо здесь: номер → код из Telegram → пароль 2FA при необходимости. API Hash остаётся на сервере и не показывается в списке.</p>
+  </div>
+  <div class="actions">
+    <button class="secondary" type="button" onclick="scanSessions()">⟳ Проверить сессии</button>
+    <span class="badge badge-pending">{{ accounts|length }} в панели</span>
+  </div>
+</section>
+
+<div class="grid">
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h2>Подключить по телефону</h2>
+        <p class="subtle">Запрос кода отправится в Telegram. Данные аккаунта сохранятся только после успешного входа.</p>
+      </div>
+      <span class="pill badge-ok">Пошаговая авторизация</span>
+    </div>
+    <form id="auth_form" onsubmit="beginAuth(event)">
+      <div class="form-grid">
+        <div class="field">
+          <label for="auth_name">Название сессии</label>
+          <input id="auth_name" name="name" placeholder="например, account_1" pattern="[A-Za-z0-9_-]{1,64}" required>
+        </div>
+        <div class="field">
+          <label for="auth_phone">Номер телефона</label>
+          <input id="auth_phone" name="phone" type="tel" placeholder="+7 900 000-00-00" autocomplete="tel" required>
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="auth_api_id">Telegram API ID</label>
+          <input id="auth_api_id" name="api_id" type="number" min="1" placeholder="Из my.telegram.org" required>
+        </div>
+        <div class="field">
+          <label for="auth_api_hash">Telegram API Hash</label>
+          <input id="auth_api_hash" name="api_hash" type="password" autocomplete="off" placeholder="Секретный ключ приложения" required>
+        </div>
+      </div>
+      <div class="field">
+        <label for="auth_proxy">Прокси <span class="subtle">(необязательно)</span></label>
+        <input id="auth_proxy" name="proxy" placeholder="socks5://user:pass@host:1080">
+      </div>
+      <button id="auth_start_btn" type="submit">Продолжить и запросить код</button>
+    </form>
+
+    <div id="auth_code_step" hidden>
+      <div class="divider"></div>
+      <div class="notice success" id="auth_phone_notice">Код отправлен.</div>
+      <form onsubmit="submitAuthCode(event)" style="margin-top: 14px">
+        <div class="field">
+          <label for="auth_code">Код Telegram</label>
+          <input id="auth_code" inputmode="numeric" autocomplete="one-time-code" placeholder="Код из приложения Telegram" required>
+        </div>
+        <div class="actions">
+          <button type="submit">Подтвердить код</button>
+          <button class="ghost" type="button" onclick="cancelAuth()">Отмена</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="auth_password_step" hidden>
+      <div class="notice warning">Для аккаунта включён пароль двухэтапной проверки Telegram.</div>
+      <form onsubmit="submitAuthPassword(event)" style="margin-top: 14px">
+        <div class="field">
+          <label for="auth_password">Пароль 2FA</label>
+          <input id="auth_password" type="password" autocomplete="current-password" required>
+        </div>
+        <div class="actions">
+          <button type="submit">Завершить авторизацию</button>
+          <button class="ghost" type="button" onclick="cancelAuth()">Отмена</button>
+        </div>
+      </form>
+    </div>
+    <div id="auth_result" class="notice" hidden style="margin-top: 14px"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h2>Импорт готовой сессии</h2>
+        <p class="subtle">Подходит для файла Pyrogram <code>.session</code>. После загрузки панель сразу проверит Telegram-профиль.</p>
+      </div>
+      <span class="pill badge-pending">до 25 МБ</span>
+    </div>
+    <form id="upload_form" onsubmit="uploadSession(event)">
+      <div class="field">
+        <label for="session_file">Файл сессии</label>
+        <input id="session_file" name="session_file" type="file" accept=".session" required>
+      </div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="upload_name">Имя в панели <span class="subtle">(необязательно)</span></label>
+          <input id="upload_name" name="name" placeholder="Можно взять из имени файла">
+        </div>
+        <div class="field">
+          <label for="upload_phone">Телефон</label>
+          <input id="upload_phone" name="phone" type="tel" placeholder="+7…">
+        </div>
+      </div>
+      <div class="form-grid">
+        <div class="field"><label for="upload_api_id">API ID</label><input id="upload_api_id" name="api_id" type="number" min="1" required></div>
+        <div class="field"><label for="upload_api_hash">API Hash</label><input id="upload_api_hash" name="api_hash" type="password" autocomplete="off" required></div>
+      </div>
+      <div class="field"><label for="upload_proxy">Прокси <span class="subtle">(необязательно)</span></label><input id="upload_proxy" name="proxy" placeholder="socks5://host:1080"></div>
+      <button id="upload_btn" class="secondary" type="submit">Загрузить и проверить сессию</button>
+    </form>
+  </section>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <div>
+      <h2>Сессии и поведение</h2>
+      <p class="subtle">Нажмите «Изменить», чтобы задать персону, вероятность ответа и баланс текста/медиа.</p>
+    </div>
+    <div class="actions"><span class="badge badge-ok">{{ accounts|selectattr('enabled')|list|length }} включено</span></div>
+  </div>
+  {% if accounts %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Аккаунт</th><th>Профиль / сессия</th><th>Персона</th><th>Ответ</th><th>Статус</th><th>Настройки</th></tr></thead>
+      <tbody>
+      {% for a in accounts %}
+        <tr>
+          <td><strong>{{ a.name }}</strong><br><small>{{ a.phone or 'Телефон не задан' }}</small></td>
+          <td>
+            {% if a.username %}<span>@{{ a.username }}</span>{% elif a.first_name %}<span>{{ a.first_name }}</span>{% else %}<span class="subtle">Профиль не проверен</span>{% endif %}
+            {% if a.tg_id %}<br><small>ID {{ a.tg_id }}</small>{% endif %}
+          </td>
+          <td><span title="{{ a.persona }}">{{ (a.persona or 'Персона не задана')[:54] }}{% if a.persona|length > 54 %}…{% endif %}</span></td>
+          <td>
+            {{ ((a.reply_probability if a.behavior_customized else settings.default_reply_probability) * 100)|round|int }}%
+            <br><span class="badge {{ 'badge-running' if a.behavior_customized else 'badge-pending' }}">{{ 'Индивидуально' if a.behavior_customized else 'Общие правила' }}</span>
+          </td>
+          <td>
+            {% if a.session_status == 'authorized' %}<span class="badge badge-authorized">● Авторизован</span>
+            {% elif a.session_status == 'unauthorized' %}<span class="badge badge-unauthorized">● Нужен вход</span>
+            {% else %}<span class="badge badge-unknown">● Не проверен</span>{% endif %}
+            {% if a.name in active_accounts %}<br><span class="badge badge-ok" style="margin-top:5px">● Активен сейчас</span>{% endif %}
+            {% if not a.enabled %}<br><span class="badge badge-pending" style="margin-top:5px">Выключен</span>{% endif %}
+          </td>
+          <td class="nowrap">
+            <button type="button" class="secondary small" onclick="openAccountEdit({{ a.name|tojson }})">Настроить</button>
+            <button type="button" class="danger small" onclick="deleteAccount({{ a.name|tojson }})" style="margin-top:5px">Убрать</button>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <div class="empty">Аккаунтов пока нет. Подключите Telegram выше или загрузите готовый файл сессии.</div>
+  {% endif %}
+  <div id="scan_output" class="notice" hidden style="margin-top: 14px"></div>
+</div>
+
+<div id="account_modal" class="modal" onclick="if(event.target===this) closeAccountEdit()">
+  <div class="modal-box">
+    <div class="card-head">
+      <div><p class="eyebrow">Управление сессией</p><h2 id="edit_title">Настройки аккаунта</h2></div>
+      <button type="button" class="ghost" onclick="closeAccountEdit()" aria-label="Закрыть">✕</button>
+    </div>
+    <form id="edit_form" onsubmit="saveAccountEdit(event)">
+      <input type="hidden" name="name" id="edit_name">
+      <div class="form-grid">
+        <div class="field"><label for="edit_phone">Телефон</label><input id="edit_phone" name="phone" type="tel"></div>
+        <div class="field"><label for="edit_api_id">API ID</label><input id="edit_api_id" name="api_id" type="number" min="1"></div>
+      </div>
+      <div class="field"><label for="edit_api_hash">API Hash</label><input id="edit_api_hash" name="api_hash" type="password" autocomplete="new-password" placeholder="Сохранён. Заполните только для замены"></div>
+      <div class="field"><label for="edit_proxy">Прокси</label><input id="edit_proxy" name="proxy" placeholder="Пусто — прямое подключение"></div>
+      <div class="field"><label for="edit_persona">Персона / инструкции для этого аккаунта</label><textarea id="edit_persona" name="persona" rows="3" placeholder="Например: спокойный участник, отвечает коротко и по делу"></textarea></div>
+      <div class="grid-2">
+        <div class="field"><label for="edit_behavior_mode">Источник правил поведения</label><select id="edit_behavior_mode" name="behavior_mode" onchange="toggleBehaviorFields()"><option value="global">Общие настройки раздела «Поведение»</option><option value="custom">Индивидуально для аккаунта</option></select></div>
+        <div class="field"><label for="edit_enabled">Состояние аккаунта</label><select id="edit_enabled" name="enabled"><option value="1">Включён</option><option value="0">Выключен</option></select></div>
+      </div>
+      <p id="behavior_mode_help" class="help">При общих правилах вероятность и веса медиа берутся из раздела «Поведение».</p>
+      <div id="individual_fields">
+        <div class="field"><label for="edit_reply">Вероятность ответа, 0–1</label><input id="edit_reply" name="reply_probability" type="number" min="0" max="1" step="0.05"></div>
+        <p class="help">Доли медиа — относительные веса. Если выбранное медиа недоступно, агент отправит текстовый ответ.</p>
+        <div class="form-grid">
+          <div class="field"><label for="edit_media_text">Текст, %</label><input id="edit_media_text" name="media_text" type="number" min="0" step="1"></div>
+          <div class="field"><label for="edit_media_gif">GIF, %</label><input id="edit_media_gif" name="media_gif" type="number" min="0" step="1"></div>
+          <div class="field"><label for="edit_media_sticker">Стикер, %</label><input id="edit_media_sticker" name="media_sticker" type="number" min="0" step="1"></div>
+          <div class="field"><label for="edit_media_photo">Фото, %</label><input id="edit_media_photo" name="media_photo" type="number" min="0" step="1"></div>
+          <div class="field"><label for="edit_media_voice">Голосовое, %</label><input id="edit_media_voice" name="media_voice" type="number" min="0" step="1"></div>
+        </div>
+      </div>
+      <div id="edit_output" class="notice" hidden style="margin: 10px 0"></div>
+      <div class="actions" style="justify-content:flex-end">
+        <button type="button" class="secondary" onclick="closeAccountEdit()">Отмена</button>
+        <button id="edit_save_btn" type="submit">Сохранить настройки</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+const accountData = {{ accounts|tojson }};
+const settingsDefaults = {{ settings|tojson }};
+let authName = '';
+
+function setOutput(id, text, kind = '') {
+  const element = document.getElementById(id);
+  showMessage(element, text, kind);
+}
+async function scanSessions() {
+  const output = document.getElementById('scan_output');
+  showMessage(output, 'Проверяю локальные .session-файлы и статус авторизации…');
+  try {
+    const response = await fetch('/api/accounts/scan', {method: 'POST'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось проверить сессии');
+    const rows = data.sessions || [];
+    output.textContent = rows.length
+      ? rows.map(row => `${row.status === 'authorized' ? '✓' : '•'} ${row.name}: ${row.status}${row.username ? ' (@' + row.username + ')' : ''}`).join('\n')
+      : 'Файлы .session не найдены в папке sessions/.';
+    output.className = `notice ${rows.some(row => row.status === 'unauthorized') ? 'warning' : 'success'}`;
+    output.hidden = false;
+    if (rows.some(row => row.status === 'authorized')) setTimeout(() => location.reload(), 900);
+  } catch (error) { showMessage(output, error.message, 'error'); }
+}
+
+async function beginAuth(event) {
+  event.preventDefault();
+  const form = event.target;
+  const button = document.getElementById('auth_start_btn');
+  const result = document.getElementById('auth_result');
+  authName = form.elements.name.value.trim();
+  button.disabled = true; button.textContent = 'Подключаюсь…';
+  result.hidden = true;
+  try {
+    const response = await fetch('/api/accounts/auth/start', {method: 'POST', body: new FormData(form)});
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || data.detail || 'Ошибка авторизации');
+    if (data.status === 'authorized') {
+      showMessage(result, `Сессия ${authName} уже авторизована и сохранена.`, 'success');
+      setTimeout(() => location.reload(), 900);
+    } else {
+      document.getElementById('auth_phone_notice').textContent = `Код отправлен на ${data.phone || 'указанный номер'}. Введите код из Telegram.`;
+      document.getElementById('auth_code_step').hidden = false;
+      document.getElementById('auth_code').focus();
+      button.textContent = 'Код отправлен';
+    }
+  } catch (error) {
+    showMessage(result, error.message, 'error');
+    button.disabled = false; button.textContent = 'Продолжить и запросить код';
+  }
+}
+async function submitAuthCode(event) {
+  event.preventDefault();
+  const code = document.getElementById('auth_code').value.trim();
+  try {
+    const form = new FormData(); form.append('name', authName); form.append('code', code);
+    const response = await fetch('/api/accounts/auth/code', {method: 'POST', body: form});
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || data.detail || 'Код не принят');
+    if (data.status === 'password_required') {
+      document.getElementById('auth_password_step').hidden = false;
+      document.getElementById('auth_password').focus();
+      return;
+    }
+    showMessage(document.getElementById('auth_result'), `Аккаунт ${authName} авторизован и сохранён.`, 'success');
+    setTimeout(() => location.reload(), 900);
+  } catch (error) { setOutput('auth_result', error.message, 'error'); }
+}
+async function submitAuthPassword(event) {
+  event.preventDefault();
+  const form = new FormData(); form.append('name', authName); form.append('password', document.getElementById('auth_password').value);
+  try {
+    const response = await fetch('/api/accounts/auth/password', {method: 'POST', body: form});
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || data.detail || 'Пароль не принят');
+    showMessage(document.getElementById('auth_result'), `Аккаунт ${authName} авторизован и сохранён.`, 'success');
+    setTimeout(() => location.reload(), 900);
+  } catch (error) { setOutput('auth_result', error.message, 'error'); }
+}
+async function cancelAuth() {
+  if (authName) {
+    const form = new FormData(); form.append('name', authName);
+    await fetch('/api/accounts/auth/cancel', {method: 'POST', body: form});
+  }
+  location.reload();
+}
+async function uploadSession(event) {
+  event.preventDefault();
+  const form = event.target;
+  const button = document.getElementById('upload_btn');
+  button.disabled = true; button.textContent = 'Загружаю и проверяю…';
+  try {
+    const response = await fetch('/api/accounts/upload', {method: 'POST', body: new FormData(form)});
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || data.detail || 'Импорт не выполнен');
+    showMessage(document.getElementById('scan_output'), `Сессия проверена: ${data.info.first_name || data.info.name}${data.info.username ? ' (@' + data.info.username + ')' : ''}.`, 'success');
+    setTimeout(() => location.reload(), 900);
+  } catch (error) {
+    showMessage(document.getElementById('scan_output'), error.message, 'error');
+  } finally { button.disabled = false; button.textContent = 'Загрузить и проверить сессию'; }
+}
+function openAccountEdit(name) {
+  const account = accountData.find(item => item.name === name);
+  if (!account) return;
+  const form = document.getElementById('edit_form');
+  form.elements.name.value = account.name;
+  form.elements.phone.value = account.phone || '';
+  form.elements.api_id.value = account.api_id || '';
+  form.elements.api_hash.value = '';
+  form.elements.proxy.value = account.proxy || '';
+  form.elements.persona.value = account.persona || '';
+  form.elements.behavior_mode.value = account.behavior_customized ? 'custom' : 'global';
+  form.elements.reply_probability.value = account.behavior_customized
+    ? account.reply_probability : settingsDefaults.default_reply_probability;
+  form.elements.enabled.value = account.enabled ? '1' : '0';
+  for (const kind of ['text', 'gif', 'sticker', 'photo', 'voice']) {
+    const globalWeight = Math.round(settingsDefaults.default_media_bias[kind] * 100);
+    form.elements[`media_${kind}`].value = account.behavior_customized ? account.media_percent[kind] : globalWeight;
+  }
+  toggleBehaviorFields();
+  document.getElementById('edit_title').textContent = `Настройки · ${account.name}`;
+  document.getElementById('edit_output').hidden = true;
+  document.getElementById('account_modal').classList.add('open');
+}
+function closeAccountEdit() { document.getElementById('account_modal').classList.remove('open'); }
+function toggleBehaviorFields() {
+  const custom = document.getElementById('edit_behavior_mode').value === 'custom';
+  document.querySelectorAll('#individual_fields input').forEach(input => { input.disabled = !custom; });
+  document.getElementById('behavior_mode_help').textContent = custom
+    ? 'Индивидуальная вероятность и веса будут сохранены только для этого аккаунта.'
+    : 'При общих правилах вероятность и веса медиа берутся из раздела «Поведение».';
+}
+async function saveAccountEdit(event) {
+  event.preventDefault();
+  const button = document.getElementById('edit_save_btn'); button.disabled = true;
+  try {
+    const data = await postForm('/api/accounts/update', event.target);
+    showMessage(document.getElementById('edit_output'), `Настройки ${data.account.name} сохранены.`, 'success');
+    setTimeout(() => location.reload(), 650);
+  } catch (error) { showMessage(document.getElementById('edit_output'), error.message, 'error'); }
+  finally { button.disabled = false; }
+}
+async function deleteAccount(name) {
+  if (!confirm(`Убрать ${name} из панели? Файл .session останется на диске.`)) return;
+  const form = new FormData(); form.append('name', name);
+  try {
+    const response = await fetch('/api/accounts/delete', {method: 'POST', body: form});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось удалить аккаунт');
+    location.reload();
+  } catch (error) { alert(error.message); }
+}
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAccountEdit(); });
+</script>
+{% endblock %}
