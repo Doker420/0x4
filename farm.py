@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import socket
 import sys
@@ -395,6 +396,17 @@ class DonorCorpus:
 #                    PROMPTS
 # ═══════════════════════════════════════════════════════════════
 
+QUESTION_START_RE = re.compile(
+    r"^\s*(?:(?:а|ну|слушай)\s+)?(?:"
+    r"что|кто(?:[-\s]нибудь)?|где|куда|откуда|когда|почему|зачем|как|"
+    r"какой|какая|какое|какие|чей|чья|чье|чьё|чьи|сколько|кому|кого|чего|чем|"
+    r"есть\s+ли|можно\s+ли|нужно\s+ли|будет\s+ли|может\s+ли|"
+    r"подскажите|посоветуйте|расскажите|помогите|"
+    r"who|what|where|when|why|how|which|whose|can|could|would|do|does|is|are"
+    r")\b",
+    re.IGNORECASE,
+)
+
 REPLY_PROMPT = """Ты — участник группового чата. Отвечай ТОЛЬКО одной короткой репликой (1–2 предложения, до 200 символов), без кавычек и пояснений.
 
 Твоя роль: {persona}
@@ -411,7 +423,9 @@ REPLY_PROMPT = """Ты — участник группового чата. От�
 
 Правила:
 - разговорно, живо, можно эмодзи
-- если уместно — задай короткий вопрос
+- если входящее сообщение задаёт вопрос — сначала дай прямой ответ именно на него
+- опирайся на тему и контекст; если точного ответа нет, не выдумывай факты
+- если уместно — задай короткий уточняющий вопрос
 - не упоминай, что ты ИИ
 - отвечай на языке последних сообщений
 
@@ -762,7 +776,8 @@ class FarmAccount:
 
     async def _on_incoming(self, client: Client, message: TGMessage) -> None:
         del client
-        if FARM_CFG.get("farm", {}).get("scenario_mode", "reactive") not in {"reactive", "combined"}:
+        scenario_mode = FARM_CFG.get("farm", {}).get("scenario_mode", "reactive")
+        if scenario_mode not in {"reactive", "combined"}:
             return
         if not message or getattr(message, "empty", False) or getattr(message, "service", None):
             return
@@ -775,6 +790,7 @@ class FarmAccount:
             return
 
         text = self._message_text(message)
+        is_question = self._looks_like_question(text)
         chat_id = int(message.chat.id)
         async with self.state.lock:
             if not self.state.remember_message(chat_id, int(message.id)):
@@ -787,8 +803,13 @@ class FarmAccount:
                 "text": text,
                 "kind": self._message_kind(message),
                 "direction": "incoming",
+                "is_question": is_question,
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
+
+        if scenario_mode == "combined" and not is_question:
+            log.debug("[%s] incoming message %s retained as context but is not a question", self.name, message.id)
+            return
 
         candidates = [account for account in self.farm_accounts if account._running]
         if not candidates:
@@ -797,6 +818,8 @@ class FarmAccount:
         if random.random() > responder.reply_probability:
             log.info("[%s] пропускаю сообщение %s (reply_probability)", responder.name, message.id)
             return
+        if scenario_mode == "combined":
+            log.info("[%s] случайно выбран для ответа на вопрос %s", responder.name, message.id)
         task = asyncio.create_task(
             responder._answer_incoming(message, text),
             name=f"reply-{responder.name}-{message.id}",
@@ -833,6 +856,17 @@ class FarmAccount:
     @classmethod
     def _message_text(cls, message: TGMessage) -> str:
         return str(getattr(message, "text", None) or getattr(message, "caption", None) or f"[{cls._message_kind(message)}]").strip()
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        candidate = " ".join((text or "").split())
+        if not candidate:
+            return False
+        if "?" in candidate or "？" in candidate:
+            return True
+        if candidate.startswith("@") and " " in candidate:
+            candidate = candidate.split(None, 1)[1]
+        return bool(QUESTION_START_RE.match(candidate))
 
     async def _answer_incoming(self, message: TGMessage, incoming_text: str) -> None:
         farm_cfg = FARM_CFG.get("farm", {})
