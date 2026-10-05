@@ -9,6 +9,25 @@ import farm
 class FakeTelegramClient:
     def __init__(self):
         self.messages = []
+        self.handlers = []
+
+    async def connect(self):
+        return True
+
+    async def invoke(self, _request):
+        return None
+
+    async def get_me(self):
+        return types.SimpleNamespace(id=100, username="unit")
+
+    async def initialize(self):
+        return None
+
+    async def get_chat(self, _chat_id):
+        return types.SimpleNamespace(id=_chat_id)
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
 
     async def send_message(self, **kwargs):
         self.messages.append(kwargs)
@@ -73,6 +92,48 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
 
         await account._on_incoming(None, message)
         self.assertEqual(account._answer_incoming.await_count, 1)
+
+    async def test_combined_mode_registers_incoming_message_handler(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.client = FakeTelegramClient()
+        account.user_id = None
+        account.farm_accounts = [account]
+        account._running = False
+        account._task = None
+
+        await account.start()
+
+        self.assertTrue(account._running)
+        self.assertEqual(len(account.client.handlers), 1)
+
+    async def test_incoming_message_handler_stays_enabled_in_combined_mode(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=78,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=201, is_bot=False, username="tester", first_name="Test"),
+            text="Вопрос во время тематического диалога",
+        )
+
+        await account._on_incoming(None, message)
+        await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_awaited_once_with(message, "Вопрос во время тематического диалога")
+        self.assertEqual(state.chat_history[-1]["direction"], "incoming")
 
     async def test_missing_gif_falls_back_to_reply_text(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)

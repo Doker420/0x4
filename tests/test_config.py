@@ -27,6 +27,10 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_roulette_numbers("0-1001")
 
+    def test_combined_scenario_mode_is_preserved(self):
+        settings = load_farm_settings({"scenario_mode": "combined"})
+        self.assertEqual(settings["scenario_mode"], "combined")
+
     def test_scenario_settings_are_sanitized(self):
         settings = load_farm_settings({
             "scenario_mode": "unknown",

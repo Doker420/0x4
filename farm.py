@@ -268,6 +268,7 @@ class FarmState:
         self.topic: str = "общее общение"
         self.last_outgoing_message_id: int | None = None
         self.lock = asyncio.Lock()
+        self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
         self._seen_ids: set[tuple[int, int]] = set()
 
@@ -720,16 +721,16 @@ class FarmAccount:
         farm_cfg = FARM_CFG.get("farm", {})
         scenario_mode = farm_cfg.get("scenario_mode", "reactive")
         self._running = True
-        if scenario_mode == "reactive":
-            # Listen for real incoming group messages. Shared state deduplicates
-            # the update so at most one account responds.
+        if scenario_mode in {"reactive", "combined"}:
+            # Combined mode keeps the normal reply handler active while a single
+            # scenario scheduler adds sequential account-to-account turns.
             self.client.add_handler(
                 MessageHandler(
                     self._on_incoming,
                     filters.chat(target) & filters.incoming,
                 )
             )
-            if farm_cfg.get("proactive_enabled", False):
+            if scenario_mode == "reactive" and farm_cfg.get("proactive_enabled", False):
                 self._task = asyncio.create_task(self._loop(), name=f"farm-proactive-{self.name}")
 
     async def stop(self) -> None:
@@ -761,7 +762,7 @@ class FarmAccount:
 
     async def _on_incoming(self, client: Client, message: TGMessage) -> None:
         del client
-        if FARM_CFG.get("farm", {}).get("scenario_mode", "reactive") != "reactive":
+        if FARM_CFG.get("farm", {}).get("scenario_mode", "reactive") not in {"reactive", "combined"}:
             return
         if not message or getattr(message, "empty", False) or getattr(message, "service", None):
             return
@@ -840,7 +841,8 @@ class FarmAccount:
         delay = random.uniform(min_delay, max_delay)
         if delay:
             await asyncio.sleep(delay)
-        await self._send_reply(reply_to=message, incoming_text=incoming_text)
+        async with self.state.outgoing_lock:
+            await self._send_reply(reply_to=message, incoming_text=incoming_text)
 
     async def _loop(self) -> None:
         farm_cfg = FARM_CFG.get("farm", {})
@@ -1176,9 +1178,9 @@ async def run_scenario(
     stop_event: asyncio.Event,
     settings: dict[str, Any],
 ) -> None:
-    """Publish a finite, sequential dialogue/roulette line among selected accounts."""
+    """Run the account dialogue (and, in combined mode, keep incoming replies active)."""
     mode = str(settings.get("scenario_mode", "reactive"))
-    if mode not in {"discussion", "roulette"}:
+    if mode not in {"discussion", "roulette", "combined"}:
         return
     if len(accounts) < 2:
         raise RuntimeError("Для сценария нужны минимум два подключённых аккаунта")
@@ -1194,7 +1196,8 @@ async def run_scenario(
     opening_sent = False
     if settings.get("post_opening", True):
         opener = accounts[0]
-        opening_sent = await opener._send_text(topic, reply_to=FARM_CFG.get("topic_id"))
+        async with state.outgoing_lock:
+            opening_sent = await opener._send_text(topic, reply_to=FARM_CFG.get("topic_id"))
         if opening_sent:
             log.info("Сценарий: аккаунт %s опубликовал стартовую тему", opener.name)
         else:
@@ -1228,14 +1231,15 @@ async def run_scenario(
 
         account_offset = 1 if opening_sent else 0
         account = accounts[(turn_index + account_offset) % len(accounts)]
-        async with state.lock:
-            reply_to = state.last_outgoing_message_id
-        if reply_to is None:
-            reply_to = FARM_CFG.get("topic_id")
 
         if mode == "roulette":
             text = str(random.choice(numbers))
-            sent = await account._send_text(text, reply_to=reply_to)
+            async with state.outgoing_lock:
+                async with state.lock:
+                    reply_to = state.last_outgoing_message_id
+                if reply_to is None:
+                    reply_to = FARM_CFG.get("topic_id")
+                sent = await account._send_text(text, reply_to=reply_to)
             action = f"выбрал число {text}"
         else:
             tell_joke = bool(joke_every and (turn_index + 1) % joke_every == 0)
@@ -1249,7 +1253,12 @@ async def run_scenario(
                 global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
             )
             kind = account._pick_kind()
-            sent = await account._send_dialogue_content(text, reply_to=reply_to, kind=kind)
+            async with state.outgoing_lock:
+                async with state.lock:
+                    reply_to = state.last_outgoing_message_id
+                if reply_to is None:
+                    reply_to = FARM_CFG.get("topic_id")
+                sent = await account._send_dialogue_content(text, reply_to=reply_to, kind=kind)
             action = f"рассказал анекдот" if tell_joke else f"продолжил разговор ({kind})"
 
         if sent:
@@ -1260,7 +1269,10 @@ async def run_scenario(
 
     if turn_limit and turn_index >= turn_limit:
         log.info("Сценарий завершён: отправлено ходов=%d", turn_index)
-        stop_event.set()
+        if mode == "combined":
+            log.info("Объединённый режим: ответы на входящие сообщения остаются активными до ручной остановки")
+        else:
+            stop_event.set()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1427,6 +1439,8 @@ async def run_farm() -> None:
     scenario_mode = farm_settings.get("scenario_mode", "reactive")
     if scenario_mode == "reactive":
         log.info("Режим: ответы на входящие сообщения, proactive=%s", farm_settings["proactive_enabled"])
+    elif scenario_mode == "combined":
+        log.info("Режим: объединённый — диалог по теме и ответы участникам")
     else:
         log.info("Режим сценария: %s; автоматические реплики будут чередоваться по очереди", scenario_mode)
 
@@ -1508,6 +1522,8 @@ async def run_farm() -> None:
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
         if scenario_mode == "reactive":
             log.info("🎉 Ферма запущена: %d аккаунтов; режим ответов на сообщения", len(accounts))
+        elif scenario_mode == "combined":
+            log.info("🎉 Объединённый режим запущен: %d аккаунтов; диалог и ответы на сообщения", len(accounts))
         else:
             log.info("🎉 Сценарий запущен: %d аккаунтов; сообщения будут чередоваться по очереди", len(accounts))
 
@@ -1520,7 +1536,7 @@ async def run_farm() -> None:
                 log.exception("Сценарий завершился с ошибкой")
                 stop_event.set()
 
-        if scenario_mode in {"discussion", "roulette"}:
+        if scenario_mode in {"discussion", "roulette", "combined"}:
             scenario_task = asyncio.create_task(run_scenario_safely(), name="farm-scenario")
 
         async def autosave() -> None:

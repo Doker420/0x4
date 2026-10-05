@@ -104,6 +104,26 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts[0].sent[1]["reply_to"], accounts[2].sent[0]["message_id"])
         self.assertIn(accounts[2].sent[0]["text"], farm.CLEAN_JOKES)
 
+    async def test_combined_dialogue_finishes_without_stopping_incoming_replies(self):
+        state = farm.FarmState()
+        accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]
+        stop_event = farm.asyncio.Event()
+        settings = {
+            "scenario_mode": "combined",
+            "scenario_topic": "Обсуждаем полезные привычки.",
+            "scenario_turns": 2,
+            "joke_every": 0,
+            "rest_every": 0,
+            "post_opening": False,
+        }
+
+        with patch.object(farm.random, "uniform", return_value=0):
+            await farm.run_scenario(accounts, state, stop_event, settings)
+
+        self.assertFalse(stop_event.is_set())
+        self.assertEqual([len(account.sent) for account in accounts], [1, 1])
+        self.assertEqual(accounts[1].sent[0]["reply_to"], accounts[0].sent[0]["message_id"])
+
     async def test_roulette_sends_only_configured_random_numbers(self):
         state = farm.FarmState()
         accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]

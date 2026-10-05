@@ -153,7 +153,7 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
     )
 
     mode = str(settings.get("scenario_mode") or "reactive").strip().lower()
-    settings["scenario_mode"] = mode if mode in {"reactive", "discussion", "roulette"} else "reactive"
+    settings["scenario_mode"] = mode if mode in {"reactive", "discussion", "roulette", "combined"} else "reactive"
     settings["scenario_topic"] = str(settings.get("scenario_topic") or "").strip()[:2000]
     settings["scenario_turns"] = _bounded_int(settings.get("scenario_turns"), 20, 0, 500)
     settings["joke_every"] = _bounded_int(settings.get("joke_every"), 5, 0, 1000)

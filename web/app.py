@@ -604,7 +604,7 @@ async def api_chatfarm_start(
 ):
     _current_owner(web_auth)
     scenario_mode = scenario_mode.strip().lower()
-    if scenario_mode not in {"reactive", "discussion", "roulette"}:
+    if scenario_mode not in {"reactive", "discussion", "roulette", "combined"}:
         raise HTTPException(422, "Выберите доступный режим чата")
     scenario_topic = scenario_topic.strip()
     if len(scenario_topic) > 2000:

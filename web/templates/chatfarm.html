@@ -5,7 +5,7 @@
   <div>
     <p class="eyebrow">Ответы и активность</p>
     <h1>Чат-агенты</h1>
-    <p class="subtle">Выберите обычные ответы участникам или последовательный сценарий, в котором подключённые аккаунты общаются по заданной теме.</p>
+    <p class="subtle">Выберите ответы участникам, диалог аккаунтов по теме или объедините оба режима. Рулетка остаётся отдельным сценарием.</p>
   </div>
   <div class="actions">
     <span id="farm_status_badge" class="badge badge-pending">Проверяю статус…</span>
@@ -33,9 +33,10 @@
         <select id="scenario_mode" name="scenario_mode" onchange="updateScenarioForm()">
           <option value="reactive">Ответы на сообщения участников</option>
           <option value="discussion">Диалог аккаунтов по общей теме</option>
+          <option value="combined">Диалог и ответы участникам</option>
           <option value="roulette">Рулетка — случайные числа</option>
         </select>
-        <span class="help">В сценарном режиме аккаунты говорят по очереди и связывают реплики ответами друг на друга.</span>
+        <span id="scenario_mode_help" class="help">В сценарном режиме аккаунты говорят по очереди и связывают реплики ответами друг на друга.</span>
       </div>
       <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
         <div class="notice warning" style="margin-bottom:12px">Сообщения будут отправлены в Telegram от выбранных аккаунтов. Используйте сценарии только в группе, которой управляете, и предупредите участников об автоматизации.</div>
@@ -50,7 +51,7 @@
           <span class="help">Можно указать диапазон или список; аккаунты публикуют только числа.</span>
         </div>
         <div class="grid-2">
-          <div class="field"><label for="scenario_turns">Ходов диалога</label><input id="scenario_turns" name="scenario_turns" type="number" min="0" max="500" step="1" value="20" required><span class="help">0 — работать до ручной остановки.</span></div>
+          <div class="field"><label id="scenario_turn_label" for="scenario_turns">Ходов диалога</label><input id="scenario_turns" name="scenario_turns" type="number" min="0" max="500" step="1" value="20" required><span id="scenario_turn_help" class="help">0 — работать до ручной остановки.</span></div>
           <div class="field"><label for="joke_every">Анекдот каждые N ходов</label><input id="joke_every" name="joke_every" type="number" min="0" max="1000" step="1" value="5" required><span class="help">0 — выключить; в рулетке не используется.</span></div>
           <div class="field"><label for="rest_every">Отдыхать после N ходов</label><input id="rest_every" name="rest_every" type="number" min="0" max="1000" step="1" value="6" required><span class="help">0 — без длинных перерывов.</span></div>
           <div class="grid-2">
@@ -59,7 +60,7 @@
           </div>
         </div>
         <div class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
-        <p class="help">В дискуссии медиа (GIF, стикеры, фото и голосовые) выбираются по весам аккаунта. Реплики чередуются по порядку списка аккаунтов.</p>
+        <p id="scenario_runtime_help" class="help">В диалоге медиа (GIF, стикеры, фото и голосовые) выбираются по весам аккаунта. Реплики чередуются по порядку списка аккаунтов.</p>
       </div>
       <div class="field">
         <label>Аккаунты</label>
@@ -80,13 +81,13 @@
       </div>
       <span id="delay_help" class="help">В сценарном режиме минимум 5 секунд между сообщениями, чтобы не перегружать чат.</span>
       <details id="reactive_options" style="margin:8px 0 16px">
-        <summary style="cursor:pointer;color:#b7c8dc;font-weight:700;font-size:13px">Вероятности для этого запуска</summary>
+        <summary style="cursor:pointer;color:#b7c8dc;font-weight:700;font-size:13px">Ответы и реакции</summary>
         <div class="grid-2" style="margin-top:12px">
-          <div class="field"><label>Q&amp;A, 0–1</label><input name="qa_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.qa_probability }}"></div>
-          <div class="field"><label>Диалоги, 0–1</label><input name="clone_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.clone_probability }}"></div>
+          <div class="field" id="qa_probability_field"><label>Q&amp;A, 0–1</label><input name="qa_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.qa_probability }}"></div>
+          <div class="field" id="clone_probability_field"><label>Диалоги, 0–1</label><input name="clone_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.clone_probability }}"></div>
           <div class="field"><label>Реакции, 0–1</label><input name="reaction_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.reaction_probability }}"></div>
         </div>
-        <p class="help">Q&amp;A и диалоги используются только при включённом proactive-режиме в разделе «Поведение».</p>
+        <p id="reply_settings_help" class="help">Q&amp;A и диалоги используются только при включённом proactive-режиме в разделе «Поведение».</p>
       </details>
       <button id="btn_start_farm" type="submit" style="width:100%;min-height:46px">▶ Запустить ответы в чате</button>
     </form>
@@ -118,22 +119,51 @@ function updateScenarioForm() {
   if (!selector) return;
   const mode = selector.value;
   const active = mode !== 'reactive';
+  const combined = mode === 'combined';
+  const roulette = mode === 'roulette';
   document.getElementById('scenario_fields').hidden = !active;
-  document.getElementById('roulette_fields').hidden = mode !== 'roulette';
-  document.getElementById('reactive_options').hidden = active;
+  document.getElementById('roulette_fields').hidden = !roulette;
+  document.getElementById('reactive_options').hidden = !(mode === 'reactive' || combined);
+  document.getElementById('qa_probability_field').hidden = mode !== 'reactive';
+  document.getElementById('clone_probability_field').hidden = mode !== 'reactive';
   document.getElementById('scenario_topic').required = active;
-  document.getElementById('roulette_numbers').required = mode === 'roulette';
+  document.getElementById('roulette_numbers').required = roulette;
+  document.getElementById('scenario_turn_label').textContent = roulette ? 'Ходов рулетки' : 'Ходов диалога';
+  document.getElementById('scenario_turn_help').textContent = combined
+    ? 'По достижении лимита диалог завершится, но ответы на входящие останутся активны до ручной остановки; 0 — без лимита.'
+    : '0 — выполнять сценарий до ручной остановки.';
+  document.getElementById('scenario_mode_help').textContent = combined
+    ? 'Аккаунты по очереди обсуждают тему и параллельно отвечают участникам группы.'
+    : roulette
+      ? 'Аккаунты по очереди публикуют числа из заданного диапазона; ответы участникам отключены.'
+      : mode === 'discussion'
+        ? 'Аккаунты по очереди обсуждают тему и связывают реплики ответами друг на друга.'
+        : 'Аккаунты отвечают на сообщения участников; можно настроить задержку, вероятность ответа и медиа.';
+  document.getElementById('scenario_runtime_help').textContent = combined
+    ? 'Диалог идёт по очереди, а ответы на входящие сообщения работают одновременно. После лимита ходов диалог остановится, ответы останутся включены.'
+    : roulette
+      ? 'Рулетка публикует только случайные числа из заданного диапазона или списка.'
+      : 'В диалоге медиа (GIF, стикеры, фото и голосовые) выбираются по весам аккаунта. Реплики чередуются по порядку списка аккаунтов.';
+  document.getElementById('reply_settings_help').textContent = combined
+    ? 'Вероятность ответа и выбор медиа настраиваются у каждого аккаунта; здесь задаётся вероятность реакций. Q&A и случайные диалоги не запускаются отдельно.'
+    : 'Q&A и клонирование диалогов используются только при включённом proactive-режиме в разделе «Поведение».';
   document.getElementById('min_delay').min = active ? '5' : '0';
   if (!delayTouched) {
     document.getElementById('min_delay').value = active ? '20' : reactiveDelayDefaults.min;
     document.getElementById('max_delay').value = active ? '45' : reactiveDelayDefaults.max;
   }
-  document.getElementById('delay_help').textContent = active
-    ? 'Пауза между репликами сценария; для такого режима минимум 5 секунд.'
-    : 'Задержка перед ответом на входящее сообщение.';
-  document.getElementById('btn_start_farm').textContent = active
-    ? '▶ Запустить сценарий по очереди'
-    : '▶ Запустить ответы в чате';
+  document.getElementById('delay_help').textContent = combined
+    ? 'Пауза между ходами диалога и перед ответом участнику; минимум 5 секунд.'
+    : active
+      ? 'Пауза между ходами сценария; минимум 5 секунд.'
+      : 'Задержка перед ответом на входящее сообщение.';
+  document.getElementById('btn_start_farm').textContent = combined
+    ? '▶ Запустить диалог и ответы'
+    : roulette
+      ? '▶ Запустить рулетку'
+      : mode === 'discussion'
+        ? '▶ Запустить диалог по теме'
+        : '▶ Запустить ответы в чате';
 }
 document.getElementById('min_delay')?.addEventListener('input', () => { delayTouched = true; });
 document.getElementById('max_delay')?.addEventListener('input', () => { delayTouched = true; });

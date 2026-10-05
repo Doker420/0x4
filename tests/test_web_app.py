@@ -47,6 +47,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         chatfarm = await self.client.get("/chatfarm")
         self.assertEqual(chatfarm.status_code, 200)
         self.assertIn("Диалог аккаунтов по общей теме", chatfarm.text)
+        self.assertIn("Диалог и ответы участникам", chatfarm.text)
         self.assertIn("Рулетка — случайные числа", chatfarm.text)
         self.assertIn("Отдыхать после N ходов", chatfarm.text)
 
@@ -127,6 +128,28 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["scenario_mode"], "discussion")
         self.assertEqual(submitted["scenario_turns"], 8)
         self.assertTrue(submitted["post_opening"])
+
+    async def test_chatfarm_accepts_combined_dialogue_and_incoming_replies(self):
+        for name in ("alpha", "beta"):
+            await db.upsert_account(
+                name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+            )
+        payload = {
+            "accounts": "alpha,beta",
+            "target_id": "-1001234567890",
+            "min_delay": "20",
+            "max_delay": "45",
+            "scenario_mode": "combined",
+            "scenario_topic": "Обсудите тему и отвечайте участникам.",
+            "scenario_turns": "4",
+        }
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=72) as submit:
+            response = await self.client.post("/api/chatfarm/start", data=payload)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        submitted = submit.await_args.args[1]
+        self.assertEqual(submitted["scenario_mode"], "combined")
+        self.assertEqual(submitted["scenario_turns"], 4)
 
     async def test_chatfarm_scenario_requires_multiple_accounts_and_valid_numbers(self):
         for name in ("alpha", "beta"):
