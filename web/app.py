@@ -243,6 +243,7 @@ async def accounts_page(request: Request, web_auth: Optional[str] = Cookie(defau
     rows = await db.list_accounts()
     sessions = await db.list_sessions()
     settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+    default_api_id, default_api_hash = await manager.manager.default_api_credentials()
     return _render(
         request,
         "accounts.html",
@@ -250,6 +251,10 @@ async def accounts_page(request: Request, web_auth: Optional[str] = Cookie(defau
             "accounts": [_account_for_ui(row) for row in rows],
             "sessions": sessions,
             "settings": settings,
+            "session_defaults": {
+                "api_id": default_api_id or "",
+                "api_hash_set": bool(default_api_hash),
+            },
             "active_accounts": await manager.manager.list_active(),
         },
     )
@@ -261,11 +266,32 @@ async def api_scan_sessions(web_auth: Optional[str] = Cookie(default=None)):
     return {"sessions": await manager.manager.scan_sessions_dir()}
 
 
+@app.post("/api/accounts/session-defaults")
+async def api_save_session_defaults(
+    api_id: int = Form(...),
+    api_hash: str = Form(default=""),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    if api_id <= 0:
+        raise HTTPException(422, "Telegram API ID должен быть положительным числом")
+    supplied_hash = api_hash.strip()
+    if supplied_hash:
+        resolved_hash = supplied_hash
+    else:
+        _, resolved_hash = await manager.manager.default_api_credentials()
+    if not resolved_hash:
+        raise HTTPException(422, "Укажите Telegram API Hash из my.telegram.org")
+    await db.set_setting("telegram_api_id", str(api_id))
+    await db.set_setting("telegram_api_hash", resolved_hash)
+    return {"ok": True, "sessions": await manager.manager.scan_sessions_dir()}
+
+
 @app.post("/api/accounts/auth/start")
 async def api_auth_start(
     name: str = Form(...),
-    api_id: int = Form(...),
-    api_hash: str = Form(...),
+    api_id: Optional[int] = Form(default=None),
+    api_hash: str = Form(default=""),
     phone: str = Form(...),
     proxy: str = Form(default=""),
     persona: str = Form(default=""),
@@ -282,6 +308,14 @@ async def api_auth_start(
     try:
         safe_name = validate_session_name(name)
         existing = await db.get_account(safe_name)
+        default_api_id, default_api_hash = await manager.manager.default_api_credentials()
+        api_id = api_id or (existing.get("api_id") if existing else None) or default_api_id
+        api_hash = api_hash.strip()
+        if not api_hash and existing:
+            api_hash = str(existing.get("api_hash") or "")
+        api_hash = api_hash or default_api_hash
+        if not api_id or not api_hash:
+            raise ValueError("Введите API ID/Hash или сначала задайте общие credentials вверху страницы")
         if existing:
             persona = persona.strip() or str(existing.get("persona") or "")
             proxy = proxy.strip() or str(existing.get("proxy") or "")

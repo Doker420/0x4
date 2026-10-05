@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import time
 import urllib.parse
@@ -251,6 +252,20 @@ class AccountManager:
             last_checked_at=time.time(),
         )
 
+    async def default_api_credentials(self) -> tuple[int | None, str]:
+        """Shared Telegram app credentials used to import local session files."""
+        raw_api_id = await db.get_setting("telegram_api_id", "")
+        raw_api_hash = await db.get_setting("telegram_api_hash", "")
+        raw_api_id = raw_api_id or os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID", "")
+        api_hash = raw_api_hash or os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH", "")
+        try:
+            api_id = int(raw_api_id)
+            if api_id <= 0:
+                api_id = None
+        except (TypeError, ValueError):
+            api_id = None
+        return api_id, str(api_hash or "").strip()
+
     async def list_active(self) -> List[str]:
         return [name for name, client in self._clients.items() if client.is_connected]
 
@@ -298,7 +313,7 @@ class AccountManager:
             await self._disconnect(client)
 
     async def scan_sessions_dir(self) -> List[dict]:
-        """Find local sessions and verify any account with known credentials."""
+        """Import and verify local sessions using per-account or shared credentials."""
         results: List[dict] = []
         cfg_accounts: Dict[str, dict] = {}
         cfg_path = ROOT / "farm_config.json"
@@ -311,6 +326,7 @@ class AccountManager:
             except Exception as exc:
                 log.warning("Не удалось прочитать локальный farm_config.json (%s)", type(exc).__name__)
 
+        default_api_id, default_api_hash = await self.default_api_credentials()
         for path in sorted(SESSIONS_DIR.glob("*.session")):
             if not path.is_file() or not SESSION_NAME_RE.fullmatch(path.stem):
                 continue
@@ -319,22 +335,36 @@ class AccountManager:
             account = await db.get_account(name)
             legacy = cfg_accounts.get(name, {})
 
-            # Import old local config only for an unconfigured account; never overwrite
-            # a record already edited in the web panel.
-            if not account and legacy.get("api_id") and legacy.get("api_hash"):
+            # Prefer credentials stored for this account, then the legacy local
+            # config, and finally the shared defaults entered once in the panel.
+            legacy_api_id = legacy.get("api_id") or default_api_id
+            legacy_api_hash = legacy.get("api_hash") or default_api_hash
+            if not account and legacy_api_id and legacy_api_hash:
+                has_legacy_credentials = bool(legacy.get("api_id") and legacy.get("api_hash"))
                 await db.upsert_account(
                     name,
-                    api_id=int(legacy["api_id"]),
-                    api_hash=str(legacy["api_hash"]),
+                    api_id=int(legacy_api_id),
+                    api_hash=str(legacy_api_hash),
                     phone=str(legacy.get("phone") or ""),
                     proxy=str(legacy.get("proxy") or ""),
                     persona=str(legacy.get("persona") or ""),
                     reply_probability=float(legacy.get("reply_probability", DEFAULT_FARM_SETTINGS["default_reply_probability"])),
                     media_bias=json.dumps(normalize_media_bias(legacy.get("media_bias")), ensure_ascii=False),
-                    behavior_customized=1,
+                    behavior_customized=1 if has_legacy_credentials else 0,
                     enabled=1,
+                    session_status="unknown",
                 )
                 account = await db.get_account(name)
+
+            if account:
+                credential_updates: Dict[str, Any] = {}
+                if not account.get("api_id") and legacy_api_id:
+                    credential_updates["api_id"] = int(legacy_api_id)
+                if not account.get("api_hash") and legacy_api_hash:
+                    credential_updates["api_hash"] = str(legacy_api_hash)
+                if credential_updates:
+                    await db.upsert_account(name, **credential_updates)
+                    account.update(credential_updates)
 
             if not account or not account.get("api_id") or not account.get("api_hash"):
                 results.append({"name": name, "source": "sessions/", "status": "needs_credentials"})
@@ -345,8 +375,8 @@ class AccountManager:
                     name,
                     int(account["api_id"]),
                     str(account["api_hash"]),
-                    str(account.get("phone") or ""),
-                    str(account.get("proxy") or ""),
+                    str(account.get("phone") or legacy.get("phone") or ""),
+                    str(account.get("proxy") or legacy.get("proxy") or ""),
                 )
                 results.append({
                     "name": name,

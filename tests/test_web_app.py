@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from web import auth, db
-from web.app import app
+from web import auth, db, manager
+from web.app import app, auth_flow
 
 
 class WebAppTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +36,8 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts.status_code, 200)
         self.assertIn("Подключить по телефону", accounts.text)
         self.assertIn("panel_agent", accounts.text)
+        self.assertIn("onclick='openAccountEdit(\"panel_agent\")'", accounts.text)
+        self.assertIn("onclick='deleteAccount(\"panel_agent\")'", accounts.text)
         self.assertNotIn("never-send-this-to-browser", accounts.text)
 
         settings = await self.client.get("/settings")
@@ -47,6 +49,33 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Диалог аккаунтов по общей теме", chatfarm.text)
         self.assertIn("Рулетка — случайные числа", chatfarm.text)
         self.assertIn("Отдыхать после N ходов", chatfarm.text)
+
+    async def test_shared_session_credentials_are_saved_and_trigger_auto_scan(self):
+        scan_results = [{"name": "alice", "source": "sessions/", "status": "authorized", "username": "alice_tg"}]
+        with patch.object(manager.manager, "scan_sessions_dir", new=AsyncMock(return_value=scan_results)) as scan:
+            response = await self.client.post("/api/accounts/session-defaults", data={
+                "api_id": "12345", "api_hash": "private-session-app-hash",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(await db.get_setting("telegram_api_id"), "12345")
+        self.assertEqual(await db.get_setting("telegram_api_hash"), "private-session-app-hash")
+        self.assertEqual(response.json()["sessions"][0]["status"], "authorized")
+        scan.assert_awaited_once()
+        page = await self.client.get("/accounts")
+        self.assertIn("Общие credentials заданы", page.text)
+        self.assertNotIn("private-session-app-hash", page.text)
+
+    async def test_reauthorization_uses_saved_account_credentials_when_form_fields_are_blank(self):
+        await db.upsert_account(
+            "alice", api_id=456, api_hash="stored-api-hash", phone="+10000000000",
+            enabled=1, session_status="unauthorized",
+        )
+        with patch.object(auth_flow, "start", new=AsyncMock(return_value={"status": "authorized"})) as start:
+            response = await self.client.post("/api/accounts/auth/start", data={
+                "name": "alice", "phone": "+10000000000",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(start.await_args.args[:3], ("alice", 456, "stored-api-hash"))
 
     async def test_account_can_switch_between_shared_and_custom_behavior(self):
         await db.upsert_account(

@@ -13,6 +13,25 @@
   </div>
 </section>
 
+<section class="card" style="margin-bottom:18px">
+  <div class="card-head">
+    <div>
+      <h2>Автоимпорт сессий из папки</h2>
+      <p class="subtle">Введите Telegram API ID и Hash один раз. Панель просканирует <code>sessions/*.session</code>, добавит найденные аккаунты и проверит их.</p>
+    </div>
+    <span class="badge {{ 'badge-ok' if session_defaults.api_hash_set else 'badge-pending' }}">{{ 'Общие credentials заданы' if session_defaults.api_hash_set else 'Нужны API credentials' }}</span>
+  </div>
+  <form id="session_defaults_form" onsubmit="saveSessionDefaults(event)">
+    <div class="grid-2">
+      <div class="field"><label for="session_api_id">Telegram API ID</label><input id="session_api_id" name="api_id" type="number" min="1" value="{{ session_defaults.api_id }}" placeholder="Из my.telegram.org" required></div>
+      <div class="field"><label for="session_api_hash">Telegram API Hash</label><input id="session_api_hash" name="api_hash" type="password" autocomplete="new-password" placeholder="{{ 'Уже сохранён — оставьте пустым, чтобы не менять' if session_defaults.api_hash_set else 'Из my.telegram.org' }}" {% if not session_defaults.api_hash_set %}required{% endif %}></div>
+    </div>
+    <button id="session_defaults_btn" type="submit" class="secondary">Сохранить и проверить папку sessions/</button>
+  </form>
+  <div id="session_defaults_output" class="notice" hidden style="margin-top:12px"></div>
+  <p class="help" style="margin-top:10px">Если файл содержит действующую авторизацию, он подключится автоматически. Истёкшая сессия потребует вход по телефону, коду Telegram и, при необходимости, паролю 2FA. Hash хранится только на сервере и повторно не показывается.</p>
+</section>
+
 <div class="grid">
   <section class="card">
     <div class="card-head">
@@ -36,11 +55,11 @@
       <div class="form-grid">
         <div class="field">
           <label for="auth_api_id">Telegram API ID</label>
-          <input id="auth_api_id" name="api_id" type="number" min="1" placeholder="Из my.telegram.org" required>
+          <input id="auth_api_id" name="api_id" type="number" min="1" value="{{ session_defaults.api_id }}" placeholder="Из my.telegram.org или сохранённые defaults">
         </div>
         <div class="field">
           <label for="auth_api_hash">Telegram API Hash</label>
-          <input id="auth_api_hash" name="api_hash" type="password" autocomplete="off" placeholder="Секретный ключ приложения" required>
+          <input id="auth_api_hash" name="api_hash" type="password" autocomplete="off" placeholder="{{ 'Сохранён в общих defaults — можно оставить пустым' if session_defaults.api_hash_set else 'Из my.telegram.org или сохранённые defaults' }}">
         </div>
       </div>
       <div class="field">
@@ -147,8 +166,8 @@
             {% if not a.enabled %}<br><span class="badge badge-pending" style="margin-top:5px">Выключен</span>{% endif %}
           </td>
           <td class="nowrap">
-            <button type="button" class="secondary small" onclick="openAccountEdit({{ a.name|tojson }})">Настроить</button>
-            <button type="button" class="danger small" onclick="deleteAccount({{ a.name|tojson }})" style="margin-top:5px">Убрать</button>
+            <button type="button" class="secondary small" onclick='openAccountEdit({{ a.name|tojson }})'>Настроить</button>
+            <button type="button" class="danger small" onclick='deleteAccount({{ a.name|tojson }})' style="margin-top:5px">Убрать</button>
           </td>
         </tr>
       {% endfor %}
@@ -210,6 +229,41 @@ function setOutput(id, text, kind = '') {
   const element = document.getElementById(id);
   showMessage(element, text, kind);
 }
+function renderSessionResults(output, rows) {
+  const labels = {
+    authorized: 'авторизован',
+    unauthorized: 'нужен повторный вход',
+    needs_credentials: 'нужны API ID/Hash',
+  };
+  output.textContent = rows.length
+    ? rows.map(row => `${row.status === 'authorized' ? '✓' : '•'} ${row.name}: ${labels[row.status] || row.status}${row.username ? ' (@' + row.username + ')' : ''}`).join('\\n')
+    : 'Файлы .session не найдены в папке sessions/.';
+  output.className = `notice ${rows.some(row => row.status !== 'authorized') ? 'warning' : 'success'}`;
+  output.hidden = false;
+}
+async function saveSessionDefaults(event) {
+  event.preventDefault();
+  const form = event.target;
+  const button = document.getElementById('session_defaults_btn');
+  const output = document.getElementById('session_defaults_output');
+  button.disabled = true; button.textContent = 'Сохраняю и проверяю…';
+  try {
+    const response = await fetch('/api/accounts/session-defaults', {method: 'POST', body: new FormData(form)});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось сохранить credentials');
+    renderSessionResults(output, data.sessions || []);
+    form.elements.api_hash.value = '';
+    form.elements.api_hash.placeholder = 'Сохранён — оставьте пустым, чтобы не менять';
+    form.elements.api_hash.required = false;
+    if ((data.sessions || []).some(row => row.status !== 'needs_credentials')) {
+      setTimeout(() => location.reload(), 1200);
+    }
+  } catch (error) {
+    showMessage(output, error.message, 'error');
+  } finally {
+    button.disabled = false; button.textContent = 'Сохранить и проверить папку sessions/';
+  }
+}
 async function scanSessions() {
   const output = document.getElementById('scan_output');
   showMessage(output, 'Проверяю локальные .session-файлы и статус авторизации…');
@@ -218,12 +272,8 @@ async function scanSessions() {
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Не удалось проверить сессии');
     const rows = data.sessions || [];
-    output.textContent = rows.length
-      ? rows.map(row => `${row.status === 'authorized' ? '✓' : '•'} ${row.name}: ${row.status}${row.username ? ' (@' + row.username + ')' : ''}`).join('\n')
-      : 'Файлы .session не найдены в папке sessions/.';
-    output.className = `notice ${rows.some(row => row.status === 'unauthorized') ? 'warning' : 'success'}`;
-    output.hidden = false;
-    if (rows.some(row => row.status === 'authorized')) setTimeout(() => location.reload(), 900);
+    renderSessionResults(output, rows);
+    if (rows.some(row => row.status !== 'needs_credentials')) setTimeout(() => location.reload(), 900);
   } catch (error) { showMessage(output, error.message, 'error'); }
 }
 
@@ -236,7 +286,10 @@ async function beginAuth(event) {
   button.disabled = true; button.textContent = 'Подключаюсь…';
   result.hidden = true;
   try {
-    const response = await fetch('/api/accounts/auth/start', {method: 'POST', body: new FormData(form)});
+    const credentials = new FormData(form);
+    if (!form.elements.api_id.value) credentials.delete('api_id');
+    if (!form.elements.api_hash.value.trim()) credentials.delete('api_hash');
+    const response = await fetch('/api/accounts/auth/start', {method: 'POST', body: credentials});
     const data = await response.json();
     if (!response.ok || data.ok === false) throw new Error(data.error || data.detail || 'Ошибка авторизации');
     if (data.status === 'authorized') {
