@@ -380,6 +380,30 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(answer)
 
 
+    async def test_send_reply_blocks_canned_output_at_the_final_send_boundary(self):
+        canned = "Спасибо за вопрос! Не хочу гадать без контекста — уточните, пожалуйста, что для вас важнее всего."
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.persona = "синтетическая роль"
+        account.bridge = None
+        account.donor = object()
+        account.state = farm.FarmState()
+        reply_to = types.SimpleNamespace(id=44)
+        send_text = AsyncMock(return_value=True)
+
+        with (
+            patch.object(farm, "generate_reply", new=AsyncMock(return_value=canned)),
+            patch.object(account, "_pick_kind", return_value="text"),
+            patch.object(account, "_send_text", new=send_text),
+        ):
+            sent = await account._send_reply(reply_to=reply_to, incoming_text="всм это мне:")
+
+        self.assertTrue(sent)
+        self.assertEqual(send_text.await_count, 1)
+        self.assertNotIn("Спасибо за вопрос", send_text.await_args.args[0])
+        self.assertNotIn("Не хочу гадать", send_text.await_args.args[0])
+        self.assertIs(send_text.await_args.kwargs["reply_to"], reply_to)
+
     async def test_question_text_is_included_in_the_generated_reply_prompt(self):
         state = farm.FarmState()
         state.topic = "Обсуждаем полезные привычки"

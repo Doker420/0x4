@@ -1593,12 +1593,27 @@ class FarmAccount:
         reply_to: TGMessage | int | None = None,
         incoming_text: str = "",
     ) -> bool:
+        scenario_mode = str(FARM_CFG.get("farm", {}).get("scenario_mode", "reactive"))
+
+        async def local_fallback() -> str:
+            async with self.state.lock:
+                donor_history, live_history = _state_history_parts(self.state, self.name)
+                history = [*donor_history[-8:], *live_history[-60:]]
+                topic = self.state.topic
+            fallback_input = incoming_text
+            if not fallback_input and reply_to is None:
+                fallback_input = _recent_human_context(history, "") or "Интересная мысль"
+            return _offline_conversational_reply(
+                fallback_input,
+                history,
+                topic if scenario_mode != "reactive" else "",
+            )
+
         try:
             persona = self.persona
             global_prompt = str(FARM_CFG.get("farm", {}).get("agent_prompt", "")).strip()
             if global_prompt:
                 persona = f"{persona}\nОбщие указания: {global_prompt}"
-            scenario_mode = str(FARM_CFG.get("farm", {}).get("scenario_mode", "reactive"))
             text = await generate_reply(
                 self.bridge,
                 self.state,
@@ -1609,8 +1624,14 @@ class FarmAccount:
                 account_name=self.name,
             )
         except Exception:
-            log.exception("[%s] reply generation failed", self.name)
-            text = "Понял, спасибо что поделился 🙂"
+            log.exception("[%s] reply generation failed; using local conversation fallback", self.name)
+            text = await local_fallback()
+
+        # Keep a final send-boundary guard in case a bridge, plugin, or stale
+        # generation path bypasses generate_reply's retry and filtering.
+        if _is_canned_reply(text):
+            log.warning("[%s] blocked canned reply at send boundary", self.name)
+            text = await local_fallback()
 
         kind = self._pick_kind()
         try:
