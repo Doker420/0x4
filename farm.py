@@ -300,6 +300,56 @@ class DeepSeekSession:
 #                    STATE
 # ═══════════════════════════════════════════════════════════════
 
+# Punctuation is ignored when comparing two lines, emoji are not: 😄 and 😂 stay different.
+_TEXT_KEY_PUNCTUATION = set(".,!?;:\u2014\u2013-()[]{}\"'\u00ab\u00bb\u2026\u201c\u201d\u201e")
+
+
+def _text_key(text: str) -> str:
+    """Casefolded form used to spot the same line sent twice."""
+    cleaned = "".join(" " if char in _TEXT_KEY_PUNCTUATION else char for char in str(text or "").casefold())
+    return " ".join(cleaned.split())
+
+
+def _pick_unused(candidates: Any, avoid: Any) -> str:
+    """Return a candidate nobody used recently, least-recently-used first."""
+    pool = [str(item).strip() for item in candidates if str(item).strip()]
+    if not pool:
+        return ""
+    # The latest mention of each line wins, so a line that just sounded counts as new.
+    last_seen: dict[str, int] = {}
+    for index, item in enumerate(avoid):
+        key = _text_key(item)
+        if key:
+            last_seen[key] = index
+    fresh = [item for item in pool if _text_key(item) not in last_seen]
+    if fresh:
+        return random.choice(fresh)
+    # Every candidate already sounded: take the one that left the window longest ago.
+    def age(item: str) -> int:
+        return last_seen.get(_text_key(item), -1)
+
+    oldest = min(age(item) for item in pool)
+    return random.choice([item for item in pool if age(item) == oldest])
+
+
+def _is_farm_repeat(text: str, recent_lines: Any) -> bool:
+    """True when another account already sent this same line."""
+    key = _text_key(text)
+    return bool(key) and any(_text_key(line) == key for line in recent_lines)
+
+
+def _repetition_hint(lines: Any, limit: int = 6) -> str:
+    """Prompt addendum listing what the farm already said, so the model does not repeat it."""
+    recent = [str(line).strip()[:90] for line in list(lines)[-limit:] if str(line).strip()]
+    if not recent:
+        return ""
+    listed = "\n".join(f"— {line}" for line in recent)
+    return (
+        "\n\nЭти реплики уже звучали в чате (любым аккаунтом). Не повторяй их, не пересказывай "
+        f"и не перефразируй в ту же сторону:\n{listed}"
+    )
+
+
 class FarmState:
     def __init__(self) -> None:
         self.chat_history: deque[dict[str, Any]] = deque(maxlen=60)
@@ -318,6 +368,9 @@ class FarmState:
         # Media keys (donor files, configured links, provider URLs) used recently,
         # shared by every account so two accounts do not open with the same gif.
         self.recent_media: deque[str] = deque(maxlen=200)
+        # Lines already sent by any account, shared farm-wide: consecutive bot
+        # messages must never repeat each other.
+        self.recent_texts: deque[str] = deque(maxlen=40)
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
@@ -333,6 +386,18 @@ class FarmState:
     def mark_media(self, key: str) -> None:
         if key:
             self.recent_media.append(key)
+
+    def text_seen(self, text: str) -> bool:
+        """True when this exact line (ignoring punctuation) was sent recently."""
+        key = _text_key(text)
+        if not key:
+            return False
+        return any(_text_key(item) == key for item in self.recent_texts)
+
+    def mark_text(self, text: str) -> None:
+        value = str(text or "").strip()
+        if value:
+            self.recent_texts.append(value)
 
     def remember_message(self, chat_id: int, message_id: int) -> bool:
         key = (int(chat_id), int(message_id))
@@ -351,6 +416,7 @@ class FarmState:
             "last_outgoing_message_id": self.last_outgoing_message_id,
             "account_participant_ids": self.account_participant_ids,
             "used_archive_ids": {account: sorted(ids) for account, ids in self.used_archive_ids.items()},
+            "recent_texts": list(self.recent_texts),
         }
 
     def load(self, data: dict[str, Any]) -> None:
@@ -365,6 +431,9 @@ class FarmState:
                         self.used_archive_ids[str(account)] = {int(value) for value in ids or ()}
                 except (TypeError, ValueError):
                     continue
+        self.recent_texts = deque(
+            (str(item) for item in (data.get("recent_texts") or []) if str(item).strip()), maxlen=40
+        )
         self.topic = data.get("topic", "общее общение")
         message_id = data.get("last_outgoing_message_id")
         self.last_outgoing_message_id = int(message_id) if message_id else None
@@ -687,12 +756,20 @@ def is_dialogue_echo(candidate: str, history: list[dict[str, Any]] | deque[dict[
     return False
 
 
-def _fallback_was_sent(candidate: str, history: list[dict[str, Any]]) -> bool:
+def _fallback_was_sent(candidate: str, history: Any) -> bool:
+    """Accept both chat rows and plain lines, so idle/room-wide checks reuse it."""
     candidate_norm = " ".join(_echo_tokens(candidate))
     if not candidate_norm:
         return False
-    for item in reversed([row for row in history if row.get("direction") == "outgoing" and row.get("text")][-8:]):
-        previous_norm = " ".join(_echo_tokens(str(item.get("text") or "")))
+    spoken: list[str] = []
+    for row in history:
+        if isinstance(row, dict):
+            if row.get("direction") == "outgoing" and row.get("text"):
+                spoken.append(str(row.get("text") or ""))
+        elif str(row or "").strip():
+            spoken.append(str(row))
+    for previous in spoken[-8:]:
+        previous_norm = " ".join(_echo_tokens(previous))
         if candidate_norm == previous_norm or (
             len(previous_norm) >= 40 and previous_norm in candidate_norm
         ):
@@ -701,12 +778,24 @@ def _fallback_was_sent(candidate: str, history: list[dict[str, Any]]) -> bool:
 
 
 def _choose_fresh_fallback(
-    candidates: tuple[str, ...], history: list[dict[str, Any]], turn_number: int, topic_line: str
+    candidates: tuple[str, ...],
+    history: list[dict[str, Any]],
+    turn_number: int,
+    topic_line: str,
+    avoid: Any = (),
 ) -> str:
     start = (max(1, turn_number) - 1) % len(candidates)
+    history_texts = [
+        str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in history
+    ]
+    used = [*history_texts, *[str(line) for line in avoid]]
     for offset in range(len(candidates)):
         candidate = candidates[(start + offset) % len(candidates)]
-        if not _fallback_was_sent(candidate, history) and not _is_circular_dialogue_reply(candidate):
+        if (
+            not _fallback_was_sent(candidate, history)
+            and not _is_circular_dialogue_reply(candidate)
+            and _text_key(candidate) not in {_text_key(line) for line in used}
+        ):
             return candidate
     fresh_options = (
         f"Следующий предметный шаг по «{topic_line}» — проверить один критерий на конкретном примере.",
@@ -715,9 +804,13 @@ def _choose_fresh_fallback(
         "Пока вывод предварительный: одного наблюдения мало, поэтому нужен ещё один проверяемый факт.",
     )
     for candidate in fresh_options:
-        if not _fallback_was_sent(candidate, history) and not _is_circular_dialogue_reply(candidate):
+        if (
+            not _fallback_was_sent(candidate, history)
+            and not _is_circular_dialogue_reply(candidate)
+            and _text_key(candidate) not in {_text_key(line) for line in used}
+        ):
             return candidate
-    return fresh_options[start % len(fresh_options)]
+    return _pick_unused((*candidates, *fresh_options), used) or fresh_options[start % len(fresh_options)]
 
 
 async def generate_reply(
@@ -735,6 +828,7 @@ async def generate_reply(
         history = [*donor_history[-8:], *live_history[-60:]]
         context = build_context(deque(_prompt_history_window(donor_history, live_history), maxlen=60), limit=20)
         topic = state.topic
+        recent_lines = list(state.recent_texts)
     if bridge and getattr(bridge, "is_ready", False):
         try:
             topic_context = f"Текущая тема сценария: {topic}" if include_scenario_topic and topic else ""
@@ -743,18 +837,23 @@ async def generate_reply(
                 topic_context=topic_context,
                 context=context,
                 incoming=incoming_text or "(нет текста — ответь на медиа-сообщение)",
-            )
+            ) + _repetition_hint(recent_lines)
             text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
-            if text and (is_dialogue_echo(text, history) or _is_canned_reply(text)):
+            if text and (
+                is_dialogue_echo(text, history) or _is_canned_reply(text) or _is_farm_repeat(text, recent_lines)
+            ):
                 log.warning("[%s] generated reply was repetitive or canned; retrying once", persona[:20])
                 retry_prompt = (
                     prompt
-                    + "\n\nПредыдущая попытка повторила реплику или звучала как шаблон. "
-                    "Дай короткий живой ответ конкретно на входящее сообщение. Не начинай с благодарности за вопрос, "
-                    "не говори «не хочу гадать без контекста» и не задавай встречный вопрос автоматически."
+                    + "\n\nПредыдущая попытка повторила реплику другого аккаунта или звучала как шаблон. "
+                    "Дай короткий живой ответ конкретно на входящее сообщение, другими словами. "
+                    "Не начинай с благодарности за вопрос, не говори «не хочу гадать без контекста» "
+                    "и не задавай встречный вопрос автоматически."
                 )
                 text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
-                if text and (is_dialogue_echo(text, history) or _is_canned_reply(text)):
+                if text and (
+                    is_dialogue_echo(text, history) or _is_canned_reply(text) or _is_farm_repeat(text, recent_lines)
+                ):
                     text = ""
             if text:
                 return text
@@ -765,6 +864,7 @@ async def generate_reply(
         incoming_text,
         history,
         topic if include_scenario_topic else "",
+        avoid=recent_lines,
     )
 
 
@@ -848,19 +948,23 @@ async def generate_followup_line(
     """One short line that slightly continues the answered question, nothing more."""
     async with state.lock:
         history = list(state.chat_history)
+        recent_lines = list(state.recent_texts)
     spoken = [line for line in previous_lines if line] or [question]
     if bridge and getattr(bridge, "is_ready", False):
         try:
             previous = "\n".join(f"— {line[:160]}" for line in spoken[-3:])
-            prompt = FOLLOWUP_PROMPT.format(persona=persona, question=str(question)[:280], previous=previous)
+            prompt = FOLLOWUP_PROMPT.format(
+                persona=persona, question=str(question)[:280], previous=previous
+            ) + _repetition_hint(recent_lines, limit=4)
             text = (await bridge.ask(prompt)).strip().strip('"').strip("\u00ab\u00bb")[:160]
-            if text and not _is_canned_reply(text) and not is_dialogue_echo(text, history):
+            if text and not _is_canned_reply(text) and not is_dialogue_echo(text, history) \
+                    and not _is_farm_repeat(text, recent_lines):
                 return text
             if text:
                 log.info("[%s] реплика подхвата отклонена как повтор или шаблон", persona[:20])
         except Exception as exc:
             log.warning("[%s] follow-up generation error: %s", persona[:20], exc)
-    return _choose_natural_reply(FOLLOWUP_LINES, history)
+    return _choose_natural_reply(FOLLOWUP_LINES, history, avoid=recent_lines)
 
 
 async def generate_new_topic(bridge: Any, state: FarmState, donor: DonorCorpus) -> str:
@@ -949,6 +1053,18 @@ CLEAN_JOKES = (
     "— Почему компьютер пошёл к врачу? — Подхватил вирус, а перезагрузиться не помогло.",
     "— Как называется медведь без зубов? — Мармеладный.",
     "— Почему чай не спорит? — Он предпочитает заваривать отношения.",
+    "— Почему пылесос не любит шумные компании? — Он быстро выходит из себя.",
+    "— Что делает кот, когда ему скучно? — Ничего, но очень выразительно.",
+    "— Почему таксист не верит в приметы? — Он и так каждый день счётчик крутит.",
+    "— Как назвать зарядку, которую делают лежа? — Планирование.",
+    "— Почему окно никогда не опаздывает? — Оно всегда в срок вставляет своё слово.",
+    "— Что сказал программист чайнику? — Ты слишком много кипятишься.",
+    "— Почему лужа не спорит с сапогами? — У неё своя глубина.",
+    "— Как называется рыбалка без рыбы? — Отдых на природе.",
+    "— Почему календарь всегда спокоен? — У него всё по дням расписано.",
+    "— Что общего у будильника и совести? — Оба звонят не вовремя.",
+    "— Почему шкаф молчит? — Он привык держать всё в себе.",
+    "— Как называется самое тихое место в доме? — Тот самый выключенный телефон.",
 )
 
 
@@ -1168,7 +1284,9 @@ def _history_leads_for(persona: str) -> tuple[str, ...]:
     return _DEFAULT_HISTORY_LEADS
 
 
-def _history_offline_turn(source_text: str, persona: str, history: list[dict[str, Any]]) -> str:
+def _history_offline_turn(
+    source_text: str, persona: str, history: list[dict[str, Any]], avoid: Any = ()
+) -> str:
     """Speak with the collected archive message: short, casual, with typos and emoji."""
     base = _history_short_line(source_text)
     if not base:
@@ -1185,7 +1303,7 @@ def _history_offline_turn(source_text: str, persona: str, history: list[dict[str
             lead = ""
         emoji = _HISTORY_EMOJI[(len(candidates) + offset * 3) % len(_HISTORY_EMOJI)]
         candidates.append(f"{lead}{line} {emoji}".strip())
-    return _choose_natural_reply(tuple(dict.fromkeys(candidates)), history)
+    return _choose_natural_reply(tuple(dict.fromkeys(candidates)), history, avoid=avoid)
 
 
 def _context_participant_id(item: dict[str, Any]) -> int | None:
@@ -1295,6 +1413,7 @@ def _progressive_offline_turn(
     source_text: str,
     turn_number: int,
     history: list[dict[str, Any]],
+    avoid: Any = (),
 ) -> str:
     """Advance from the anonymized source through distinct, concrete discussion steps."""
     seed = source_text or topic
@@ -1348,7 +1467,7 @@ def _progressive_offline_turn(
             "Практическое правило из обсуждения: сначала проверить главный критерий и альтернативу, и только потом выбирать действие.",
             "Итог цепочки: мы перешли от исходной мысли к критерию, ограничению и проверке. Это развитие темы, а не повтор стартового вопроса.",
         )
-    return _choose_fresh_fallback(lines, history, turn_number, _short_context_line(seed, 64))
+    return _choose_fresh_fallback(lines, history, turn_number, _short_context_line(seed, 64), avoid=avoid)
 
 
 def _question_context_fallback_candidates(topic: str, source_text: str) -> tuple[str, ...]:
@@ -1360,48 +1479,63 @@ def _question_context_fallback_candidates(topic: str, source_text: str) -> tuple
             "Я бы сначала сравнил дорогу и то, что реально нужно рядом — одних красивых видов мало 🙂",
             "Тут многое зависит от дат и приоритетов. Я бы проверил время в пути и удобства на месте.",
             "Если важны тишина и природа, ещё стоит глянуть транспорт и инфраструктуру — это часто решает.",
+            "Я бы сравним не только место, но и то, как туда добираться в реальные даты.",
+            "Логика простая: сначала критерий поездки, потом уже конкретный город.",
         )
     elif domain == "rest":
         candidates = (
             "Я бы начал с самого простого: посмотреть, как сон и нагрузка влияют на самочувствие.",
             "Тут нет одного режима для всех. Лучше менять что-то по одному и смотреть, что реально помогает.",
             "Наверное, сначала стоит понять, чего сейчас не хватает — сна, пауз или просто свободного времени.",
+            "Я бы не менял всё сразу: одна привычка за раз, и по ощущениям видно результат.",
+            "Тут важно не идеальное расписание, а то, которое реально получится держать.",
         )
     elif domain == "food":
         candidates = (
             "Я бы сравнил время готовки и список продуктов — обычно сразу видно, какой вариант удобнее.",
             "Тут всё упирается в то, что уже есть дома и сколько времени хочется потратить 🙂",
             "Звучит вкусно. Я бы начал с простого варианта и потом уже добавлял остальное.",
+            "Я бы посмотрел, что уже есть под рукой, и от этого плясал 🙂",
+            "Тут главное не перегружать: пара ингредиентов и понятный порядок действий.",
         )
     elif re.search(r"\b(?:как|настроить|сделать|запустить|исправить)\b", source_text, re.IGNORECASE):
         candidates = (
             "Я бы начал с одного простого шага и проверил результат, а не менял всё сразу.",
             "Попробуй сначала самый очевидный вариант; если не сработает, тогда уже копать глубже.",
             "Сначала стоит понять, на каком именно шаге стопорится — так будет проще найти причину.",
+            "Я бы проверил это на одном маленьком примере: так сразу видно, где ломается.",
+            "Разложи по шагам и посмотри, после какого шага поведение меняется.",
         )
     elif re.search(r"\b(?:почему|зачем|из-за чего)\b", source_text, re.IGNORECASE):
         candidates = (
             "Тут может быть несколько причин. Я бы сначала посмотрел, что изменилось прямо перед этим.",
             "Не стал бы сразу сводить всё к одной причине — сначала полезно проверить пару деталей.",
             "Похоже, тут стоит разложить ситуацию по шагам, а не угадывать с ходу.",
+            "Я бы отталкивался от того, что точно известно, а догадки оставил на потом.",
+            "Причина часто не одна — сначала стоит исключить самое простое объяснение.",
         )
     elif re.search(r"\b(?:думаете|считаете|как тебе|что скажете)\b", source_text, re.IGNORECASE):
         candidates = (
             "Мне кажется, лучше сравнить варианты по тому, что для тебя действительно важно.",
             "Я бы не торопился с выводом — сначала посмотрел бы на плюсы и минусы каждого варианта.",
             "Хороший вопрос 🙂 А ты сам к какому варианту сейчас склоняешься?",
+            "Мне ближе вариант, который проще проверить на практике.",
+            "Я бы выбрал тот, где меньше условий, которые нужно соблюдать.",
         )
     else:
         candidates = (
             "Хороший вопрос. Я бы начал с одного конкретного примера — так быстрее станет понятно, в чём дело.",
             "Тут многое зависит от деталей. Я бы сначала проверил самый простой вариант.",
             "Я бы разобрал это по шагам, без поспешного вывода. Что уже пробовали?",
+            "Мне кажется, тут важно не угадать, а проверить одну версию.",
+            "Я бы начал с самого простого объяснения и шёл дальше по порядку.",
         )
     return candidates
 
 
-def _question_context_fallback(topic: str, source_text: str) -> str:
-    return random.choice(_question_context_fallback_candidates(topic, source_text))
+def _question_context_fallback(topic: str, source_text: str, avoid: Any = ()) -> str:
+    candidates = tuple(dict.fromkeys([*_question_context_fallback_candidates(topic, source_text), *DUPLICATE_SAFE_LINES]))
+    return _pick_unused(candidates, avoid) or random.choice(candidates)
 
 
 def _is_canned_reply(text: str) -> bool:
@@ -1413,15 +1547,25 @@ def _is_canned_reply(text: str) -> bool:
     )
 
 
-def _choose_natural_reply(candidates: tuple[str, ...], history: list[dict[str, Any]]) -> str:
+def _choose_natural_reply(
+    candidates: tuple[str, ...],
+    history: list[dict[str, Any]],
+    avoid: Any = (),
+    extra: Any = (),
+) -> str:
+    """Pick a line nobody used recently — both this chat and the whole farm count.
+
+    ``extra`` widens a small branch pool with neutral lines, so a narrow topic
+    does not force the farm back to a phrase it already used.
+    """
     recent_outgoing: list[str] = []
     for item in reversed(history):
         if item.get("direction") == "outgoing" and item.get("text"):
-            recent_outgoing.append(str(item.get("text") or "").strip().casefold())
+            recent_outgoing.append(str(item.get("text") or "").strip())
             if len(recent_outgoing) == 12:
                 break
-    fresh = [candidate for candidate in candidates if candidate.strip().casefold() not in recent_outgoing]
-    return random.choice(fresh or candidates)
+    pool = tuple(dict.fromkeys([*candidates, *[str(line) for line in extra]]))
+    return _pick_unused(pool, [*recent_outgoing, *[str(line) for line in avoid]])
 
 
 def _recent_human_context(history: list[dict[str, Any]], incoming_text: str) -> str:
@@ -1442,6 +1586,7 @@ def _offline_conversational_reply(
     incoming_text: str,
     history: list[dict[str, Any]],
     topic: str = "",
+    avoid: Any = (),
 ) -> str:
     """Use short, varied reactions instead of the old repeated question placeholder."""
     raw = str(incoming_text or "").strip()
@@ -1513,7 +1658,7 @@ def _offline_conversational_reply(
     else:
         candidates = ("Понял тебя 🙂", "Хм, интересная мысль", "Да, в этом есть смысл", "Ага, тут есть о чём подумать")
 
-    return _choose_natural_reply(candidates, history)
+    return _choose_natural_reply(candidates, history, avoid=avoid, extra=DUPLICATE_SAFE_LINES)
 
 
 async def generate_dialogue_turn(
@@ -1532,6 +1677,7 @@ async def generate_dialogue_turn(
         donor_history, live_history = _state_history_parts(state, account_name)
         history = [*donor_history[-8:], *live_history[-60:]]
         context = build_context(deque(_prompt_history_window(donor_history, live_history), maxlen=60), limit=20)
+        recent_lines = list(state.recent_texts)
     latest_event = live_history[-1] if live_history else (donor_history[-1] if donor_history else {})
     latest_text = str(latest_event.get("text") or "").strip()
     latest_event_is_human = bool(latest_event and latest_event.get("direction") != "outgoing")
@@ -1566,12 +1712,14 @@ async def generate_dialogue_turn(
                 progression_step=progression_step,
                 context=context,
                 extra_instruction=joke_instruction,
-            )
+            ) + _repetition_hint(recent_lines)
             # The transcript gives continuity; the separate seed keeps the model
             # anchored to human-provided content instead of looping on bot questions.
             text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
             rejected = bool(text) and (
-                is_dialogue_echo(text, history) or _is_circular_dialogue_reply(text)
+                is_dialogue_echo(text, history)
+                or _is_circular_dialogue_reply(text)
+                or _is_farm_repeat(text, recent_lines)
             )
             if rejected:
                 log.warning("[%s] scenario line echoed or stalled; retrying once", persona[:32])
@@ -1583,7 +1731,9 @@ async def generate_dialogue_turn(
                 )
                 text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
                 if text and (
-                    is_dialogue_echo(text, history) or _is_circular_dialogue_reply(text)
+                    is_dialogue_echo(text, history)
+                    or _is_circular_dialogue_reply(text)
+                    or _is_farm_repeat(text, recent_lines)
                 ):
                     log.warning("[%s] retry still repeated or stalled; using progressive local fallback", persona[:32])
                     text = ""
@@ -1593,10 +1743,12 @@ async def generate_dialogue_turn(
             log.exception("[%s] scenario dialogue generation failed", persona[:32])
 
     if tell_joke:
-        return _choose_fresh_fallback(CLEAN_JOKES, history, turn_number, "эту тему")
+        return _choose_fresh_fallback(CLEAN_JOKES, history, turn_number, "эту тему", avoid=recent_lines)
     if latest_event_is_human and FarmAccount._looks_like_question(latest_text):
-        return _question_context_fallback(topic, source_text or latest_text)
-    return _progressive_offline_turn(topic, source_text, turn_number, history)
+        fallback = _question_context_fallback(topic, source_text or latest_text, avoid=recent_lines)
+        if not _is_farm_repeat(fallback, recent_lines):
+            return fallback
+    return _progressive_offline_turn(topic, source_text, turn_number, history, avoid=recent_lines)
 
 
 async def generate_history_dialogue_turn(
@@ -1624,6 +1776,7 @@ async def generate_history_dialogue_turn(
                 row for row in live_history if row.get("direction") == "outgoing"
             ][-8:]
             conversation_context = build_context(deque(synthetic_turns), limit=8)
+            recent_lines = list(state.recent_texts)
         source_text = _history_source_text(item)
         if not source_text:
             continue
@@ -1641,7 +1794,7 @@ async def generate_history_dialogue_turn(
                 source_context=source_context,
                 conversation_context=conversation_context,
                 previous_turn=previous_turn,
-            )
+            ) + _repetition_hint(recent_lines)
             try:
                 text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
                 if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
@@ -1651,6 +1804,7 @@ async def generate_history_dialogue_turn(
                     or _is_circular_dialogue_reply(text)
                     or is_dialogue_echo(text, history)
                     or _line_already_sent(text, history)
+                    or _is_farm_repeat(text, recent_lines)
                     or not _history_reply_is_anchored(text, source_context)
                 )
                 if rejected:
@@ -1669,6 +1823,7 @@ async def generate_history_dialogue_turn(
                         or _is_circular_dialogue_reply(text)
                         or is_dialogue_echo(text, history)
                         or _line_already_sent(text, history)
+                        or _is_farm_repeat(text, recent_lines)
                         or not _history_reply_is_anchored(text, source_context)
                     ):
                         text = ""
@@ -1676,8 +1831,8 @@ async def generate_history_dialogue_turn(
                 log.exception("[%s] history dialogue generation failed", persona[:32])
 
         if not text:
-            text = _history_offline_turn(source_text, persona, history)
-        if text and not _line_already_sent(text, history):
+            text = _history_offline_turn(source_text, persona, history, avoid=recent_lines)
+        if text and not _line_already_sent(text, history) and not _is_farm_repeat(text, recent_lines):
             return text
         if text:
             log.info("[%s] история: реплика уже звучала, беру следующее сообщение архива", persona[:32])
@@ -1727,6 +1882,30 @@ async def generate_reaction(bridge: Any, text: str) -> str:
     return random.choice(["👍", "🔥", "❤️", "👏", "😁"])
     return random.choice(allowed)
 
+
+# Last-resort lines: used only when the very same phrase is about to be sent twice.
+DUPLICATE_SAFE_LINES = (
+    "Согласен, так и есть 🙂",
+    "Хм, надо обдумать",
+    "Понял тебя",
+    "Ага, вижу логику",
+    "Интересно выходит",
+    "Да, звучит разумно",
+    "Ну, посмотрим, как пойдёт",
+    "Тут всё понятно 🙂",
+    "Кажется, мысль движется в нужную сторону",
+    "Окей, тогда так и сделаем",
+    "Вроде логично 🙂",
+    "Держу в курсе, если что-то изменится",
+    "Спасибо, что напомнил 🙂",
+    "Ох, ну и дела 😄",
+    "Двигаемся дальше",
+    "Я бы пока не спешил с выводом",
+    "Записал, спасибо 🙂",
+    "Это объясняет часть картины",
+    "Пока согласен не во всём, но идея рабочая",
+    "Ладно, обсудим ещё раз позже 🙂",
+)
 
 IDLE_LINES = (
     "тихо стало 🙂",
@@ -2293,6 +2472,7 @@ class FarmAccount:
                 donor_history, live_history = _state_history_parts(self.state, self.name)
                 history = [*donor_history[-8:], *live_history[-60:]]
                 topic = self.state.topic
+                recent_lines = list(self.state.recent_texts)
             fallback_input = incoming_text
             if not fallback_input and reply_to is None:
                 fallback_input = _recent_human_context(history, "") or "Интересная мысль"
@@ -2300,6 +2480,7 @@ class FarmAccount:
                 fallback_input,
                 history,
                 topic if scenario_mode not in {"reactive", "history_dialogue"} else "",
+                avoid=recent_lines,
             )
 
         try:
@@ -2657,7 +2838,8 @@ class FarmAccount:
         share = self._turn_media_share("emoji_only_percent")
         if share <= 0 or random.random() >= share:
             return ""
-        return random.choice(configured_emoji_set(farm_cfg))
+        pool = configured_emoji_set(farm_cfg)
+        return _pick_unused(pool, list(self.state.recent_texts)) or random.choice(pool)
 
     def _send_kwargs(self, reply_to: TGMessage | int | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"chat_id": int(FARM_CFG["target_chat_id"])}
@@ -2682,7 +2864,48 @@ class FarmAccount:
         except Exception:
             log.debug("typing simulation skipped", exc_info=True)
 
+    def _dedupe_text(self, text: str) -> str:
+        """Guarantee that no line leaves the farm twice in a row.
+
+        Roulette numbers and dice/animation values are exempt: there the repeat
+        carries meaning.
+        """
+        value = str(text or "").strip()
+        if not value or value.isdigit():
+            return value
+        if not self.state.text_seen(value):
+            return value
+        variant = self._text_variant(value)
+        if variant:
+            log.info("[%s] повтор реплики заменён на вариант: %s", self.name, variant[:60])
+            return variant
+        replacement = _pick_unused(DUPLICATE_SAFE_LINES, list(self.state.recent_texts))
+        log.warning("[%s] одинаковая реплика отменена, отправляю нейтральную фразу", self.name)
+        return replacement
+
+    def _text_variant(self, text: str) -> str:
+        """Rewrite a duplicated line so it stays natural but is no longer identical."""
+        value = str(text or "").strip()
+        seen = list(self.state.recent_texts)
+        emoji_only = not any(char.isalnum() for char in value)
+        if emoji_only:
+            pool = configured_emoji_set(FARM_CFG.get("farm", {}))
+            return _pick_unused(pool, seen)
+        candidates: list[str] = []
+        body = value.rstrip(".! ")
+        # Keep the same meaning, vary the framing or the emoji at the end.
+        for tail in (" 🙂", " 😄", " 😅", " 👍", " вроде так", " как-то так", " если коротко"):
+            candidates.append(f"{body}{tail}")
+        for prefix in ("Кстати, ", "Если по делу, ", "По-моему, "):
+            if len(value) > 12:
+                candidates.append(prefix + value[0].casefold() + value[1:])
+        fresh = [item for item in candidates if item.strip() and not _is_farm_repeat(item, seen)]
+        return random.choice(fresh) if fresh else ""
+
     async def _send_text(self, text: str, reply_to: TGMessage | int | None = None) -> bool:
+        if not text:
+            return False
+        text = self._dedupe_text(text)
         if not text:
             return False
         try:
@@ -2870,6 +3093,8 @@ class FarmAccount:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
             self.state.last_outgoing_message_id = int(msg.id)
+            if kind == "text":
+                self.state.mark_text(text)
             self.state.mark_activity()
 
 
@@ -2972,7 +3197,11 @@ async def run_scenario(
             if tell_joke:
                 async with state.lock:
                     joke_history = list(state.chat_history)
-                text = _choose_fresh_fallback(CLEAN_JOKES, joke_history, turn_number, "эту тему")
+                async with state.lock:
+                    recent_lines = list(state.recent_texts)
+                text = _choose_fresh_fallback(
+                    CLEAN_JOKES, joke_history, turn_number, "эту тему", avoid=recent_lines
+                )
             else:
                 text = await generate_history_dialogue_turn(
                     account.bridge,
@@ -3255,8 +3484,14 @@ async def idle_activity_tick(
     state.idle_cursor = (state.idle_cursor + 1) % len(accounts)
     async with state.lock:
         recent = list(state.chat_history)
+    async with state.lock:
+        recent_lines = list(state.recent_texts)
     text = _choose_fresh_fallback(
-        IDLE_LINES, [item.get("text", "") for item in recent], len(recent) + 1, "эту тему"
+        IDLE_LINES,
+        [item.get("text", "") for item in recent],
+        len(recent) + 1,
+        "эту тему",
+        avoid=recent_lines,
     )
     use_gif = random.random() < (int(settings.get("idle_gif_percent") or 0) / 100.0)
     posted = False

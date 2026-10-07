@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import re
 import tempfile
 import types
@@ -862,6 +863,186 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         account.state = farm.FarmState()
         farm.FARM_CFG["farm"].update({"emoji_only_enabled": True, "emoji_only_percent": 100, "emoji_set": "\U0001f602 \U0001f525"})
         self.assertIn(account._maybe_emoji_only(), {"\U0001f602", "\U0001f525"})
+
+    def _live_account(self, name: str, state: farm.FarmState) -> farm.FarmAccount:
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = name
+        account.user_id = abs(hash(name)) % 100000
+        account.state = state
+        account.client = FakeMediaClient()
+        account.donor = EmptyDonor()
+        account.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        account._typing = AsyncMock()
+        return account
+
+    def test_text_key_ignores_punctuation_but_not_emoji(self):
+        self.assertEqual(farm._text_key("Понял тебя! 🙂"), farm._text_key("понял  тебя 🙂"))
+        self.assertNotEqual(farm._text_key("😂"), farm._text_key("😄"))
+
+    async def test_two_accounts_in_a_row_never_send_the_same_line(self):
+        state = farm.FarmState()
+        first = self._live_account("dup-one", state)
+        second = self._live_account("dup-two", state)
+
+        self.assertTrue(await farm.FarmAccount._send_text(first, "Понял тебя 🙂"))
+        self.assertTrue(await farm.FarmAccount._send_text(second, "Понял тебя 🙂"))
+
+        first_text = first.client.sent[0]["text"]
+        second_text = second.client.sent[0]["text"]
+        self.assertNotEqual(farm._text_key(first_text), farm._text_key(second_text))
+        self.assertNotEqual(second_text.strip(), "")
+        self.assertTrue(state.text_seen(first_text))
+        self.assertTrue(state.text_seen(second_text))
+
+    async def test_chained_farm_repeats_are_replaced_not_silenced(self):
+        state = farm.FarmState()
+        accounts = [self._live_account(f"chain-{index}", state) for index in range(6)]
+        for account in accounts:
+            self.assertTrue(
+                await farm.FarmAccount._send_text(account, "Ага, мысль ясна"),
+                "аккаунт не должен молчать вместо повтора",
+            )
+        texts = [farm._text_key(account.client.sent[0]["text"]) for account in accounts]
+        self.assertEqual(len(set(texts)), len(texts), f"повторы остались: {texts}")
+
+    def test_roulette_numbers_are_allowed_to_repeat(self):
+        state = farm.FarmState()
+        account = self._live_account("roulette-dup", state)
+        state.mark_text("17")
+        self.assertEqual(account._dedupe_text("17"), "17")
+
+    def test_recent_texts_survive_a_state_round_trip(self):
+        state = farm.FarmState()
+        state.mark_text("Понял тебя 🙂")
+        restored = farm.FarmState()
+        restored.load(state.to_dict())
+        self.assertTrue(restored.text_seen("понял  тебя! 🙂"))
+
+    def test_offline_answers_to_the_same_question_never_repeat_back_to_back(self):
+        history = [
+            {"author": "участник", "text": "как это починить?", "direction": "incoming", "message_id": 1}
+        ]
+        avoid: list[str] = []
+        answers = []
+        for _ in range(12):
+            answer = farm._offline_conversational_reply("как это починить?", history, "", avoid=avoid)
+            self.assertTrue(answer.strip(), "фарм не должен молчать вместо повтора")
+            if answers:
+                self.assertNotEqual(
+                    farm._text_key(answer),
+                    farm._text_key(answers[-1]),
+                    f"два аккаунта подряд сказали одно и то же: {answer!r}",
+                )
+            answers.append(answer)
+            avoid.append(answer)
+        # Пул на такой вопрос — не три строки: первые восемь ответов уникальны.
+        self.assertEqual(len({farm._text_key(item) for item in answers[:8]}), 8)
+
+    def test_jokes_do_not_repeat_back_to_back(self):
+        history = [{"author": "участник", "text": "о чём поговорим", "direction": "incoming", "message_id": 1}]
+        avoid: list[str] = []
+        jokes = []
+        for turn in range(1, 8):
+            joke = farm._choose_fresh_fallback(farm.CLEAN_JOKES, history, turn, "тему", avoid=avoid)
+            self.assertNotIn(farm._text_key(joke), {farm._text_key(item) for item in avoid})
+            jokes.append(joke)
+            avoid.append(joke)
+        self.assertEqual(len({farm._text_key(item) for item in jokes}), 7)
+        self.assertGreaterEqual(len(farm.CLEAN_JOKES), 12)
+
+    def test_choose_natural_reply_skips_lines_used_by_other_accounts(self):
+        candidates = ("Понял тебя", "Ага, есть такое", "Интересная мысль")
+        chosen = farm._choose_natural_reply(candidates, [], avoid=["Понял тебя!", "Ага, есть такое."])
+        self.assertEqual(farm._text_key(chosen), farm._text_key("Интересная мысль"))
+
+    def test_choose_natural_reply_reuses_the_oldest_line_when_pool_is_exhausted(self):
+        candidates = ("Первая", "Вторая")
+        chosen = farm._choose_natural_reply(candidates, [], avoid=["Первая", "Первая", "Вторая"])
+        self.assertEqual(chosen, "Первая")  # ушла из окна раньше второй
+
+    async def test_llm_repeat_is_rejected_and_replaced(self):
+        class CopyPasteBridge:
+            is_ready = True
+
+            def __init__(self, line):
+                self.line = line
+
+            async def ask(self, prompt):
+                return self.line
+
+        state = farm.FarmState()
+        state.mark_text("Уже звучало 🙂")
+        account = self._live_account("llm-dup", state)
+        account.persona = "роль"
+        account.bridge = CopyPasteBridge("Уже звучало 🙂")
+
+        sent = await farm.FarmAccount._send_reply(
+            account, reply_to=None, incoming_text="что скажешь?"
+        )
+        self.assertTrue(sent)
+        sent_text = account.client.sent[0]["text"]
+        self.assertNotEqual(farm._text_key(sent_text), farm._text_key("Уже звучало 🙂"))
+        self.assertEqual(len(account.client.sent), 1)
+
+    async def test_idle_revival_of_two_accounts_differs(self):
+        settings = {
+            "idle_enabled": True,
+            "idle_after_sec": 60,
+            "idle_cooldown_sec": 60,
+            "idle_gif_percent": 0,
+        }
+        state = farm.FarmState()
+        accounts = [self._live_account(f"idle-{index}", state) for index in range(2)]
+        base = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        self.assertTrue(
+            await farm.idle_activity_tick(accounts, state, settings, now=base + datetime.timedelta(seconds=120))
+        )
+        self.assertTrue(
+            await farm.idle_activity_tick(accounts, state, settings, now=base + datetime.timedelta(seconds=200))
+        )
+
+        first_text = accounts[0].client.sent[0]["text"]
+        second_text = accounts[1].client.sent[0]["text"]
+        self.assertNotEqual(farm._text_key(first_text), farm._text_key(second_text))
+        self.assertTrue(state.text_seen(first_text) and state.text_seen(second_text))
+
+    def test_pick_unused_cycles_instead_of_sticking_to_the_same_line(self):
+        pool = ("Первая", "Вторая", "Третья")
+        avoid: list[str] = []
+        picked = []
+        for _ in range(9):
+            line = farm._pick_unused(pool, avoid)
+            picked.append(line)
+            avoid.append(line)
+        for previous, current in zip(picked, picked[1:]):
+            self.assertNotEqual(previous, current, f"повтор подряд: {picked}")
+        self.assertEqual(len(set(picked)), 3)
+
+    def test_progressive_offline_turns_never_repeat_back_to_back(self):
+        avoid: list[str] = []
+        turns = []
+        for turn in range(1, 25):
+            text = farm._progressive_offline_turn("обсуждаем переезд", "", turn, [], avoid=avoid)
+            self.assertTrue(text.strip())
+            if turns:
+                self.assertNotEqual(
+                    farm._text_key(text), farm._text_key(turns[-1]), f"ход {turn} повторил предыдущий"
+                )
+            turns.append(text)
+            avoid.append(text)
+        self.assertGreaterEqual(len({farm._text_key(item) for item in turns}), 8)
+
+    def test_history_offline_turns_never_repeat_back_to_back(self):
+        history = [{"author": "участник", "text": "вчера ходил в кино", "direction": "incoming", "message_id": 3}]
+        avoid: list[str] = []
+        lines = []
+        for _ in range(12):
+            text = farm._history_offline_turn("собрался в поездку, взял билеты и глянул маршрут", "роль", history, avoid=avoid)
+            self.assertTrue(text.strip())
+            if lines:
+                self.assertNotEqual(farm._text_key(text), farm._text_key(lines[-1]))
+            lines.append(text)
+            avoid.append(text)
 
     def test_night_mode_window_covers_wrap_around_and_same_day_ranges(self):
         from datetime import datetime, timezone
