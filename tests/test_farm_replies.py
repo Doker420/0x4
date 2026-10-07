@@ -1,0 +1,433 @@
+import asyncio
+import types
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import farm
+
+
+class FakeTelegramClient:
+    def __init__(self):
+        self.messages = []
+        self.handlers = []
+
+    async def connect(self):
+        return True
+
+    async def invoke(self, _request):
+        return None
+
+    async def get_me(self):
+        return types.SimpleNamespace(id=100, username="unit")
+
+    async def initialize(self):
+        return None
+
+    async def get_chat(self, _chat_id):
+        return types.SimpleNamespace(id=_chat_id)
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+        return types.SimpleNamespace(
+            id=901,
+            from_user=types.SimpleNamespace(id=100),
+            chat=types.SimpleNamespace(id=kwargs["chat_id"]),
+        )
+
+
+class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_cfg = farm.FARM_CFG
+        farm.FARM_CFG = {
+            "target_chat_id": -1001234567890,
+            "topic_id": None,
+            "farm": {"typing_simulation": False, "reaction_probability": 0.0},
+        }
+
+    def tearDown(self):
+        farm.FARM_CFG = self.old_cfg
+
+    def test_accounts_receive_distinct_default_roles_and_llm_scopes(self):
+        class SessionBridge:
+            def __init__(self):
+                self.keys = []
+
+            def session(self, key):
+                self.keys.append(key)
+                return types.SimpleNamespace(is_ready=True)
+
+        bridge = SessionBridge()
+        accounts = []
+        with patch.object(farm, "Client"):
+            for name in ("first", "second"):
+                account = farm.FarmAccount(
+                    {"name": name, "api_id": 123, "api_hash": "secret"},
+                    bridge,
+                    farm.FarmState(),
+                    object(),
+                    accounts,
+                )
+                accounts.append(account)
+
+        self.assertNotEqual(accounts[0].persona, accounts[1].persona)
+        self.assertNotEqual(bridge.keys[0], bridge.keys[1])
+        self.assertIn("first", bridge.keys[0])
+        self.assertIn("second", bridge.keys[1])
+        personas = {account.name: account.persona for account in accounts}
+        reordered = []
+        with patch.object(farm, "Client"):
+            for name in ("second", "first"):
+                reordered.append(farm.FarmAccount(
+                    {"name": name, "api_id": 123, "api_hash": "secret"},
+                    bridge,
+                    farm.FarmState(),
+                    object(),
+                    reordered,
+                ))
+        self.assertEqual(personas, {account.name: account.persona for account in reordered})
+
+    async def test_account_deepseek_sessions_keep_conversation_ids_isolated(self):
+        class FakeDeepSeekClient:
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, prompt, **kwargs):
+                conversation_id = kwargs.get("conversation_id")
+                if not conversation_id:
+                    conversation_id = f"conversation-{len(self.calls) + 1}"
+                self.calls.append({"prompt": prompt, **kwargs, "result_conversation_id": conversation_id})
+                return types.SimpleNamespace(conversation_id=conversation_id, text=f"answer-{len(self.calls)}")
+
+        bridge = farm.DeepSeekBridge()
+        bridge._client = FakeDeepSeekClient()
+        bridge._ready = True
+        first = bridge.session("chat:-1001:account:first")
+        second = bridge.session("chat:-1001:account:second")
+
+        await first.ask("first turn")
+        await second.ask("second turn")
+        await first.ask("first follow-up")
+        await second.ask("second follow-up")
+
+        calls = bridge._client.calls
+        self.assertNotIn("conversation_id", calls[0])
+        self.assertNotIn("conversation_id", calls[1])
+        self.assertEqual(calls[2]["conversation_id"], "conversation-1")
+        self.assertEqual(calls[3]["conversation_id"], "conversation-2")
+
+    async def test_send_text_sets_reply_to_message_id(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.client = FakeTelegramClient()
+        account.state = farm.FarmState()
+        account._typing = AsyncMock()
+
+        sent = await account._send_text("Ответ", reply_to=42)
+        self.assertTrue(sent)
+        self.assertEqual(account.client.messages[0]["reply_to_message_id"], 42)
+        self.assertEqual(account.client.messages[0]["chat_id"], -1001234567890)
+
+    async def test_incoming_message_is_deduplicated_and_scheduled_for_reply(self):
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+
+        message = types.SimpleNamespace(
+            id=77,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=200, is_bot=False, username="tester", first_name="Test"),
+            text="Как отправить ответ реплаем?",
+        )
+        await account._on_incoming(None, message)
+        pending = list(account._background_tasks)
+        self.assertEqual(len(pending), 1)
+        await asyncio.gather(*pending)
+        account._answer_incoming.assert_awaited_once_with(message, "Как отправить ответ реплаем?")
+        self.assertEqual(state.chat_history[-1]["direction"], "incoming")
+
+        await account._on_incoming(None, message)
+        self.assertEqual(account._answer_incoming.await_count, 1)
+
+    async def test_combined_mode_registers_incoming_message_handler(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.client = FakeTelegramClient()
+        account.user_id = None
+        account.farm_accounts = [account]
+        account._running = False
+        account._task = None
+
+        await account.start()
+
+        self.assertTrue(account._running)
+        self.assertEqual(len(account.client.handlers), 1)
+
+    async def test_incoming_message_handler_stays_enabled_in_combined_mode(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=78,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=201, is_bot=False, username="tester", first_name="Test"),
+            text="Как ответить на вопрос во время тематического диалога?",
+        )
+
+        message.text = "Спасибо, ответ помог."
+        await account._on_incoming(None, message)
+        self.assertFalse(account._background_tasks)
+        self.assertFalse(state.chat_history[-1]["is_question"])
+
+        message.id = 79
+        message.text = "Ребят кто нибудь знает как ответить на вопрос во время тематического диалога"
+        with self.assertLogs("farm", level="INFO") as captured:
+            await account._on_incoming(None, message)
+            await asyncio.gather(*list(account._background_tasks))
+
+        self.assertTrue(any("вопрос распознан" in line for line in captured.output))
+        self.assertTrue(any("ответ на сообщение 79 запланирован" in line for line in captured.output))
+        account._answer_incoming.assert_awaited_once_with(
+            message, "Ребят кто нибудь знает как ответить на вопрос во время тематического диалога"
+        )
+        self.assertEqual(state.chat_history[-1]["direction"], "incoming")
+        self.assertTrue(state.chat_history[-1]["is_question"])
+
+    async def test_zero_reply_probability_never_schedules_an_answer(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = farm.FarmState()
+        account._running = True
+        account.reply_probability = 0.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=82,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=204, is_bot=False, username="tester", first_name="Test"),
+            text="Кто нибудь знает как это починить",
+        )
+        with patch.object(farm.random, "random", return_value=0):
+            await account._on_incoming(None, message)
+        self.assertFalse(account._background_tasks)
+        account._answer_incoming.assert_not_awaited()
+
+    async def test_combined_mode_randomly_assigns_each_question_to_one_account(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
+        state = farm.FarmState()
+        accounts = []
+        for name, user_id in (("first", 100), ("second", 101)):
+            account = farm.FarmAccount.__new__(farm.FarmAccount)
+            account.name = name
+            account.user_id = user_id
+            account.state = state
+            account._running = True
+            account.reply_probability = 1.0
+            account._background_tasks = set()
+            account._answer_incoming = AsyncMock()
+            accounts.append(account)
+        for account in accounts:
+            account.farm_accounts = accounts
+        message = types.SimpleNamespace(
+            id=81,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=203, is_bot=False, username="tester", first_name="Test"),
+            text="Кто знает, как это настроить?",
+        )
+
+        with patch.object(farm.random, "choice", return_value=accounts[1]), patch.object(farm.random, "random", return_value=0):
+            await accounts[0]._on_incoming(None, message)
+            await accounts[1]._on_incoming(None, message)
+            await asyncio.gather(*list(accounts[1]._background_tasks))
+
+        accounts[0]._answer_incoming.assert_not_awaited()
+        accounts[1]._answer_incoming.assert_awaited_once_with(message, "Кто знает, как это настроить?")
+
+    async def test_reactive_mode_keeps_replying_to_non_question_messages(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "reactive"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = farm.FarmState()
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=80,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=202, is_bot=False, username="tester", first_name="Test"),
+            text="Спасибо, ответ помог.",
+        )
+
+        await account._on_incoming(None, message)
+        await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_awaited_once_with(message, "Спасибо, ответ помог.")
+
+    def test_forum_topic_uses_reply_to_top_message_id(self):
+        farm.FARM_CFG["topic_id"] = 42
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        self.assertTrue(account._is_in_configured_topic(types.SimpleNamespace(
+            id=80, reply_to_message_id=79, reply_to_top_message_id=42
+        )))
+        self.assertFalse(account._is_in_configured_topic(types.SimpleNamespace(
+            id=81, reply_to_message_id=80, reply_to_top_message_id=43
+        )))
+        self.assertTrue(account._is_in_configured_topic(types.SimpleNamespace(id=42)))
+
+    def test_question_detection_does_not_require_perfect_punctuation(self):
+        for text in (
+            "Почему это произошло",
+            "Подскажите как настроить тему",
+            "Ребят, есть идеи как это исправить",
+            "кто нибудь сталкивался с такой ошибкой",
+            "чё делать если приложение не открывается",
+            "anyone know how to fix this",
+            "@helper можешь подсказать как настроить",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(farm.FarmAccount._looks_like_question(text))
+        self.assertTrue(farm.FarmAccount._looks_like_question("Готово, спасибо?"))
+        self.assertFalse(farm.FarmAccount._looks_like_question("Спасибо, всё понятно."))
+        self.assertFalse(farm.FarmAccount._looks_like_question("Завтра встречаемся в шесть"))
+
+    async def test_offline_reply_uses_safe_fallback_instead_of_copying_donor_text(self):
+        donor = types.SimpleNamespace(sample_texts=lambda _count: ["Чужое сообщение из донора"])
+        answer = await farm.generate_reply(None, farm.FarmState(), donor, "синтетическая роль", "Как это работает?")
+        self.assertNotEqual(answer, "Чужое сообщение из донора")
+        self.assertIn("Не хочу гадать", answer)
+
+    async def test_question_text_is_included_in_the_generated_reply_prompt(self):
+        state = farm.FarmState()
+        state.topic = "Обсуждаем полезные привычки"
+        state.chat_history.append({"author": "участник", "text": "Как начать бегать по утрам?", "kind": "text"})
+        donor = types.SimpleNamespace(sample_texts=lambda _count: [])
+        ask = AsyncMock(return_value="Начните с коротких прогулок.")
+        bridge = types.SimpleNamespace(is_ready=True, ask=ask)
+
+        answer = await farm.generate_reply(
+            bridge, state, donor, "дружелюбный участник", "Как начать бегать по утрам?"
+        )
+
+        self.assertEqual(answer, "Начните с коротких прогулок.")
+        prompt = ask.await_args.args[0]
+        self.assertIn("Как начать бегать по утрам?", prompt)
+        self.assertIn("Обсуждаем полезные привычки", prompt)
+        self.assertIn("дай прямой ответ именно на него", prompt)
+        self.assertIn("автоматизированный аккаунт", prompt)
+        self.assertIn("не выдумывай личный опыт", prompt)
+        self.assertIn("не вычитывай реплику до литературной точности", prompt)
+
+    async def test_behavior_only_reply_omits_stale_scenario_topic(self):
+        state = farm.FarmState()
+        state.topic = "Старая сценарная тема"
+        state.chat_history.append({
+            "author": "участник", "text": "Что думаете?", "direction": "incoming", "kind": "text"
+        })
+        ask = AsyncMock(return_value="Можно попробовать такой подход.")
+        bridge = types.SimpleNamespace(is_ready=True, ask=ask)
+
+        answer = await farm.generate_reply(
+            bridge,
+            state,
+            types.SimpleNamespace(sample_texts=lambda _count: []),
+            "спокойный участник" + chr(10) + "Общие указания: отвечай кратко",
+            "Что думаете?",
+            include_scenario_topic=False,
+        )
+
+        self.assertEqual(answer, "Можно попробовать такой подход.")
+        prompt = ask.await_args.args[0]
+        self.assertNotIn("Старая сценарная тема", prompt)
+        self.assertIn("Что думаете?", prompt)
+        self.assertIn("Общие указания: отвечай кратко", prompt)
+        self.assertIn("спокойный участник", prompt)
+
+    async def test_reactive_send_reply_uses_saved_instructions_without_scenario_topic(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "alpha"
+        account.persona = "дружелюбный участник"
+        account.bridge = object()
+        account.state = farm.FarmState()
+        account.donor = object()
+        account._pick_kind = lambda: "text"
+        account._send_text = AsyncMock(return_value=True)
+        old_cfg = farm.FARM_CFG
+        farm.FARM_CFG = {"farm": {"scenario_mode": "reactive", "agent_prompt": "Отвечай кратко."}}
+        try:
+            with patch.object(farm, "generate_reply", new=AsyncMock(return_value="Ответ")) as generate:
+                sent = await account._send_reply(reply_to=55, incoming_text="Вопрос")
+        finally:
+            farm.FARM_CFG = old_cfg
+
+        self.assertTrue(sent)
+        generate.assert_awaited_once_with(
+            account.bridge,
+            account.state,
+            account.donor,
+            "дружелюбный участник" + chr(10) + "Общие указания: Отвечай кратко.",
+            "Вопрос",
+            include_scenario_topic=False,
+        )
+        account._send_text.assert_awaited_once_with("Ответ", reply_to=55)
+
+    async def test_missing_gif_falls_back_to_reply_text(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.persona = "test"
+        account.bridge = None
+        account.state = farm.FarmState()
+        account.donor = object()
+        account._pick_kind = lambda: "gif"
+        account._send_gif = AsyncMock(return_value=False)
+        account._send_text = AsyncMock(return_value=True)
+        target = types.SimpleNamespace(id=55)
+
+        with patch.object(farm, "generate_reply", new=AsyncMock(return_value="Текстовый ответ")):
+            sent = await account._send_reply(reply_to=target, incoming_text="Привет")
+
+        self.assertTrue(sent)
+        account._send_gif.assert_awaited_once_with(reply_to=target, search_text="Привет")
+        account._send_text.assert_awaited_once_with("Текстовый ответ", reply_to=target)
+
+    def test_configured_media_weights_are_used(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        self.assertEqual(account._pick_kind(), "gif")
+
+
+if __name__ == "__main__":
+    unittest.main()
