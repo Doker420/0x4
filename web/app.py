@@ -30,6 +30,34 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app = FastAPI(title="0x4 — управление аккаунтами")
 MAX_SESSION_UPLOAD = 25 * 1024 * 1024
+_PENDING_INVITE_REFERENCES: dict[str, tuple[float, dict[str, Any]]] = {}
+INVITE_REFERENCE_TTL = 60 * 60
+
+
+def _store_invite_reference(reference: dict[str, Any]) -> str:
+    """Keep private invite hashes out of persisted task payloads and logs."""
+    now = asyncio.get_running_loop().time()
+    for token, (created_at, _) in list(_PENDING_INVITE_REFERENCES.items()):
+        if now - created_at > INVITE_REFERENCE_TTL:
+            _PENDING_INVITE_REFERENCES.pop(token, None)
+    token = uuid.uuid4().hex
+    _PENDING_INVITE_REFERENCES[token] = (now, dict(reference))
+    return token
+
+
+def _take_invite_reference(token: str) -> Optional[dict[str, Any]]:
+    stored = _PENDING_INVITE_REFERENCES.pop(str(token), None)
+    if not stored:
+        return None
+    created_at, reference = stored
+    if asyncio.get_running_loop().time() - created_at > INVITE_REFERENCE_TTL:
+        return None
+    return dict(reference)
+
+
+def _discard_invite_reference(token: Optional[str]) -> None:
+    if token:
+        _PENDING_INVITE_REFERENCES.pop(str(token), None)
 
 
 # ─── Task handlers ───
@@ -92,6 +120,12 @@ async def _h_history_fetch(payload: dict) -> dict:
 async def _h_chat_context_collect(payload: dict) -> dict:
     if FARM_PROCESS is not None and FARM_PROCESS.returncode is None:
         raise RuntimeError("Остановите чат-ферму перед проверкой членства и сбором истории")
+    invite_token = payload.pop("invite_token", None)
+    if invite_token:
+        reference = _take_invite_reference(invite_token)
+        if reference is None:
+            raise RuntimeError("Invite-ссылка больше недоступна в памяти. Повторите запуск сбора истории.")
+        payload["reference"] = reference
     return await chat_context.collect_chat_context(payload)
 
 
@@ -669,6 +703,11 @@ async def chatfarm_page(request: Request, web_auth: Optional[str] = Cookie(defau
         topic_prefill = str(max(0, int(request.query_params.get("topic_id", "0"))))
     except (TypeError, ValueError):
         topic_prefill = "0"
+    history_source_prefill = request.query_params.get("history_source", "")[:512]
+    try:
+        history_topic_prefill = str(max(0, int(request.query_params.get("history_topic_id", "0"))))
+    except (TypeError, ValueError):
+        history_topic_prefill = "0"
     return _render(
         request,
         "chatfarm.html",
@@ -678,6 +717,8 @@ async def chatfarm_page(request: Request, web_auth: Optional[str] = Cookie(defau
             "targets": targets,
             "target_prefill": target_prefill,
             "topic_prefill": topic_prefill,
+            "history_source_prefill": history_source_prefill,
+            "history_topic_prefill": history_topic_prefill,
         },
     )
 
@@ -705,6 +746,7 @@ async def api_collect_chat_context(
     history_limit: int = Form(default=100),
     topic_id: int = Form(default=0),
     download_media: Optional[str] = Form(default=None),
+    auto_join: Optional[str] = Form(default=None),
     authorization_ack: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
 ):
@@ -716,11 +758,11 @@ async def api_collect_chat_context(
         reference = chat_context.parse_chat_link(chat_link)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if reference.get("invite_hash"):
+    auto_join_enabled = auto_join is not None
+    if auto_join_enabled and reference.get("source") not in {"invite", "username"}:
         raise HTTPException(
             422,
-            "Invite-ссылки не используются для автоматического вступления. "
-            "Добавьте аккаунты вручную и укажите публичную ссылку или ID чата.",
+            "Для авто-вступления используйте публичный username или invite-ссылку; одного ID или t.me/c недостаточно.",
         )
     if not 1 <= history_limit <= chat_context.MAX_HISTORY:
         raise HTTPException(422, f"Лимит истории должен быть от 1 до {chat_context.MAX_HISTORY}")
@@ -742,7 +784,8 @@ async def api_collect_chat_context(
             or not account.get("api_hash") or account.get("session_status") != "authorized"
         ):
             raise HTTPException(422, f"Аккаунт {name} выключен, не настроен или не авторизован")
-    task_id = await tasks.runner.submit("chat_context_collect", {
+    invite_token = _store_invite_reference(reference) if reference.get("invite_hash") else None
+    payload = {
         "reference": {
             "chat_ref": reference["chat_ref"],
             "invite_hash": None,
@@ -754,7 +797,15 @@ async def api_collect_chat_context(
         "history_limit": history_limit,
         "topic_id": topic_id,
         "download_media": download_media is not None,
-    })
+        "auto_join": auto_join_enabled,
+    }
+    if invite_token:
+        payload["invite_token"] = invite_token
+    try:
+        task_id = await tasks.runner.submit("chat_context_collect", payload)
+    except Exception:
+        _discard_invite_reference(invite_token)
+        raise
     return {"ok": True, "task_id": task_id}
 
 
@@ -794,6 +845,9 @@ async def api_chatfarm_start(
     collect_context_history: Optional[str] = Form(default=None),
     context_reader: str = Form(default=""),
     history_limit: int = Form(default=100),
+    history_source: str = Form(default=""),
+    history_topic_id: int = Form(default=0),
+    auto_join_history: Optional[str] = Form(default=None),
     scenario_turns: int = Form(default=20),
     joke_every: int = Form(default=5),
     rest_every: int = Form(default=6),
@@ -811,7 +865,7 @@ async def api_chatfarm_start(
     if automation_ack is None:
         raise HTTPException(
             422,
-            "Подтвердите разрешение, объявление в чате об автоматических сообщениях и членство аккаунтов в чате",
+            "Подтвердите разрешение, объявление участникам об автоматизации, членство в целевом чате и (если выбрано) вступление в источник истории",
         )
     collect_history = (
         scenario_mode != "reactive"
@@ -841,6 +895,36 @@ async def api_chatfarm_start(
         raise HTTPException(422, str(exc)) from exc
     if collect_history and (not history_reader or history_reader not in clean_names):
         raise HTTPException(422, "Выберите сессию для чтения истории среди аккаунтов диалога")
+    history_source_reference = None
+    effective_history_topic = 0
+    auto_join_history_enabled = collect_history and auto_join_history is not None
+    if collect_history:
+        source_value = history_source.strip()
+        try:
+            history_source_reference = (
+                chat_context.parse_chat_link(source_value)
+                if source_value
+                else {
+                    "chat_ref": target_id,
+                    "invite_hash": None,
+                    "topic_id": None,
+                    "source": "id",
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f"Некорректный чат-источник истории: {exc}") from exc
+        if history_topic_id < 0:
+            raise HTTPException(422, "ID темы источника должен быть положительным числом")
+        effective_history_topic = (
+            history_topic_id
+            or history_source_reference.get("topic_id")
+            or (topic_id if not source_value else 0)
+        )
+        if auto_join_history_enabled and history_source_reference.get("source") not in {"invite", "username"}:
+            raise HTTPException(
+                422,
+                "Для авто-вступления в источник укажите публичный username или invite-ссылку; одного числового ID/t.me/c недостаточно.",
+            )
     for name in clean_names:
         account = await db.get_account(name)
         if (
@@ -894,6 +978,14 @@ async def api_chatfarm_start(
         "collect_history": collect_history,
         "context_reader": history_reader,
         "history_limit": history_limit if collect_history else 0,
+        "history_reference": ({
+            "chat_ref": history_source_reference["chat_ref"],
+            "invite_hash": None,
+            "topic_id": history_source_reference.get("topic_id"),
+            "source": history_source_reference.get("source"),
+        } if collect_history and history_source_reference else None),
+        "history_topic_id": effective_history_topic,
+        "history_auto_join": auto_join_history_enabled,
         "scenario_turns": 20 if behavior_only else scenario_turns,
         "joke_every": 0 if behavior_only else joke_every,
         "rest_every": 0 if behavior_only else rest_every,
@@ -903,7 +995,18 @@ async def api_chatfarm_start(
         "post_opening": not behavior_only and post_opening is not None,
         "automation_acknowledged": automation_ack is not None,
     }
-    task_id = await tasks.runner.submit("start_chatfarm", settings)
+    history_invite_token = (
+        _store_invite_reference(history_source_reference)
+        if collect_history and history_source_reference and history_source_reference.get("invite_hash")
+        else None
+    )
+    if history_invite_token:
+        settings["history_invite_token"] = history_invite_token
+    try:
+        task_id = await tasks.runner.submit("start_chatfarm", settings)
+    except Exception:
+        _discard_invite_reference(history_invite_token)
+        raise
     return {"ok": True, "task_id": task_id, "collecting_history": collect_history}
 
 
@@ -940,30 +1043,52 @@ async def _h_start_chatfarm(payload: dict) -> dict:
         raise RuntimeError("Чат-ферма уже работает")
     if manager.manager.farm_sessions_busy():
         raise RuntimeError("Обнаружена работающая чат-ферма; сначала остановите её")
+    history_result = None
     if payload.get("collect_history"):
+        history_reference = payload.get("history_reference") or {
+            "chat_ref": int(payload["target_id"]),
+            "invite_hash": None,
+            "topic_id": int(payload.get("topic_id") or 0) or None,
+            "source": "id",
+        }
+        invite_token = payload.pop("history_invite_token", None)
+        if invite_token:
+            resolved_reference = _take_invite_reference(invite_token)
+            if resolved_reference is None:
+                raise RuntimeError("Invite-ссылка больше недоступна в памяти. Повторите запуск фермы.")
+            history_reference = resolved_reference
         history_result = await chat_context.collect_chat_context({
-            "reference": {
-                "chat_ref": int(payload["target_id"]),
-                "invite_hash": None,
-                "topic_id": int(payload.get("topic_id") or 0) or None,
-                "source": "id",
-            },
+            "reference": history_reference,
             "reader": payload.get("context_reader"),
             "accounts": payload.get("accounts", []),
             "history_limit": int(payload.get("history_limit") or 100),
-            "topic_id": int(payload.get("topic_id") or 0),
+            "topic_id": int(
+                payload.get("history_topic_id")
+                if payload.get("history_topic_id") is not None
+                else payload.get("topic_id") or 0
+            ),
             "download_media": False,
+            "auto_join": bool(payload.get("history_auto_join", False)),
         })
+        assignments = ", ".join(
+            f"{name} → участник {participant_id}"
+            for name, participant_id in (history_result.get("account_participant_ids") or {}).items()
+        ) or "пар для участников нет"
         log.info(
-            "Собран обезличенный контекст чата %s: %d сообщений; теперь запускаю чат-ферму",
+            "Собран обезличенный контекст чата %s: %d сообщений; назначение истории: %s; теперь запускаю чат-ферму",
             history_result["chat_id"],
             history_result["message_count"],
+            assignments,
         )
     env = os.environ.copy()
     env.update({
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
         "FARM_OVERRIDE_TARGET": str(payload["target_id"]),
+        "FARM_OVERRIDE_CONTEXT_CHAT_ID": str(
+            history_result["chat_id"] if history_result else payload["target_id"]
+        ),
+        "FARM_OVERRIDE_CONTEXT_REFRESH": "1" if history_result else "0",
         "FARM_OVERRIDE_TOPIC": str(payload.get("topic_id", 0)),
         "FARM_OVERRIDE_ACCOUNTS": ",".join(payload["accounts"]),
         "FARM_OVERRIDE_MIN_DELAY": str(payload["min_delay"]),

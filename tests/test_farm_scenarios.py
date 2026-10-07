@@ -96,6 +96,15 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.last_outgoing_message_id)
         self.assertEqual(list(state.chat_history), [incoming])
 
+    def test_state_round_trip_preserves_account_to_participant_mapping(self):
+        state = farm.FarmState()
+        state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
+
+        restored = farm.FarmState()
+        restored.load(state.to_dict())
+
+        self.assertEqual(restored.account_participant_ids, {"bot_one": 1, "bot_two": 2})
+
     async def test_reactive_mode_does_not_require_or_start_a_scenario(self):
         state = farm.FarmState()
         stop_event = farm.asyncio.Event()
@@ -294,6 +303,40 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(reply, "А какой небольшой шаг проще всего проверить в первую очередь?")
         self.assertEqual(bridge.ask.await_count, 2)
+
+    async def test_each_bot_prompt_uses_only_its_mapped_participant_history(self):
+        state = farm.FarmState()
+        state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
+        state.chat_history.extend([
+            {
+                "author": "участник 1", "participant_id": 1,
+                "text": "UNIQUE_MESSAGE_FROM_PARTICIPANT_ONE", "direction": "context",
+            },
+            {
+                "author": "участник 2", "participant_id": 2,
+                "text": "UNIQUE_MESSAGE_FROM_PARTICIPANT_TWO", "direction": "context",
+            },
+        ])
+
+        for account_name, included, excluded in (
+            ("bot_one", "UNIQUE_MESSAGE_FROM_PARTICIPANT_ONE", "UNIQUE_MESSAGE_FROM_PARTICIPANT_TWO"),
+            ("bot_two", "UNIQUE_MESSAGE_FROM_PARTICIPANT_TWO", "UNIQUE_MESSAGE_FROM_PARTICIPANT_ONE"),
+        ):
+            bridge = types.SimpleNamespace(
+                is_ready=True,
+                ask=AsyncMock(return_value="Новый проверяемый шаг по теме."),
+            )
+            await farm.generate_dialogue_turn(
+                bridge,
+                state,
+                "Обсуждаем тему",
+                "синтетическая роль",
+                1,
+                account_name=account_name,
+            )
+            prompt = bridge.ask.await_args.args[0]
+            self.assertIn(included, prompt)
+            self.assertNotIn(excluded, prompt)
 
     async def test_later_llm_turn_is_instructed_to_continue_the_previous_account(self):
         state = farm.FarmState()

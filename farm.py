@@ -299,6 +299,7 @@ class FarmState:
         self.chat_history: deque[dict[str, Any]] = deque(maxlen=60)
         self.topic: str = "общее общение"
         self.last_outgoing_message_id: int | None = None
+        self.account_participant_ids: dict[str, int] | None = None
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
@@ -319,6 +320,7 @@ class FarmState:
             "chat_history": list(self.chat_history),
             "topic": self.topic,
             "last_outgoing_message_id": self.last_outgoing_message_id,
+            "account_participant_ids": self.account_participant_ids,
         }
 
     def load(self, data: dict[str, Any]) -> None:
@@ -326,6 +328,16 @@ class FarmState:
         self.topic = data.get("topic", "общее общение")
         message_id = data.get("last_outgoing_message_id")
         self.last_outgoing_message_id = int(message_id) if message_id else None
+        raw_mapping = data.get("account_participant_ids")
+        if isinstance(raw_mapping, dict):
+            normalized_mapping: dict[str, int] = {}
+            for account, participant_id in raw_mapping.items():
+                try:
+                    if account and participant_id is not None:
+                        normalized_mapping[str(account)] = int(participant_id)
+                except (TypeError, ValueError):
+                    continue
+            self.account_participant_ids = normalized_mapping
         self._seen_order.clear()
         self._seen_ids.clear()
         for item in self.chat_history:
@@ -338,6 +350,7 @@ class FarmState:
         self.chat_history = deque(incoming[-60:], maxlen=60)
         self.topic = "общее общение"
         self.last_outgoing_message_id = None
+        self.account_participant_ids = None
         self._seen_order.clear()
         self._seen_ids.clear()
         for item in self.chat_history:
@@ -474,6 +487,8 @@ REPLY_PROMPT = """Ты — автоматизированный аккаунт �
 
 Твоя синтетическая роль: {persona}
 {topic_context}
+
+Исторические сообщения в контексте отфильтрованы по участнику, назначенному этому аккаунту; используй их как содержание, но не копируй формулировки, голос или личность.
 
 Сообщение, на которое нужно ответить:
 {incoming}
@@ -614,12 +629,16 @@ async def generate_reply(
     incoming_text: str = "",
     *,
     include_scenario_topic: bool = True,
+    account_name: str | None = None,
 ) -> str:
     if bridge and getattr(bridge, "is_ready", False):
         try:
             async with state.lock:
-                history = list(state.chat_history)
-                context = build_context(state.chat_history)
+                raw_history = list(state.chat_history)
+                history = _history_for_account(
+                    raw_history, account_name, state.account_participant_ids
+                )
+                context = build_context(deque(history, maxlen=60))
                 topic = state.topic
             topic_context = f"Текущая тема сценария: {topic}" if include_scenario_topic and topic else ""
             prompt = REPLY_PROMPT.format(
@@ -727,6 +746,7 @@ DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплик�
 
 Одна обезличенная историческая реплика — исходная точка только для первого хода этапа:
 {history_seed}
+Исторические сообщения уже отфильтрованы по участнику, назначенному этому аккаунту. Используй их как содержание, но оставайся синтетической ролью: не копируй чужой стиль, голос или личность.
 
 Последняя реплика предыдущего аккаунта — продолжай её, а не начинай новый ответ на общую тему:
 {previous_turn}
@@ -794,6 +814,33 @@ def _human_message_for_turn(history: list[dict[str, Any]], turn_number: int) -> 
     phase = (max(1, turn_number) - 1) // len(DIALOGUE_PROGRESS_STEPS)
     source_index = len(sources) - 1 - phase
     return sources[source_index] if source_index >= 0 else ""
+
+
+def _context_participant_id(item: dict[str, Any]) -> int | None:
+    value = item.get("participant_id")
+    try:
+        if value is not None:
+            return int(value)
+    except (TypeError, ValueError):
+        pass
+    match = re.fullmatch(r"(?:участник|participant)\s+(\d+)", str(item.get("author") or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _history_for_account(
+    history: list[dict[str, Any]],
+    account_name: str | None,
+    account_participant_ids: dict[str, int] | None,
+) -> list[dict[str, Any]]:
+    """Restrict archived donor messages to the anonymized participant mapped to this bot."""
+    if account_name is None or account_participant_ids is None:
+        return history
+    participant_id = account_participant_ids.get(account_name)
+    return [
+        item for item in history
+        if item.get("direction") != "context"
+        or (participant_id is not None and _context_participant_id(item) == participant_id)
+    ]
 
 
 def _dialogue_domain(text: str) -> str:
@@ -922,10 +969,14 @@ async def generate_dialogue_turn(
     *,
     tell_joke: bool = False,
     global_prompt: str = "",
+    account_name: str | None = None,
 ) -> str:
-    """Generate a progressive turn, anchored in anonymized chat history."""
+    """Generate a turn using only this bot's mapped anonymized donor participant."""
     async with state.lock:
-        history = list(state.chat_history)
+        raw_history = list(state.chat_history)
+        history = _history_for_account(
+            raw_history, account_name, state.account_participant_ids
+        )
         context = build_context(deque(history, maxlen=60), limit=10)
     latest_event = history[-1] if history else {}
     latest_text = str(latest_event.get("text") or "").strip()
@@ -1365,6 +1416,7 @@ class FarmAccount:
                 persona,
                 incoming_text,
                 include_scenario_topic=scenario_mode != "reactive",
+                account_name=self.name,
             )
         except Exception:
             log.exception("[%s] reply generation failed", self.name)
@@ -1710,6 +1762,7 @@ async def run_scenario(
                 turn_index + 1,
                 tell_joke=tell_joke,
                 global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
+                account_name=account.name,
             )
             kind = account._pick_kind()
             async with state.outgoing_lock:
@@ -1950,10 +2003,48 @@ async def run_farm() -> None:
             "Режим без сценария: сброшены тема, исходящие сценарные реплики и архивный контекст; сохранены только последние входящие сообщения (%d)",
             len(state.chat_history),
         )
+    elif os.getenv("FARM_OVERRIDE_CONTEXT_REFRESH", "").strip().lower() in {"1", "true", "yes"}:
+        # A freshly collected source replaces prior archived context in this target's state.
+        state.chat_history = deque(
+            (item for item in state.chat_history if item.get("direction") != "context"),
+            maxlen=60,
+        )
+        state._seen_order.clear()
+        state._seen_ids.clear()
+        for item in state.chat_history:
+            if item.get("chat_id") is not None and item.get("message_id") is not None:
+                state.remember_message(int(item["chat_id"]), int(item["message_id"]))
 
-    context_file = DATA_DIR / "chat_contexts" / str(chat_id) / "context.json"
+    raw_context_chat_id = os.getenv("FARM_OVERRIDE_CONTEXT_CHAT_ID", "").strip()
+    try:
+        context_chat_id = int(raw_context_chat_id) if raw_context_chat_id else chat_id
+    except ValueError:
+        raise SystemExit("FARM_OVERRIDE_CONTEXT_CHAT_ID должен быть целым числом")
+    if context_chat_id == 0:
+        raise SystemExit("FARM_OVERRIDE_CONTEXT_CHAT_ID не может быть нулём")
+    context_file = DATA_DIR / "chat_contexts" / str(context_chat_id) / "context.json"
+    if scenario_mode != "reactive" and context_chat_id != chat_id:
+        log.info("История цели %s будет использована из чата-источника %s", chat_id, context_chat_id)
     collected = await load_json(context_file, {}) if scenario_mode != "reactive" else {}
     context_rows = collected.get("messages", []) if isinstance(collected, dict) else []
+    raw_participant_mapping = collected.get("account_participant_ids") if isinstance(collected, dict) else None
+    if isinstance(raw_participant_mapping, dict):
+        normalized_mapping: dict[str, int] = {}
+        for account_name, participant_id in raw_participant_mapping.items():
+            try:
+                if account_name and participant_id is not None:
+                    normalized_mapping[str(account_name)] = int(participant_id)
+            except (TypeError, ValueError):
+                continue
+        state.account_participant_ids = normalized_mapping
+    elif os.getenv("FARM_OVERRIDE_CONTEXT_REFRESH", "").strip().lower() in {"1", "true", "yes"}:
+        state.account_participant_ids = {}
+    if state.account_participant_ids is not None:
+        assignments = ", ".join(
+            f"{name} → участник {participant_id}"
+            for name, participant_id in state.account_participant_ids.items()
+        ) or "нет назначенных участников"
+        log.info("Персональный исторический контекст: %s", assignments)
     if context_rows:
         merged: dict[tuple[int, int], dict[str, Any]] = {}
         unkeyed: list[dict[str, Any]] = []
@@ -1968,7 +2059,7 @@ async def run_farm() -> None:
                 message_id = int(item["message_id"])
             except (KeyError, TypeError, ValueError):
                 continue
-            key = (chat_id, message_id)
+            key = (context_chat_id, message_id)
             if key in merged:
                 continue
             kind = str(item.get("kind") or "text")
@@ -1983,9 +2074,10 @@ async def run_farm() -> None:
                     text = f"{text} {media_hint}"
             merged[key] = {
                 "author": str(item.get("author") or "участник"),
+                "participant_id": _context_participant_id(item),
                 "user_id": 0,
                 "message_id": message_id,
-                "chat_id": chat_id,
+                "chat_id": context_chat_id,
                 "text": text[:2000],
                 "kind": kind,
                 "direction": "context",

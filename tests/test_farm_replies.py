@@ -377,6 +377,36 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Общие указания: отвечай кратко", prompt)
         self.assertIn("спокойный участник", prompt)
 
+    async def test_reply_prompt_uses_only_the_assigned_historical_participant(self):
+        state = farm.FarmState()
+        state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
+        state.chat_history.extend([
+            {
+                "author": "участник 1", "participant_id": 1,
+                "text": "UNIQUE_REPLY_CONTEXT_ONE", "direction": "context", "kind": "text",
+            },
+            {
+                "author": "участник 2", "participant_id": 2,
+                "text": "UNIQUE_REPLY_CONTEXT_TWO", "direction": "context", "kind": "text",
+            },
+        ])
+        bridge = types.SimpleNamespace(is_ready=True, ask=AsyncMock(return_value="Краткий ответ по вопросу."))
+
+        answer = await farm.generate_reply(
+            bridge,
+            state,
+            types.SimpleNamespace(sample_texts=lambda _count: []),
+            "синтетическая роль",
+            "Что проверить первым?",
+            account_name="bot_one",
+        )
+
+        self.assertEqual(answer, "Краткий ответ по вопросу.")
+        prompt = bridge.ask.await_args.args[0]
+        self.assertIn("UNIQUE_REPLY_CONTEXT_ONE", prompt)
+        self.assertNotIn("UNIQUE_REPLY_CONTEXT_TWO", prompt)
+        self.assertIn("Что проверить первым?", prompt)
+
     async def test_reactive_send_reply_uses_saved_instructions_without_scenario_topic(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "alpha"
@@ -402,11 +432,13 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
             "дружелюбный участник" + chr(10) + "Общие указания: Отвечай кратко.",
             "Вопрос",
             include_scenario_topic=False,
+            account_name="alpha",
         )
         account._send_text.assert_awaited_once_with("Ответ", reply_to=55)
 
     async def test_missing_gif_falls_back_to_reply_text(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "test_account"
         account.persona = "test"
         account.bridge = None
         account.state = farm.FarmState()

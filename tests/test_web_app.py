@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -53,8 +54,10 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.status_code, 200)
         self.assertIn("История чата", context.text)
         self.assertIn("права администратора не требуются", context.text)
-        self.assertIn("объявил в чате об автоматическом сборе истории", context.text)
-        self.assertIn("Без авто-вступления", context.text)
+        self.assertIn("объявил участникам об автоматическом сборе истории", context.text)
+        self.assertIn("Вступление — по выбору", context.text)
+        self.assertIn('name="auto_join"', context.text)
+        self.assertIn("первый выбранный аккаунт получает сообщения только участника 1", context.text)
         await db.upsert_account(
             "preview", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
@@ -72,6 +75,10 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("По умолчанию — бесконечная цепочка", chatfarm.text)
         self.assertIn("права администратора не требуются", chatfarm.text)
         self.assertIn("Перед запуском взять последние сообщения как контекст", chatfarm.text)
+        self.assertIn('name="history_source"', chatfarm.text)
+        self.assertIn("ID/ссылка чата-источника истории", chatfarm.text)
+        self.assertIn("бот 1 получает только сообщения обезличенного участника 1", chatfarm.text)
+        self.assertIn('name="auto_join_history"', chatfarm.text)
         self.assertIn("Глубина истории, сообщений", chatfarm.text)
         self.assertIn("Рулетка — случайные числа", chatfarm.text)
         self.assertIn("Отдыхать после N ходов", chatfarm.text)
@@ -142,7 +149,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         account = await db.get_account("editable")
         self.assertEqual(account["behavior_customized"], 0)
 
-    async def test_chat_context_collection_requires_ack_and_strips_link_from_task_payload(self):
+    async def test_chat_context_collection_requires_ack_and_keeps_invite_hash_out_of_task_payload(self):
         await db.upsert_account(
             "reader", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
@@ -156,19 +163,31 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         missing_ack = await self.client.post("/api/chat-context/collect", data=base)
         self.assertEqual(missing_ack.status_code, 422)
 
-        invite_link = await self.client.post("/api/chat-context/collect", data={
-            **base, "chat_link": "https://t.me/+Abcdefghijkl", "authorization_ack": "on",
-        })
-        self.assertEqual(invite_link.status_code, 422)
-
         with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=92) as submit:
+            response = await self.client.post("/api/chat-context/collect", data={
+                **base,
+                "chat_link": "https://t.me/+Abcdefghijkl",
+                "auto_join": "on",
+                "authorization_ack": "on",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["task_id"], 92)
+        payload = submit.await_args.args[1]
+        self.assertTrue(payload["auto_join"])
+        self.assertIsNone(payload["reference"]["invite_hash"])
+        self.assertNotIn("Abcdefghijkl", json.dumps(payload))
+        reference = web_app._take_invite_reference(payload["invite_token"])
+        self.assertEqual(reference["invite_hash"], "Abcdefghijkl")
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=93) as submit:
             response = await self.client.post(
                 "/api/chat-context/collect", data={**base, "authorization_ack": "on"}
             )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["task_id"], 92)
+        self.assertEqual(response.json()["task_id"], 93)
         payload = submit.await_args.args[1]
         self.assertEqual(payload["reference"]["chat_ref"], "sample_group")
+        self.assertFalse(payload["auto_join"])
         self.assertNotIn("chat_link", payload)
 
     async def test_context_delete_is_blocked_while_farm_may_recreate_state(self):
@@ -349,6 +368,9 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "collect_context_history": "on",
             "context_reader": "alpha",
             "history_limit": "37",
+            "history_source": "https://t.me/donor_room/77/100",
+            "history_topic_id": "0",
+            "auto_join_history": "on",
             "automation_ack": "on",
         }
         with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=73) as submit:
@@ -360,7 +382,74 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(submitted["collect_history"])
         self.assertEqual(submitted["context_reader"], "alpha")
         self.assertEqual(submitted["history_limit"], 37)
+        self.assertEqual(submitted["history_reference"]["chat_ref"], "donor_room")
+        self.assertEqual(submitted["history_reference"]["topic_id"], 77)
+        self.assertEqual(submitted["history_topic_id"], 77)
+        self.assertTrue(submitted["history_auto_join"])
         self.assertEqual(submitted["scenario_topic"], "Прозрачный сценарный диалог по общим идеям из недавней истории чата; без имитации участников.")
+
+    async def test_chatfarm_accepts_a_separate_numeric_history_source_id(self):
+        for name in ("alpha", "beta"):
+            await db.upsert_account(
+                name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+            )
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=730) as submit:
+            response = await self.client.post("/api/chatfarm/start", data={
+                "accounts": "alpha,beta",
+                "target_id": "-1001234567890",
+                "scenario_mode": "combined",
+                "collect_context_history": "on",
+                "context_reader": "alpha",
+                "history_limit": "50",
+                "history_source": "-1001234567899",
+                "automation_ack": "on",
+                "min_delay": "5",
+                "max_delay": "15",
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        submitted = submit.await_args.args[1]
+        self.assertEqual(submitted["target_id"], -1001234567890)
+        self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
+        self.assertEqual(submitted["history_reference"]["source"], "id")
+        self.assertFalse(submitted["history_auto_join"])
+
+    async def test_chatfarm_invite_source_requires_join_opt_in_and_keeps_hash_ephemeral(self):
+        for name in ("alpha", "beta"):
+            await db.upsert_account(
+                name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+            )
+        base = {
+            "accounts": "alpha,beta",
+            "target_id": "-1001234567890",
+            "min_delay": "5",
+            "max_delay": "15",
+            "scenario_mode": "combined",
+            "collect_context_history": "on",
+            "context_reader": "alpha",
+            "history_limit": "50",
+            "history_source": "https://t.me/+Abcdefghijkl",
+            "automation_ack": "on",
+        }
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=731) as submit:
+            response = await self.client.post("/api/chatfarm/start", data={
+                **base, "auto_join_history": "on",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        submitted = submit.await_args.args[1]
+        self.assertTrue(submitted["history_auto_join"])
+        self.assertIsNone(submitted["history_reference"]["invite_hash"])
+        self.assertNotIn("Abcdefghijkl", json.dumps(submitted))
+        reference = web_app._take_invite_reference(submitted["history_invite_token"])
+        self.assertEqual(reference["invite_hash"], "Abcdefghijkl")
+
+        invalid_id = await self.client.post("/api/chatfarm/start", data={
+            **base,
+            "history_source": "-1001234567891",
+            "auto_join_history": "on",
+        })
+        self.assertEqual(invalid_id.status_code, 422)
+        self.assertIn("числового ID", invalid_id.json()["detail"])
 
     async def test_dedicated_history_dialogue_mode_always_collects_history(self):
         for name in ("alpha", "beta"):
@@ -416,7 +505,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
 
         async def collect_context(payload):
             events.append(("collect", payload))
-            return {"chat_id": -1001234567890, "message_count": 37}
+            return {"chat_id": -1001234567899, "message_count": 37}
 
         async def spawn_process(*_args, **_kwargs):
             events.append(("spawn", None))
@@ -437,6 +526,11 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
                     "context_reader": "alpha",
                     "accounts": ["alpha", "beta"],
                     "history_limit": 37,
+                    "history_reference": {
+                        "chat_ref": "donor_room", "invite_hash": None, "topic_id": 77, "source": "username",
+                    },
+                    "history_topic_id": 77,
+                    "history_auto_join": True,
                     "min_delay": 5,
                     "max_delay": 15,
                     "qa_probability": 0.25,
@@ -460,6 +554,10 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event[0] for event in events], ["collect", "spawn"])
         self.assertEqual(events[0][1]["reader"], "alpha")
         self.assertEqual(events[0][1]["history_limit"], 37)
+        self.assertEqual(events[0][1]["reference"]["chat_ref"], "donor_room")
+        self.assertEqual(events[0][1]["topic_id"], 77)
+        self.assertTrue(events[0][1]["auto_join"])
+        self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_CONTEXT_CHAT_ID"], "-1001234567899")
         collect.assert_awaited_once()
         spawn.assert_awaited_once()
 

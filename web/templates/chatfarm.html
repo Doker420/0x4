@@ -42,8 +42,8 @@
         </select>
         <span id="scenario_mode_help" class="help">Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; тему вводить не нужно.</span>
       </div>
-      <div class="notice warning" style="margin:0 0 10px">Автоматизируйте только чат, где у вас есть разрешение, и предупредите участников. Выбранные аккаунты должны уже состоять в чате; автоматического вступления нет.</div>
-      <label class="check-row" style="align-items:flex-start;margin:0 0 16px"><input id="automation_ack" type="checkbox" name="automation_ack" required><span>У меня есть разрешение, я объявил в чате об автоматических сообщениях, а выбранные аккаунты уже состоят в нём.</span></label>
+      <div class="notice warning" style="margin:0 0 10px">Автоматизируйте только чат, где у вас есть разрешение, и предупредите участников. Для чата назначения аккаунты должны быть участниками; явное авто-вступление доступно только для источника истории ниже.</div>
+      <label class="check-row" style="align-items:flex-start;margin:0 0 16px"><input id="automation_ack" type="checkbox" name="automation_ack" required><span>У меня есть разрешение, я объявил в чате об автоматических сообщениях, выбранные аккаунты состоят в целевом чате и (если включу ниже) могут вступить в чат-источник.</span></label>
       <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
         <div class="field">
           <label for="scenario_topic">Общая тема, вопрос или правила игры</label>
@@ -53,14 +53,23 @@
         <div id="history_context_fields" class="card compact" hidden style="margin:0 0 14px;background:rgba(8,15,23,.48)">
           <label class="check-row" style="align-items:flex-start;margin-bottom:10px">
             <input id="collect_context_history" type="checkbox" name="collect_context_history">
-            <span><strong>Перед запуском взять последние сообщения как контекст</strong><small>Сбор начнётся по указанному Chat ID и ID темы; глубину можно выбрать ниже.</small></span>
+            <span><strong>Перед запуском взять последние сообщения как контекст</strong><small>По умолчанию источник — целевой Chat ID выше. При необходимости можно указать отдельный чат-донор.</small></span>
           </label>
           <div id="history_context_options" hidden>
+            <div class="field">
+              <label for="history_source">ID/ссылка чата-источника истории <span class="subtle">(необязательно)</span></label>
+              <input id="history_source" name="history_source" type="text" maxlength="512" value="{{ history_source_prefill }}" placeholder="Пусто — целевой чат; иначе ID, @username или ссылка t.me">
+              <span class="help">История будет собрана до старта и применена как контекст к диалогу в целевом чате. Вставьте числовой ID, публичный username или ссылку (включая invite-ссылку).</span>
+            </div>
             <div class="grid-2">
               <div class="field"><label for="history_limit_input">Глубина истории, сообщений</label><input id="history_limit_input" name="history_limit" type="number" min="1" max="300" step="1" value="100"><span class="help">От 1 до 300 последних сообщений.</span></div>
               <div class="field"><label for="context_reader">Сессия для чтения истории</label><select id="context_reader" name="context_reader">{% for a in accounts if a.enabled and a.session_status == 'authorized' %}<option value="{{ a.name }}">{{ a.name }}{% if a.username %} · @{{ a.username }}{% endif %}</option>{% endfor %}</select><span class="help">Достаточно быть участником чата; права администратора не требуются.</span></div>
             </div>
-            <p class="help">До запуска проверяется, что все выбранные сессии уже состоят в группе; администраторские права не нужны. Автоматического вступления нет. Подтвердите, что объявили участникам об автоматизации. История передаётся только обезличенно как контекст; аккаунты сохраняют синтетические роли и не копируют стиль или личности участников. Для запуска без сбора оставьте флажок выключенным.</p>
+            <div class="grid-2" style="margin-top:4px">
+              <div class="field"><label for="history_topic_id">ID темы источника <span class="subtle">(необязательно)</span></label><input id="history_topic_id" name="history_topic_id" type="number" min="0" value="{{ history_topic_prefill or '0' }}"><span class="help">0 — использовать ID темы из ссылки, либо всю историю.</span></div>
+              <label class="check-row" style="align-items:flex-start"><input id="auto_join_history" type="checkbox" name="auto_join_history"><span><strong>Автоматически вступить аккаунтами диалога в источник, если их там нет</strong><small>Только по username или invite-ссылке. Числовой ID и ссылка <code>t.me/c/…</code> не дают способа вступить; invite-запросы с одобрением могут не завершиться сразу.</small></span></label>
+            </div>
+            <p class="help">Все выбранные аккаунты проверяются на членство в источнике; если авто-вступление не включено, они должны уже быть участниками. Права администратора не требуются. Аккаунты сопоставляются 1:1 сверху вниз по выбранным аккаунтам: бот 1 получает только сообщения обезличенного участника 1, бот 2 — участника 2 и т. д.; номера участников идут по первому появлению в истории. Используются синтетические роли, без копирования имён и стиля. Для запуска без сбора оставьте флажок выше выключенным.</p>
           </div>
         </div>
         <div id="roulette_fields" class="field" hidden>
@@ -176,7 +185,7 @@ function updateScenarioForm() {
     document.getElementById('scenario_turns').value = historyDialogue ? '8' : (mode === 'discussion' || combined) ? '0' : '20';
   }
   document.getElementById('scenario_mode_help').textContent = historyDialogue
-    ? 'Укажите Chat ID и глубину истории, выберите любую уже состоящую в чате сессию для чтения (администратор не нужен) и подтвердите объявление участникам. Панель соберёт обезличенный контекст перед запуском цепочки.'
+    ? 'Укажите ID целевого чата и глубину истории; если источник другой, впишите его ID/ссылку отдельно (пустое поле использует цель). Выберите сессию для чтения; администратор не нужен. Панель соберёт обезличенный контекст до запуска цепочки.'
     : combined
       ? 'Аккаунты сами строят цепочку: каждый следующий ход реплаем продолжает предыдущий. Одновременно один случайный аккаунт может ответить реплаем на вопрос участника.'
       : roulette

@@ -5,20 +5,20 @@
   <div>
     <p class="eyebrow">Разрешённый сбор контекста</p>
     <h1>История чата</h1>
-    <p class="subtle">Проверьте членство аккаунтов, соберите ограниченную историю и используйте её как контекст для отдельных ролей аккаунтов.</p>
+    <p class="subtle">Проверьте членство или явно включите авто-вступление, соберите ограниченную историю и используйте её как контекст для отдельных синтетических ролей.</p>
   </div>
   <div class="actions"><a class="button secondary" href="/chatfarm">Настроить сценарий →</a></div>
 </section>
 
 <div class="grid">
   <section class="card">
-    <div class="card-head"><div><h2>Добавить источник</h2><p class="subtle">Для чтения истории достаточно сессии обычного участника группы; права администратора не требуются.</p></div><span class="pill">Без авто-вступления</span></div>
+    <div class="card-head"><div><h2>Добавить источник</h2><p class="subtle">Для чтения истории достаточно сессии обычного участника группы; права администратора не требуются.</p></div><span class="pill">Вступление — по выбору</span></div>
     {% if accounts %}
     <form id="context_form" onsubmit="collectContext(event)">
       <div class="field">
         <label for="chat_link">Ссылка или ID Telegram-чата</label>
         <input id="chat_link" name="chat_link" type="text" maxlength="512" placeholder="https://t.me/my_group или -1001234567890" required>
-        <span class="help">Можно указать публичную ссылку, ссылку <code>t.me/c/…</code> или числовой ID. Сначала вручную добавьте выбранные аккаунты в чат; приватная invite-ссылка не используется для вступления.</span>
+        <span class="help">Можно указать публичную ссылку, <code>t.me/c/…</code>, числовой ID или invite-ссылку. Для авто-вступления нужен публичный username либо invite-ссылка: один числовой ID или <code>t.me/c/…</code> не даёт права вступить.</span>
       </div>
       <div class="field">
         <label for="topic_id">ID темы форума <span class="subtle">(необязательно)</span></label>
@@ -30,7 +30,7 @@
         <select id="reader" name="reader" required onchange="syncContextAccounts()">
           {% for account in accounts %}<option value="{{ account.name }}">{{ account.name }} · {{ '@' + account.username if account.username else account.phone or 'Telegram' }}</option>{% endfor %}
         </select>
-        <span class="help">Аккаунт должен уже состоять в чате. Права администратора или владельца не нужны.</span>
+        <span class="help">Если авто-вступление не включено, аккаунт должен уже состоять в чате. Права администратора или владельца не нужны.</span>
       </div>
       <div class="field">
         <label>Аккаунты с отдельным контекстом</label>
@@ -43,27 +43,31 @@
           {% endfor %}
         </div>
         <input type="hidden" id="context_accounts" name="accounts">
-        <span class="help">Все выбранные аккаунты проверяются как уже состоящие в этой группе. Для каждого будет отдельная AI-сессия; используется его настроенная роль, а не копия реального участника. <a href="/accounts">Настроить разные роли →</a></span>
+        <span class="help">Участие каждого выбранного аккаунта проверяется. По порядку списка сверху вниз первый выбранный аккаунт получает сообщения только участника 1, второй — только участника 2 и т. д. Номера участников назначаются по первому появлению в истории; если пары нет, сессия не получает архивные сообщения. Роли и стиль самих аккаунтов остаются синтетическими. Права администратора для чтения не нужны. <a href="/accounts">Настроить разные роли →</a></span>
       </div>
+      <label class="check-row" style="align-items:flex-start;margin:8px 0 14px">
+        <input id="auto_join" type="checkbox" name="auto_join">
+        <span><strong>Автоматически вступить выбранными аккаунтами, если их ещё нет в чате</strong><small>Только по публичному username или invite-ссылке. Для числового ID и ссылок <code>t.me/c/…</code> Telegram не даёт способа вступить; при необходимости используйте invite-ссылку. Вступление может потребовать одобрения администратором.</small></span>
+      </label>
       <div class="grid-2">
         <div class="field"><label for="history_limit">Сообщений контекста</label><input id="history_limit" name="history_limit" type="number" min="1" max="300" value="100" required><span class="help">Максимум 300 последних сообщений.</span></div>
         <div class="field"><label>Медиа</label><label class="check-row"><input id="download_media" type="checkbox" name="download_media"><span>Сохранить локально до 10 небольших GIF/стикеров/файлов</span></label><span class="help">До 3 МБ на файл и 30 МБ на чат; медиа не перепубликуются автоматически.</span></div>
       </div>
-      <div class="notice warning" style="margin:8px 0 14px">Используйте только чаты, которыми вы управляете или на сбор в которых получено разрешение. Уведомите участников; история локальна, авторы в сохранённом контексте обезличены.</div>
+      <div class="notice warning" style="margin:8px 0 14px">Используйте только чаты, которыми вы управляете или на сбор и вступление в которые получено разрешение. Уведомите участников; история локальна, авторы в сохранённом контексте обезличены.</div>
       <label class="check-row" style="align-items:flex-start;margin-bottom:14px">
         <input id="authorization_ack" type="checkbox" name="authorization_ack" required>
-        <span>Я объявил в чате об автоматическом сборе истории и её обезличенном использовании, имею на это разрешение и сообщил о локальном хранении контекста.</span>
+        <span>Я объявил участникам об автоматическом сборе истории и её обезличенном использовании, получил разрешение на сбор и (если выбрано выше) вступление аккаунтов, а также сообщил о локальном хранении контекста.</span>
       </label>
       <button id="context_submit" type="submit" style="width:100%;min-height:44px">Проверить доступ и собрать контекст</button>
     </form>
     {% else %}
-      <div class="empty">Сначала авторизуйте аккаунт в разделе «Аккаунты». Для сбора выберите сессию, уже состоящую в группе; права администратора не требуются.</div>
+      <div class="empty">Сначала авторизуйте аккаунт в разделе «Аккаунты». Можно собирать из чата, где выбранные сессии уже состоят, либо явно включить авто-вступление по username/invite-ссылке. Права администратора не требуются.</div>
     {% endif %}
     <div id="context_output" class="notice" hidden style="margin-top:14px"></div>
   </section>
 
   <section class="card">
-    <div class="card-head"><div><h2>Сохранённые контексты</h2><p class="subtle">После остановки чат-фермы удаление стирает контекст, скачанные файлы и историю фермы для этого чата.</p></div><button class="secondary small" type="button" onclick="refreshContexts()">Обновить</button></div>
+    <div class="card-head"><div><h2>Сохранённые контексты</h2><p class="subtle">Удаление стирает архив источника и скачанные файлы; оно не удаляет историю фермы отдельного целевого чата.</p></div><button class="secondary small" type="button" onclick="refreshContexts()">Обновить</button></div>
     <div id="context_list">
       {% if contexts %}
         {% for context in contexts %}
@@ -72,15 +76,15 @@
             <div><h3>{{ context.title }}</h3><p class="subtle">ID {{ context.chat_id }}{% if context.topic_id %} · тема {{ context.topic_id }}{% endif %}</p></div>
             <button class="danger small" type="button" onclick="deleteContext({{ context.chat_id }})">Удалить</button>
           </div>
-          <p class="help">{{ context.message_count }} сообщений · аккаунты: {{ context.accounts|join(', ') }} · медиа: {{ context.media_counts }}</p>
-          <a href="/chatfarm?target_id={{ context.chat_id }}{% if context.topic_id %}&amp;topic_id={{ context.topic_id }}{% endif %}">Открыть настройки чата →</a>
+          <p class="help">{{ context.message_count }} сообщений · участников: {{ context.participant_count }} · аккаунты: {{ context.accounts|join(', ') }} · соответствие: {% for account, participant_id in context.account_participant_ids.items() %}{{ account }} → участник {{ participant_id }}{% if not loop.last %}, {% endif %}{% else %}нет пар{% endfor %} · медиа: {{ context.media_counts }}</p>
+          <a href="/chatfarm?history_source={{ context.chat_id }}{% if context.topic_id %}&amp;history_topic_id={{ context.topic_id }}{% endif %}">Использовать как источник истории в чат-ферме →</a>
         </article>
         {% endfor %}
       {% else %}
         <div class="empty" id="context_empty">Пока нет сохранённых источников.</div>
       {% endif %}
     </div>
-    <div class="notice" style="margin-top:12px">Сбор только читает последние сообщения. Модуль не вступает в чаты, не публикует собранный текст/медиа и не копирует стиль конкретных участников.</div>
+    <div class="notice" style="margin-top:12px">Сбор читает последние сообщения и, только если это явно отмечено при сборе и разрешено участниками, может вступить выбранными аккаунтами в чат. Собранный текст/медиа не публикуются и стиль конкретных участников не копируется.</div>
   </section>
 </div>
 
@@ -122,7 +126,7 @@ async function collectContext(event) {
   }
 }
 async function waitForContextTask(taskId, output) {
-  const deadline = Date.now() + 180000;
+  const deadline = Date.now() + 1800000;
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 1500));
     const response = await fetch('/api/tasks/list');
@@ -131,10 +135,11 @@ async function waitForContextTask(taskId, output) {
     if (!task || task.status === 'pending' || task.status === 'running') continue;
     if (task.status !== 'ok') throw new Error(task.error || 'Не удалось собрать контекст');
     const result = typeof task.result === 'string' ? JSON.parse(task.result) : task.result;
-    showMessage(output, `Готово: ${result.title}; ${result.message_count} сообщений, медиа ${JSON.stringify(result.media_counts)}.`, 'success');
+    const assignments = Object.entries(result.account_participant_ids || {}).map(([name, participant]) => `${name} → участник ${participant}`).join(', ') || 'пар для исторических ролей не найдено';
+    showMessage(output, `Готово: ${result.title}; ${result.message_count} сообщений, участников ${result.participant_count || 0}; соответствие: ${assignments}; медиа ${JSON.stringify(result.media_counts)}.`, 'success');
     const link = document.createElement('a');
-    link.href = `/chatfarm?target_id=${encodeURIComponent(result.chat_id)}${result.topic_id ? `&topic_id=${encodeURIComponent(result.topic_id)}` : ''}`;
-    link.textContent = ' Настроить прозрачный диалог и ответы в этом чате →';
+    link.href = `/chatfarm?history_source=${encodeURIComponent(result.chat_id)}${result.topic_id ? `&history_topic_id=${encodeURIComponent(result.topic_id)}` : ''}`;
+    link.textContent = ' Использовать как источник истории в чат-ферме →';
     link.style.display = 'inline-block'; link.style.marginTop = '8px';
     output.appendChild(document.createElement('br')); output.appendChild(link);
     await refreshContexts();
@@ -158,8 +163,9 @@ async function refreshContexts() {
       info.append(title, id);
       const remove = document.createElement('button'); remove.className = 'danger small'; remove.type = 'button'; remove.textContent = 'Удалить'; remove.onclick = () => deleteContext(context.chat_id);
       heading.append(info, remove);
-      const meta = document.createElement('p'); meta.className = 'help'; meta.textContent = `${context.message_count} сообщений · аккаунты: ${(context.accounts || []).join(', ')} · медиа: ${JSON.stringify(context.media_counts || {})}`;
-      const link = document.createElement('a'); link.href = `/chatfarm?target_id=${encodeURIComponent(context.chat_id)}${context.topic_id ? `&topic_id=${encodeURIComponent(context.topic_id)}` : ''}`; link.textContent = 'Открыть настройки чата →';
+      const mapping = Object.entries(context.account_participant_ids || {}).map(([name, participant]) => `${name} → участник ${participant}`).join(', ') || 'пар не найдено';
+      const meta = document.createElement('p'); meta.className = 'help'; meta.textContent = `${context.message_count} сообщений · участников: ${context.participant_count || 0} · аккаунты: ${(context.accounts || []).join(', ')} · соответствие: ${mapping} · медиа: ${JSON.stringify(context.media_counts || {})}`;
+      const link = document.createElement('a'); link.href = `/chatfarm?history_source=${encodeURIComponent(context.chat_id)}${context.topic_id ? `&history_topic_id=${encodeURIComponent(context.topic_id)}` : ''}`; link.textContent = 'Использовать как источник истории →';
       article.append(heading, meta, link); list.append(article);
     }
     if (!(data.contexts || []).length) {

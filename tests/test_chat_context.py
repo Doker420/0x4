@@ -120,12 +120,16 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
                 saved = json.loads((temp_root / "chat_contexts" / str(chat.id) / "context.json").read_text(encoding="utf-8"))
 
             self.assertEqual(result["message_count"], 2)
+            self.assertEqual(result["participant_count"], 2)
             self.assertEqual(result["accounts"], ["reader", "agent_b"])
             self.assertEqual(get_client.await_count, 2)
             self.assertEqual(close_client.await_count, 2)
             save_target.assert_awaited_once_with(chat.id, title="Authorized group", username="sample_group", kind="supergroup")
             self.assertEqual(saved["messages"][0]["author"], "участник 1")
             self.assertEqual(saved["messages"][1]["author"], "участник 2")
+            self.assertEqual([item["participant_id"] for item in saved["messages"]], [1, 2])
+            self.assertEqual(saved["account_participant_ids"], {"reader": 1, "agent_b": 2})
+            self.assertEqual(result["account_participant_ids"], {"reader": 1, "agent_b": 2})
             self.assertNotIn("private_500", json.dumps(saved, ensure_ascii=False))
             self.assertNotIn('"user_id"', json.dumps(saved))
             self.assertNotEqual(
@@ -231,6 +235,68 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["message_count"], 0)
             client.get_chat_member.assert_awaited_once_with(-1001234567890, 1)
             self.assertFalse(hasattr(client, "join_chat"))
+
+    async def test_auto_join_uses_invite_link_for_selected_accounts_before_collection(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            chat = types.SimpleNamespace(
+                id=-1001234567890, title="Private group", username=None,
+                type=types.SimpleNamespace(name="SUPERGROUP"),
+            )
+
+            async def empty_history(_chat_id, limit):
+                if False:
+                    yield None
+
+            clients = {}
+            for name, user_id in (("reader", 1), ("agent", 2)):
+                clients[name] = types.SimpleNamespace(
+                    get_chat=AsyncMock(return_value=chat),
+                    get_me=AsyncMock(return_value=types.SimpleNamespace(id=user_id)),
+                    get_chat_member=AsyncMock(return_value=types.SimpleNamespace(
+                        status=types.SimpleNamespace(name="MEMBER"), is_member=True
+                    )),
+                    get_chat_history=empty_history,
+                )
+            account_row = {"enabled": 1, "api_id": 123, "api_hash": "secret", "session_status": "authorized"}
+            join_result = {"ok": [{"name": "reader"}, {"name": "agent"}], "already": [], "fail": []}
+            with (
+                patch.object(chat_context, "CONTEXTS_DIR", root / "chat_contexts"),
+                patch.object(chat_context.db, "ROOT", root),
+                patch.object(chat_context.db, "get_account", new=AsyncMock(return_value=account_row)),
+                patch.object(chat_context.db, "upsert_chat_target", new=AsyncMock()),
+                patch.object(chat_context.manager, "get_client", new=AsyncMock(side_effect=lambda name: clients[name])),
+                patch.object(chat_context.manager, "close", new=AsyncMock()),
+                patch.object(chat_context.mass_actions, "mass_join", new=AsyncMock(return_value=join_result)) as mass_join,
+            ):
+                result = await chat_context.collect_chat_context({
+                    "reference": {
+                        "chat_ref": None, "invite_hash": "Abcdefghijkl", "topic_id": None, "source": "invite",
+                    },
+                    "reader": "reader",
+                    "accounts": ["reader", "agent"],
+                    "auto_join": True,
+                    "history_limit": 10,
+                })
+
+            mass_join.assert_awaited_once_with(["reader", "agent"], "https://t.me/+Abcdefghijkl")
+            clients["reader"].get_chat.assert_awaited_once_with("https://t.me/+Abcdefghijkl")
+            self.assertEqual(result["chat_id"], chat.id)
+
+    async def test_auto_join_rejects_numeric_id_without_a_join_link(self):
+        account_row = {"enabled": 1, "api_id": 123, "api_hash": "secret", "session_status": "authorized"}
+        with (
+            patch.object(chat_context.db, "get_account", new=AsyncMock(return_value=account_row)),
+            patch.object(chat_context.manager, "get_client", new=AsyncMock(return_value=types.SimpleNamespace())),
+            patch.object(chat_context.manager, "close", new=AsyncMock()),
+            patch.object(chat_context.mass_actions, "mass_join", new_callable=AsyncMock) as mass_join,
+        ):
+            with self.assertRaisesRegex(ValueError, "username|числового ID"):
+                await chat_context.collect_chat_context({
+                    "reference": {"chat_ref": -1001234567890, "invite_hash": None, "source": "id"},
+                    "reader": "reader", "accounts": ["reader"], "auto_join": True,
+                })
+        mass_join.assert_not_awaited()
 
     async def test_collection_rejects_selected_account_that_is_not_already_a_member(self):
         class MemberClient:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from . import db
+from . import db, mass_actions
 from .manager import manager, validate_session_name
 
 log = logging.getLogger("web.chat_context")
@@ -109,12 +109,33 @@ def _context_file(chat_id: int) -> Path:
 
 
 async def _resolve_chat(client: Any, reference: dict[str, Any]) -> Any:
-    if reference.get("invite_hash") or reference.get("chat_ref") is None:
+    if reference.get("invite_hash"):
+        invite_link = f"https://t.me/+{reference['invite_hash']}"
+        chat = await client.get_chat(invite_link)
+        if type(chat).__name__ == "ChatPreview":
+            raise PermissionError(
+                "Сессия не состоит в приватном чате. Включите авто-вступление "
+                "и укажите действующую invite-ссылку."
+            )
+        return chat
+    if reference.get("chat_ref") is None:
+        raise ValueError("Для источника истории укажите ID или ссылку на чат")
+    chat = await client.get_chat(reference["chat_ref"])
+    if type(chat).__name__ == "ChatPreview":
         raise PermissionError(
-            "Invite-ссылки не используются для вступления. Добавьте аккаунт вручную "
-            "и укажите публичную ссылку или ID чата."
+            "Сессия не состоит в чате. Включите авто-вступление и укажите публичную ссылку или invite-ссылку."
         )
-    return await client.get_chat(reference["chat_ref"])
+    return chat
+
+
+def _join_target(reference: dict[str, Any]) -> str | None:
+    if reference.get("invite_hash"):
+        return f"https://t.me/+{reference['invite_hash']}"
+    if reference.get("source") == "username" and reference.get("chat_ref") is not None:
+        return str(reference["chat_ref"])
+    # A numeric ID or t.me/c message link identifies a private peer but does not
+    # authorize joining it. Telegram requires a public username or an invite link.
+    return None
 
 
 async def _verify_membership(client: Any, chat_id: int, account_name: str) -> str:
@@ -129,12 +150,13 @@ async def _verify_membership(client: Any, chat_id: int, account_name: str) -> st
             "проверьте его членство вручную."
         ) from exc
     status = _enum_name(getattr(member, "status", None))
+    # Regular membership is enough; this deliberately does not require admin rights.
     is_member = status in {"owner", "administrator", "member"} or (
         status == "restricted" and bool(getattr(member, "is_member", False))
     )
     if not is_member:
         raise PermissionError(
-            f"Аккаунт {account_name} не состоит в чате. Автоматическое вступление не выполнялось."
+            f"Аккаунт {account_name} не состоит в чате. Проверьте авто-вступление, разрешение и статус участника."
         )
     return status
 
@@ -242,6 +264,7 @@ async def _serialize_message(
     sender = getattr(message, "from_user", None)
     sender_chat = getattr(message, "sender_chat", None)
     sender_id = getattr(sender, "id", None) or getattr(sender_chat, "id", None)
+    participant_id: int | None = None
     if sender_id is None:
         author = "участник"
     else:
@@ -249,6 +272,9 @@ async def _serialize_message(
         if sender_key not in authors:
             authors[sender_key] = f"участник {len(authors) + 1}"
         author = authors[sender_key]
+        participant_match = re.fullmatch(r"участник (\d+)", author)
+        if participant_match:
+            participant_id = int(participant_match.group(1))
 
     text = str(getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()[:2000]
     media = _media_details(message)
@@ -258,6 +284,7 @@ async def _serialize_message(
         "message_id": int(message.id),
         "date": getattr(message, "date", None).isoformat() if getattr(message, "date", None) else None,
         "author": author,
+        "participant_id": participant_id,
         "text": text,
         "kind": media["kind"] if media else "text",
         "media": media,
@@ -272,12 +299,11 @@ async def _serialize_message(
 
 
 async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
-    """Collect a bounded, anonymized transcript from a group that selected accounts already belong to."""
+    """Collect a bounded, anonymized transcript after checking or explicitly joining selected accounts."""
     reference = payload.get("reference")
     if not isinstance(reference, dict):
         reference = parse_chat_link(str(payload.get("chat_link") or ""))
-    if reference.get("invite_hash"):
-        raise ValueError("Автоматическое вступление по invite-ссылкам отключено")
+    auto_join = bool(payload.get("auto_join", False))
     reader_name = validate_session_name(str(payload.get("reader") or ""))
     account_names = list(dict.fromkeys(
         validate_session_name(str(name)) for name in payload.get("accounts", []) if str(name).strip()
@@ -309,6 +335,21 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         for name in account_names:
             clients[name] = await manager.get_client(name)
+        if auto_join:
+            join_target = _join_target(reference)
+            if not join_target:
+                raise ValueError(
+                    "Для авто-вступления нужен публичный username или invite-ссылка; "
+                    "одного числового ID/t.me/c недостаточно."
+                )
+            join_result = await mass_actions.mass_join(account_names, join_target)
+            failed_joins = join_result.get("fail", [])
+            if failed_joins:
+                failed_names = ", ".join(str(item.get("name", "?")) for item in failed_joins)
+                raise PermissionError(
+                    "Не удалось добавить в чат аккаунты: " + failed_names
+                    + ". Проверьте invite-ссылку, разрешение на вступление и лимиты Telegram."
+                )
         chat = await _resolve_chat(clients[reader_name], reference)
         chat_id = int(chat.id)
         chat_type = _enum_name(getattr(chat, "type", None))
@@ -352,16 +393,27 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
 
         title = str(getattr(chat, "title", "") or getattr(chat, "first_name", "") or chat_id)[:200]
         username = str(getattr(chat, "username", "") or "")[:64]
+        participant_ids = sorted({
+            int(item["participant_id"])
+            for item in messages
+            if item.get("participant_id") is not None
+        })
+        account_participant_ids = {
+            name: participant_ids[index]
+            for index, name in enumerate(account_names)
+            if index < len(participant_ids)
+        }
         account_scopes = {
             name: {
                 "role_source": "configured_account_persona",
                 "session_scope": f"chat:{chat_id}:account:{name}",
                 "membership": membership[name],
+                "history_participant_id": account_participant_ids.get(name),
             }
             for name in account_names
         }
         context = {
-            "schema_version": 1,
+            "schema_version": 2,
             "chat_id": chat_id,
             "title": title,
             "username": username,
@@ -369,6 +421,8 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
             "topic_id": topic_id,
             "reader_account": reader_name,
             "account_scopes": account_scopes,
+            "participant_count": len(participant_ids),
+            "account_participant_ids": account_participant_ids,
             "collected_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "history_limit": history_limit,
             "media_download_enabled": download_media,
@@ -392,6 +446,8 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
             "media_counts": media_counts,
             "downloaded_media_count": download_count,
             "accounts": account_names,
+            "participant_count": len(participant_ids),
+            "account_participant_ids": account_participant_ids,
             "context_file": context_path.relative_to(db.ROOT).as_posix(),
         }
     finally:
@@ -410,6 +466,9 @@ def list_context_summaries() -> list[dict[str, Any]]:
         try:
             data = json.loads(context_file.read_text(encoding="utf-8"))
             chat_id = int(data.get("chat_id"))
+            account_participant_ids = data.get("account_participant_ids")
+            if not isinstance(account_participant_ids, dict):
+                account_participant_ids = {}
             summaries.append({
                 "chat_id": chat_id,
                 "title": str(data.get("title") or chat_id),
@@ -417,6 +476,8 @@ def list_context_summaries() -> list[dict[str, Any]]:
                 "topic_id": data.get("topic_id"),
                 "collected_at": data.get("collected_at"),
                 "message_count": len(data.get("messages", [])),
+                "participant_count": int(data.get("participant_count") or 0),
+                "account_participant_ids": account_participant_ids,
                 "media_counts": data.get("media_counts", {}),
                 "downloaded_media_count": int(data.get("downloaded_media_count") or 0),
                 "accounts": list((data.get("account_scopes") or {}).keys()),
