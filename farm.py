@@ -36,7 +36,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from web.config import normalize_media_bias, parse_roulette_numbers
+from web.config import (
+    DICE_EMOJI,
+    POPULAR_EMOJI,
+    normalize_media_bias,
+    parse_roulette_numbers,
+)
 
 import aiofiles
 from dotenv import load_dotenv
@@ -607,6 +612,25 @@ def night_mode_active(settings: Any, now: datetime | None = None) -> bool:
     if start < end:
         return start <= current < end
     return current >= start or current < end
+
+
+def configured_emoji_set(settings: Any) -> tuple[str, ...]:
+    """Popular emoji by default; the panel can override them with its own list."""
+    raw = ""
+    if isinstance(settings, dict):
+        raw = str(settings.get("emoji_set") or "")
+    items = [item for item in re.split(r"[\s,;]+", raw) if item]
+    cleaned = list(dict.fromkeys(items))[:40]
+    return tuple(cleaned) if cleaned else POPULAR_EMOJI
+
+
+def configured_dice_emoji(settings: Any) -> str:
+    """The dice animation chosen in the panel, validated against Telegram's set."""
+    if isinstance(settings, dict):
+        value = str(settings.get("dice_emoji") or "").strip()
+        if value in DICE_EMOJI:
+            return value
+    return DICE_EMOJI[0]
 
 
 def night_mode_label(settings: Any) -> str:
@@ -1716,66 +1740,123 @@ IDLE_LINES = (
 )
 
 
-class MusicReposter:
-    """Repost tracks from a public music source without repeating the same one."""
+def _is_music_message(message: Any) -> bool:
+    if getattr(message, "audio", None) or getattr(message, "voice", None):
+        return True
+    document = getattr(message, "document", None)
+    if document is not None and "audio" in str(getattr(document, "mime_type", "") or ""):
+        return True
+    return False
 
-    def __init__(self, source: str) -> None:
+
+def _is_video_message(message: Any) -> bool:
+    if getattr(message, "video", None) or getattr(message, "animation", None):
+        return True
+    document = getattr(message, "document", None)
+    if document is not None:
+        mime = str(getattr(document, "mime_type", "") or "")
+        if mime.startswith("video/"):
+            return True
+        name = str(getattr(document, "file_name", "") or "").lower()
+        if name.endswith((".mp4", ".mov", ".mkv", ".webm")):
+            return True
+    return False
+
+
+MEDIA_SOURCE_MATCHERS = {"music": _is_music_message, "video": _is_video_message}
+MEDIA_SOURCE_LABELS = {"music": "Музыка", "video": "Видео"}
+
+
+class MediaReposter:
+    """Repost music or videos from a source chat, without repeating the same post."""
+
+    def __init__(self, source: str, kind: str = "music") -> None:
         self.source = source
-        self.track_ids: list[int] = []
+        self.kind = kind if kind in MEDIA_SOURCE_MATCHERS else "music"
+        self.message_ids: list[int] = []
         self.cursor = 0
         self.failed = False
+
+    async def _collect(self, client: Any) -> list[int]:
+        matches = MEDIA_SOURCE_MATCHERS[self.kind]
+        found: list[int] = []
+        async for message in client.get_chat_history(self.source, limit=60):
+            if matches(message):
+                found.append(int(message.id))
+            if len(found) >= 25:
+                break
+        return found
+
+    async def _join_source(self, client: Any) -> bool:
+        """Subscribe the account to the configured public source, then retry.
+
+        Auto-joining only ever targets the channel the owner typed into the
+        settings — never a chat discovered on the fly.
+        """
+        try:
+            await client.join_chat(self.source)
+            log.info("%s: аккаунт подписался на %s", MEDIA_SOURCE_LABELS[self.kind], self.source)
+            return True
+        except Exception:
+            log.warning(
+                "%s: не удалось подписаться на %s", MEDIA_SOURCE_LABELS[self.kind], self.source, exc_info=True
+            )
+            return False
 
     async def refresh(self, clients: list[Any]) -> None:
         if self.failed or not self.source:
             return
+        label = MEDIA_SOURCE_LABELS[self.kind]
         for client in clients:
-            try:
-                found: list[int] = []
-                async for message in client.get_chat_history(self.source, limit=60):
-                    if getattr(message, "audio", None) or getattr(message, "voice", None):
-                        found.append(int(message.id))
-                    elif getattr(message, "document", None) and "audio" in str(
-                        getattr(message.document, "mime_type", "") or ""
-                    ):
-                        found.append(int(message.id))
-                    if len(found) >= 25:
-                        break
+            for attempt in (0, 1):
+                try:
+                    found = await self._collect(client)
+                except Exception:
+                    if attempt == 0 and await self._join_source(client):
+                        continue  # joined the source channel; read it once more
+                    log.warning("%s: источник %s не прочитан этим аккаунтом", label, self.source, exc_info=True)
+                    break
                 if found:
                     random.shuffle(found)
-                    self.track_ids = found
+                    self.message_ids = found
                     self.cursor = 0
-                    log.info("Музыка: доступно треков для репоста=%d из %s", len(found), self.source)
+                    log.info("%s: доступно для репоста=%d из %s", label, len(found), self.source)
                     return
-            except Exception:
-                log.warning("Музыка: источник %s не прочитан этим аккаунтом", self.source, exc_info=True)
+                break
         self.failed = True
-        log.warning("Музыка: источник %s недоступен, репосты отключены", self.source)
+        log.warning("%s: источник %s недоступен, репосты отключены", label, self.source)
 
-    def next_track(self) -> int | None:
-        if not self.track_ids:
+    def tracks_left(self) -> int:
+        return len(self.message_ids)
+
+    def next_id(self) -> int | None:
+        if not self.message_ids:
             return None
-        if self.cursor >= len(self.track_ids):
-            random.shuffle(self.track_ids)
+        if self.cursor >= len(self.message_ids):
+            random.shuffle(self.message_ids)
             self.cursor = 0
-        track_id = self.track_ids[self.cursor]
+        message_id = self.message_ids[self.cursor]
         self.cursor += 1
-        return track_id
+        return message_id
 
     async def send(self, account: Any, reply_to: Any = None) -> bool:
-        track_id = self.next_track()
-        if track_id is None:
+        message_id = self.next_id()
+        if message_id is None:
             return False
+        kind = "audio" if self.kind == "music" else "video"
         try:
             message = await account.client.copy_message(
                 from_chat_id=self.source,
-                message_id=track_id,
+                message_id=message_id,
                 **account._send_kwargs(reply_to),
             )
-            await account._record(message, "", "audio")
-            log.info("[%s] музыка: репост трека %s из %s", account.name, track_id, self.source)
+            await account._record(message, "", kind)
+            log.info(
+                "[%s] %s: репост %s из %s", account.name, MEDIA_SOURCE_LABELS[self.kind], message_id, self.source
+            )
             return True
         except Exception:
-            log.exception("[%s] музыка: не удалось отправить трек %s", account.name, track_id)
+            log.exception("[%s] %s: не удалось отправить %s", account.name, MEDIA_SOURCE_LABELS[self.kind], message_id)
             return False
 
 
@@ -2245,6 +2326,11 @@ class FarmAccount:
             log.warning("[%s] blocked canned reply at send boundary", self.name)
             text = await local_fallback()
 
+        emoji_only = self._maybe_emoji_only()
+        if emoji_only:
+            log.info("[%s] отвечаю одним эмодзи вместо фразы", self.name)
+            return await self._send_text(emoji_only, reply_to=reply_to)
+
         if scenario_mode == "history_dialogue":
             media_item = self._pick_history_media(force=not bool(text))
             return await self._send_history_dialogue_content(
@@ -2279,8 +2365,10 @@ class FarmAccount:
         kind: str,
     ) -> bool:
         """Send one readable dialogue turn and optionally attach/append configured media."""
-        if kind == "music":
-            return await self._send_turn_with_music(text, reply_to=reply_to)
+        if kind in {"music", "video"}:
+            return await self._send_turn_with_media(text, reply_to=reply_to, kind=kind)
+        if kind == "dice":
+            return await self._send_dice(reply_to=reply_to)
         if kind == "text":
             return await self._send_text(text, reply_to=reply_to)
         if kind == "gif":
@@ -2442,7 +2530,9 @@ class FarmAccount:
                 return False
             # A media-only turn still uses this account's gifs, stickers, photos, voice or music.
             kind = self._plan_turn_media()
-            if kind == "music" and await self._send_music(reply_to=reply_to):
+            if kind == "dice":
+                return await self._send_dice(reply_to=reply_to)
+            if kind in {"music", "video"} and await self._send_repost(kind, reply_to=reply_to):
                 return True
             if kind == "text":
                 kind = random.choice(["gif", "sticker", "photo", "voice"])
@@ -2459,8 +2549,10 @@ class FarmAccount:
             await self._send_history_media(media_item, reply_to=text_message_id)
         elif allow_account_media:
             kind = self._plan_turn_media()
-            if kind == "music":
-                await self._send_music(reply_to=text_message_id)
+            if kind == "dice":
+                await self._send_dice(reply_to=text_message_id)
+            elif kind in {"music", "video"}:
+                await self._send_repost(kind, reply_to=text_message_id)
             elif kind != "text":
                 await self._send_farm_media(kind, reply_to=text_message_id, caption=text)
         # Keep the text turn as the chain anchor rather than a captionless attachment.
@@ -2481,7 +2573,7 @@ class FarmAccount:
         return value / 100.0 if math.isfinite(value) else default / 100.0
 
     def _plan_turn_media(self) -> str:
-        """Pick this turn's media: a music repost, a boosted gif, or the weighted kind."""
+        """Pick this turn's content: a repost, a dice roll, a boosted gif or the weighted kind."""
         farm_cfg = FARM_CFG.get("farm", {})
         if (
             farm_cfg.get("music_enabled")
@@ -2489,15 +2581,64 @@ class FarmAccount:
             and random.random() < self._turn_media_share("music_share_percent")
         ):
             return "music"
+        if (
+            farm_cfg.get("video_enabled")
+            and getattr(self, "video", None) is not None
+            and random.random() < self._turn_media_share("video_share_percent")
+        ):
+            return "video"
+        if farm_cfg.get("dice_enabled") and random.random() < self._turn_media_share("dice_share_percent"):
+            return "dice"
         if random.random() < self._turn_media_share("gif_share_percent"):
             return "gif"
         return self._pick_kind()
 
-    async def _send_music(self, reply_to: TGMessage | int | None = None) -> bool:
-        reposter = getattr(self, "music", None)
+    async def _send_repost(self, kind: str, reply_to: TGMessage | int | None = None) -> bool:
+        """Send a music track or a video copied from the configured source chat."""
+        reposter = getattr(self, "music" if kind == "music" else "video", None)
         if reposter is None:
             return False
         return await reposter.send(self, reply_to)
+
+    async def _send_music(self, reply_to: TGMessage | int | None = None) -> bool:
+        return await self._send_repost("music", reply_to)
+
+    async def _send_video(self, reply_to: TGMessage | int | None = None) -> bool:
+        return await self._send_repost("video", reply_to)
+
+    async def _send_dice(self, reply_to: TGMessage | int | None = None) -> bool:
+        """Roll a Telegram dice animation instead of writing a line."""
+        emoji = configured_dice_emoji(FARM_CFG.get("farm", {}))
+        try:
+            msg = await self.client.send_dice(**self._send_kwargs(reply_to), emoji=emoji)
+            await self._record(msg, emoji, "dice")
+            log.info("[%s] кубик %s отправлен", self.name, emoji)
+            return True
+        except Exception:
+            log.exception("[%s] dice failed", self.name)
+            return False
+
+    async def _send_turn_with_media(
+        self,
+        text: str,
+        *,
+        reply_to: TGMessage | int | None,
+        kind: str,
+    ) -> bool:
+        """Post the turn text and, separately, a reposted track or video."""
+        text = str(text or "").strip()
+        if not text:
+            return await self._send_repost(kind, reply_to=reply_to)
+        sent = await self._send_text(text, reply_to=reply_to)
+        if not sent:
+            return False
+        async with self.state.lock:
+            text_message_id = self.state.last_outgoing_message_id
+        if text_message_id:
+            await self._send_repost(kind, reply_to=text_message_id)
+            async with self.state.lock:
+                self.state.last_outgoing_message_id = text_message_id
+        return True
 
     async def _send_turn_with_music(
         self,
@@ -2506,19 +2647,17 @@ class FarmAccount:
         reply_to: TGMessage | int | None,
     ) -> bool:
         """Post the turn text and, separately, a reposted track."""
-        text = str(text or "").strip()
-        if not text:
-            return await self._send_music(reply_to=reply_to)
-        sent = await self._send_text(text, reply_to=reply_to)
-        if not sent:
-            return False
-        async with self.state.lock:
-            text_message_id = self.state.last_outgoing_message_id
-        if text_message_id:
-            await self._send_music(reply_to=text_message_id)
-            async with self.state.lock:
-                self.state.last_outgoing_message_id = text_message_id
-        return True
+        return await self._send_turn_with_media(text, reply_to=reply_to, kind="music")
+
+    def _maybe_emoji_only(self) -> str:
+        """Sometimes answer with a single popular emoji instead of a sentence."""
+        farm_cfg = FARM_CFG.get("farm", {})
+        if not farm_cfg.get("emoji_only_enabled"):
+            return ""
+        share = self._turn_media_share("emoji_only_percent")
+        if share <= 0 or random.random() >= share:
+            return ""
+        return random.choice(configured_emoji_set(farm_cfg))
 
     def _send_kwargs(self, reply_to: TGMessage | int | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"chat_id": int(FARM_CFG["target_chat_id"])}
@@ -2592,12 +2731,11 @@ class FarmAccount:
 
         downloaded: Path | None = None
         try:
-            from web.giphy import download_gif, search_gif
+            from web.giphy import download_gif, random_gif
 
             query = self._gif_query(search_text)
-            urls = await search_gif(query, limit=25)
-            fresh = [url for url in urls if not self.state.media_seen(url)]
-            url = random.choice(fresh or urls) if urls else None
+            # Ask the provider for a random gif and skip the ones the farm just used.
+            url = await random_gif(query, avoid=list(self.state.recent_media))
             if not url:
                 log.warning("[%s] GIF not sent: configure a GIPHY/Tenor key or add donor GIFs", self.name)
                 return False
@@ -2638,11 +2776,17 @@ class FarmAccount:
                 paths.append(value)
         return paths
 
-    @staticmethod
-    def _gif_query(text: str) -> str:
+    @classmethod
+    def _gif_query(cls, text: str) -> str:
+        """Build a search phrase, sampling words so two accounts rarely match."""
         words = [word.strip(".,!?;:()[]{}\"'«»") for word in (text or "").split()]
-        query = " ".join(word for word in words[:5] if len(word) > 2)
-        return query[:80] or "funny reaction"
+        words = [word for word in words if len(word) > 2]
+        if not words:
+            return random.choice(("funny reaction", "lol", "reaction", "mood"))
+        sample_size = min(len(words), random.randint(2, 4))
+        chosen = random.sample(words[:8], sample_size)
+        random.shuffle(chosen)
+        return " ".join(chosen)[:80]
 
     async def _send_photo(self, reply_to: TGMessage | int | None = None, caption: str = "") -> bool:
         send_kwargs = self._send_kwargs(reply_to)
@@ -3155,13 +3299,19 @@ async def run_farm() -> None:
             farm_settings["idle_cooldown_sec"],
             farm_settings["idle_gif_percent"],
         )
-    if farm_settings.get("music_enabled"):
+    if farm_settings.get("music_enabled") or farm_settings.get("video_enabled"):
         log.info(
-            "Музыка: репост из %s, доля музыки %s%%, доля гифок %s%%",
-            farm_settings["music_source"],
+            "Репосты: музыка %s%% (%s), видео %s%% (%s), доля гифок %s%%",
             farm_settings["music_share_percent"],
+            farm_settings.get("music_source") or "не задан",
+            farm_settings["video_share_percent"],
+            farm_settings.get("video_source") or "не задан",
             farm_settings["gif_share_percent"],
         )
+    if farm_settings.get("dice_enabled"):
+        log.info("Кубик: доля ходов %s%% (%s)", farm_settings["dice_share_percent"], farm_settings["dice_emoji"])
+    if farm_settings.get("emoji_only_enabled"):
+        log.info("Ответ одним эмодзи: доля ответов %s%%", farm_settings["emoji_only_percent"])
     if scenario_mode == "reactive":
         log.info(
             "Режим без сценария: ответы на сообщения; сценарная цепочка отключена, автономная активность=%s",
@@ -3390,13 +3540,29 @@ async def run_farm() -> None:
         for account in accounts:
             account.farm_accounts = accounts
             account.music = None
+            account.video = None
 
-        if farm_settings.get("music_enabled"):
-            music = MusicReposter(str(farm_settings.get("music_source") or "@sad_tracky"))
-            await music.refresh([account.client for account in accounts if account.client is not None])
-            if music.track_ids:
+        clients = [account.client for account in accounts if account.client is not None]
+        reposters = (
+            ("music", "music_enabled", "music_source", "music_share_percent"),
+            ("video", "video_enabled", "video_source", "video_share_percent"),
+        )
+        for kind, enabled_key, source_key, share_key in reposters:
+            source = str(farm_settings.get(source_key) or "").strip()
+            if not farm_settings.get(enabled_key) or not source:
+                continue
+            reposter = MediaReposter(source, kind)
+            await reposter.refresh(clients)
+            if reposter.tracks_left():
                 for account in accounts:
-                    account.music = music
+                    setattr(account, kind, reposter)
+                log.info(
+                    "%s: репост из %s, доля %s%%, доступо %d постов",
+                    MEDIA_SOURCE_LABELS[kind],
+                    source,
+                    farm_settings.get(share_key),
+                    reposter.tracks_left(),
+                )
 
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
         if scenario_mode == "reactive":

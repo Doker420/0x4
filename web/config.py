@@ -14,6 +14,37 @@ DEFAULT_MEDIA_BIAS = {
     "voice": 0.08,
 }
 
+# Emoji Telegram accepts for animated dice, and a popular set for emoji-only replies.
+DICE_EMOJI = ("\U0001f3b2", "\U0001f3af", "\U0001f3b3", "\U0001f3c0", "\u26bd", "\U0001f3b0")
+POPULAR_EMOJI = (
+    "\U0001f602", "\u2764\ufe0f", "\U0001f525", "\U0001f44d", "\U0001f60d", "\U0001f389",
+    "\U0001f64c", "\U0001f609", "\U0001f914", "\U0001f440", "\U0001f4af", "\u2728",
+    "\U0001f604", "\U0001f64f", "\U0001f60e", "\U0001f923", "\U0001f605", "\U0001f60a",
+    "\U0001f970", "\U0001f618",
+)
+
+
+DICE_EMOJI_NAMES = {
+    "\U0001f3b2": "Кубик",
+    "\U0001f3af": "Дартс",
+    "\U0001f3b3": "Боулинг",
+    "\U0001f3c0": "Баскетбол",
+    "\u26bd": "Футбол",
+    "\U0001f3b0": "Слоты",
+}
+
+
+def normalize_dice_emoji(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text in DICE_EMOJI else DICE_EMOJI[0]
+
+
+def normalize_emoji_set(value: Any) -> str:
+    """Keep a clean, deduplicated emoji list; an empty value means the popular set."""
+    items = [item for item in re.split(r"[\s,;]+", str(value or "")) if item]
+    return " ".join(list(dict.fromkeys(items))[:40])
+
+
 DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "agent_prompt": "Отвечай естественно, по теме сообщения и коротко. Не выдавай себя за другого человека.",
     "min_delay_sec": 2.0,
@@ -50,6 +81,15 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "music_enabled": False,
     "music_source": "@sad_tracky",
     "music_share_percent": 10,
+    "video_enabled": False,
+    "video_source": "",
+    "video_share_percent": 10,
+    "dice_enabled": False,
+    "dice_share_percent": 5,
+    "dice_emoji": DICE_EMOJI[0],
+    "emoji_only_enabled": False,
+    "emoji_only_percent": 10,
+    "emoji_set": "",
 }
 
 
@@ -196,6 +236,17 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
         settings.get("music_source"), DEFAULT_FARM_SETTINGS["music_source"]
     )
     settings["music_share_percent"] = _percent(settings.get("music_share_percent"), 10)
+
+    settings["video_enabled"] = _as_bool(settings.get("video_enabled"))
+    video_reference = str(settings.get("video_source") or "").strip()
+    settings["video_source"] = chat_reference(video_reference) if video_reference else ""
+    settings["video_share_percent"] = _percent(settings.get("video_share_percent"), 10)
+    settings["dice_enabled"] = _as_bool(settings.get("dice_enabled"))
+    settings["dice_share_percent"] = _percent(settings.get("dice_share_percent"), 5)
+    settings["dice_emoji"] = normalize_dice_emoji(settings.get("dice_emoji"))
+    settings["emoji_only_enabled"] = _as_bool(settings.get("emoji_only_enabled"))
+    settings["emoji_only_percent"] = _percent(settings.get("emoji_only_percent"), 10)
+    settings["emoji_set"] = normalize_emoji_set(settings.get("emoji_set"))
     return settings
 
 

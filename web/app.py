@@ -18,6 +18,8 @@ from fastapi.templating import Jinja2Templates
 
 from . import auth, channels, chat_context, db, giphy, manager, mass_actions, tasks
 from .config import (
+    DICE_EMOJI,
+    DICE_EMOJI_NAMES,
     DEFAULT_FARM_SETTINGS,
     DEFAULT_MEDIA_BIAS,
     chat_reference,
@@ -1561,6 +1563,8 @@ async def settings_page(request: Request, web_auth: Optional[str] = Cookie(defau
         "settings.html",
         {"settings": settings, "keys": keys,
          "server_utc_now": datetime.now(timezone.utc).strftime("%H:%M"),
+         "dice_emoji": DICE_EMOJI,
+         "dice_emoji_names": DICE_EMOJI_NAMES,
          "deepseek_available": ai.available, "deepseek_connected": ai.connected},
     )
 
@@ -1612,6 +1616,15 @@ async def api_settings_save(
     music_enabled: Optional[str] = Form(default=None),
     music_source: str = Form(default=DEFAULT_FARM_SETTINGS["music_source"]),
     music_share_percent: float = Form(default=DEFAULT_FARM_SETTINGS["music_share_percent"]),
+    video_enabled: Optional[str] = Form(default=None),
+    video_source: str = Form(default=""),
+    video_share_percent: float = Form(default=DEFAULT_FARM_SETTINGS["video_share_percent"]),
+    dice_enabled: Optional[str] = Form(default=None),
+    dice_share_percent: float = Form(default=DEFAULT_FARM_SETTINGS["dice_share_percent"]),
+    dice_emoji: str = Form(default=DEFAULT_FARM_SETTINGS["dice_emoji"]),
+    emoji_only_enabled: Optional[str] = Form(default=None),
+    emoji_only_percent: float = Form(default=DEFAULT_FARM_SETTINGS["emoji_only_percent"]),
+    emoji_set: str = Form(default=""),
     clear_giphy_key: Optional[str] = Form(default=None),
     clear_tenor_key: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
@@ -1630,6 +1643,15 @@ async def api_settings_save(
         raise HTTPException(
             422, "Источник музыки: укажите @username канала или его числовой ID, например @sad_tracky"
         )
+    video_ref = chat_reference(video_source.strip())
+    if video_enabled is not None and not video_ref:
+        raise HTTPException(
+            422, "Источник видео: укажите @username канала или числовой ID, например @prikoly"
+        )
+    if dice_emoji.strip() and dice_emoji.strip() not in DICE_EMOJI:
+        raise HTTPException(422, "Кубик: выберите один из предложенных эмодзи")
+    if len(emoji_set) > 400:
+        raise HTTPException(422, "Набор эмодзи: максимум 400 символов")
     model = deepseek_model.strip().lower()
     if model not in {"default", "expert"}:
         raise HTTPException(422, "Режим DeepSeek должен быть default или expert")
@@ -1661,6 +1683,15 @@ async def api_settings_save(
         "music_enabled": music_enabled is not None,
         "music_source": music_ref,
         "music_share_percent": _percent_field(music_share_percent, "Доля музыки в отправках"),
+        "video_enabled": video_enabled is not None,
+        "video_source": video_ref,
+        "video_share_percent": _percent_field(video_share_percent, "Доля видео в отправках"),
+        "dice_enabled": dice_enabled is not None,
+        "dice_share_percent": _percent_field(dice_share_percent, "Доля кубиков в отправках"),
+        "dice_emoji": dice_emoji.strip() or DEFAULT_FARM_SETTINGS["dice_emoji"],
+        "emoji_only_enabled": emoji_only_enabled is not None,
+        "emoji_only_percent": _percent_field(emoji_only_percent, "Доля ответов одним эмодзи"),
+        "emoji_set": emoji_set,
     })
     await db.set_setting("farm_settings", json.dumps(saved, ensure_ascii=False))
     if clear_giphy_key is not None:

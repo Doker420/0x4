@@ -75,6 +75,10 @@ class FakeMediaClient:
         self.sent.append(kwargs)
         return self._message(kwargs, len(self.sent))
 
+    async def send_dice(self, **kwargs):
+        self.sent.append({**kwargs, "dice": True})
+        return self._message(kwargs, len(self.sent))
+
     @staticmethod
     def _message(kwargs, sequence):
         return types.SimpleNamespace(
@@ -119,16 +123,46 @@ class FakeMusicAccount:
         self.recorded.append((int(msg.id), text, kind))
 
 
-class FakeMusicClient:
-    def __init__(self, track_ids):
-        self.track_ids = list(track_ids)
+class FakeMediaSourceClient:
+    """Source chat history: audio posts, video posts or neither.
+
+    ``locked`` models an account that cannot read the source until it joins.
+    """
+
+    def __init__(self, ids, kind="audio", locked=False):
+        self.ids = list(ids)
+        self.kind = kind
+        self.locked = locked
+        self.joined = []
 
     def get_chat_history(self, source, limit=50):
-        async def generator():
-            for identifier in self.track_ids[:limit]:
-                yield types.SimpleNamespace(id=identifier, audio=object(), voice=None, document=None)
+        ids = [] if self.locked else self.ids[:limit]
+        kind = self.kind
 
-        return generator()
+        async def generator():
+            if self.locked:
+                raise RuntimeError("CHAT_FORBIDDEN")
+            for identifier in ids:
+                yield types.SimpleNamespace(
+                    id=identifier,
+                    audio=object() if kind == "audio" else None,
+                    voice=None,
+                    video=object() if kind == "video" else None,
+                    animation=None,
+                    document=None,
+                )
+
+        # Errors must surface on iteration, exactly like Pyrogram does.
+        async def guarded():
+            async for item in generator():
+                yield item
+
+        return guarded()
+
+    async def join_chat(self, source):
+        self.joined.append(source)
+        self.locked = False
+        return types.SimpleNamespace(id=-100, title=source)
 
 
 class FakeFollowUpAccount:
@@ -600,13 +634,13 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account._plan_turn_media(), "music")
 
     async def test_music_reposter_cycles_tracks_without_repeats(self):
-        reposter = farm.MusicReposter("@sad_tracky")
-        await reposter.refresh([FakeMusicClient([11, 12, 13])])
-        self.assertEqual(sorted(reposter.track_ids), [11, 12, 13])
+        reposter = farm.MediaReposter("@sad_tracky", "music")
+        await reposter.refresh([FakeMediaSourceClient([11, 12, 13], kind="audio")])
+        self.assertEqual(sorted(reposter.message_ids), [11, 12, 13])
 
-        first_pass = [reposter.next_track() for _ in range(3)]
+        first_pass = [reposter.next_id() for _ in range(3)]
         self.assertEqual(sorted(first_pass), [11, 12, 13])
-        second_pass = [reposter.next_track() for _ in range(3)]
+        second_pass = [reposter.next_id() for _ in range(3)]
         self.assertEqual(sorted(second_pass), [11, 12, 13])
 
         account = FakeMusicAccount()
@@ -617,12 +651,45 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reply_to_message_id"], None)
         self.assertEqual(account.recorded, [(555, "", "audio")])
 
-    async def test_music_reposter_without_source_does_not_break_the_turn(self):
-        reposter = farm.MusicReposter("@sad_tracky")
-        await reposter.refresh([FakeMusicClient([])])
-        self.assertEqual(reposter.next_track(), None)
-        self.assertFalse(await reposter.send(FakeMusicAccount()))
+    async def test_video_reposter_takes_videos_from_the_source_channel(self):
+        reposter = farm.MediaReposter("@funny_videos", "video")
+        await reposter.refresh([FakeMediaSourceClient([21, 22, 23], kind="video")])
+        self.assertEqual(sorted(reposter.message_ids), [21, 22, 23])
+        self.assertEqual(reposter.kind, "video")
 
+        account = FakeMusicAccount()
+        self.assertTrue(await reposter.send(account))
+        self.assertEqual(account.recorded, [(555, "", "video")])
+
+        # An audio-only source yields nothing for a video reposter.
+        empty = farm.MediaReposter("@funny_videos", "video")
+        await empty.refresh([FakeMediaSourceClient([31], kind="audio")])
+        self.assertFalse(await empty.send(FakeMusicAccount()))
+
+    async def test_reposter_subscribes_to_the_configured_source_then_reads_it(self):
+        reposter = farm.MediaReposter("@prikoly", "video")
+        client = FakeMediaSourceClient([41, 42], kind="video", locked=True)
+        await reposter.refresh([client])
+        self.assertEqual(client.joined, ["@prikoly"])
+        self.assertEqual(sorted(reposter.message_ids), [41, 42])
+
+        # A permanently private source still disables reposts instead of crashing.
+        class Unjoinable(FakeMediaSourceClient):
+            async def join_chat(self, source):
+                raise RuntimeError("USER_ALREADY_PARTICIPANT")
+
+        stubborn = Unjoinable([51], kind="video", locked=True)
+        broken = farm.MediaReposter("@private", "video")
+        await broken.refresh([stubborn])
+        self.assertTrue(broken.failed)
+        self.assertEqual(broken.message_ids, [])
+        self.assertFalse(await broken.send(FakeMusicAccount()))
+
+    async def test_music_reposter_without_source_does_not_break_the_turn(self):
+        reposter = farm.MediaReposter("@sad_tracky")
+        await reposter.refresh([FakeMediaSourceClient([])])
+        self.assertEqual(reposter.next_id(), None)
+        self.assertFalse(await reposter.send(FakeMusicAccount()))
 
     async def test_gif_sources_rotate_between_accounts(self):
         state = farm.FarmState()
@@ -650,6 +717,34 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await account._send_gif(reply_to=None))
         again = [account.client.sent[1]["animation"] for account in accounts]
         self.assertTrue(set(again) <= {"gif-one", "gif-two", "gif-three"})
+
+    async def test_provider_gifs_avoid_the_one_another_account_just_sent(self):
+        from web import giphy
+
+        state = farm.FarmState()
+        urls = ["https://cdn/gif-1.gif", "https://cdn/gif-2.gif"]
+        accounts = []
+        for index in range(2):
+            account = farm.FarmAccount.__new__(farm.FarmAccount)
+            account.name = f"gif{index}"
+            account.user_id = 2000 + index
+            account.state = state
+            account.client = FakeMediaClient()
+            account.donor = EmptyDonor()
+            account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+            account._typing = AsyncMock()
+            accounts.append(account)
+
+        with patch.object(giphy, "random_gif", new_callable=AsyncMock, return_value=urls[0]) as provider, \
+             patch.object(giphy, "download_gif", new_callable=AsyncMock, return_value=Path("/tmp/unit.gif")):
+            self.assertTrue(await accounts[0]._send_gif(reply_to=None, search_text="привет всем"))
+            provider.assert_awaited_once()
+            # The search phrase is sampled from the incoming text, so word order varies.
+            self.assertEqual(set(provider.await_args.args[0].split()), {"привет", "всем"})
+            # The second account must be told which gif is already taken.
+            provider.return_value = urls[1]
+            self.assertTrue(await accounts[1]._send_gif(reply_to=None, search_text="привет всем"))
+            self.assertEqual(provider.await_args.kwargs["avoid"], ["https://cdn/gif-1.gif"])
 
     async def test_question_answer_is_picked_up_by_other_accounts(self):
         farm.FARM_CFG["farm"].update({
@@ -719,6 +814,54 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(farm.random, "uniform", return_value=0), patch.object(farm.random, "random", return_value=0):
             await accounts[0]._answer_with_followups(message, "подскажите, как настроить?", accounts, is_question=True)
         self.assertEqual(sum(len(account.sent) for account in accounts), 1)
+
+    async def test_dice_turn_rolls_the_configured_animation(self):
+        farm.FARM_CFG["farm"].update({"dice_enabled": True, "dice_share_percent": 100, "dice_emoji": "\U0001f3b2"})
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "dice"
+        account.user_id = 4242
+        account.state = farm.FarmState()
+        account.client = FakeMediaClient()
+        account._typing = AsyncMock()
+
+        self.assertEqual(account._plan_turn_media(), "dice")
+        self.assertTrue(await account._send_dice(reply_to=None))
+        self.assertEqual(account.client.sent[0]["emoji"], "\U0001f3b2")
+        self.assertTrue(account.client.sent[0]["dice"], "ход должен уйти анимацией кубика, а не текстом")
+
+    def test_dice_is_not_planned_when_disabled(self):
+        farm.FARM_CFG["farm"].update({"dice_enabled": False, "dice_share_percent": 100, "gif_share_percent": 0})
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "nodice"
+        account.state = farm.FarmState()
+        account.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        self.assertEqual(account._plan_turn_media(), "text")
+
+    async def test_emoji_only_answer_uses_a_popular_emoji(self):
+        farm.FARM_CFG["farm"].update({"emoji_only_enabled": True, "emoji_only_percent": 100})
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "emoji"
+        account.user_id = 4343
+        account.state = farm.FarmState()
+        account.client = FakeMediaClient()
+        account._typing = AsyncMock()
+        account.persona = "дружелюбный собеседник"
+        account.bridge = None
+        account.donor = None
+
+        with patch.object(farm, "generate_reply", new_callable=AsyncMock, return_value="какой-то длинный текст ответа"):
+            sent = await farm.FarmAccount._send_reply(account, reply_to=None, incoming_text="как дела?")
+
+        self.assertTrue(sent)
+        text = account.client.sent[0]["text"]
+        self.assertIn(text, farm.POPULAR_EMOJI)
+
+    def test_emoji_set_from_settings_overrides_the_popular_default(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "custom"
+        account.state = farm.FarmState()
+        farm.FARM_CFG["farm"].update({"emoji_only_enabled": True, "emoji_only_percent": 100, "emoji_set": "\U0001f602 \U0001f525"})
+        self.assertIn(account._maybe_emoji_only(), {"\U0001f602", "\U0001f525"})
 
     def test_night_mode_window_covers_wrap_around_and_same_day_ranges(self):
         from datetime import datetime, timezone

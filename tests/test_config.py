@@ -127,6 +127,40 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(off["followups_enabled"])
         self.assertEqual(off["followups_max"], 0)
 
+    def test_video_dice_and_emoji_settings_are_validated(self):
+        defaults = load_farm_settings({})
+        self.assertFalse(defaults["video_enabled"])
+        self.assertEqual(defaults["video_source"], "")
+        self.assertFalse(defaults["dice_enabled"])
+        self.assertEqual(defaults["dice_emoji"], "\U0001f3b2")
+        self.assertFalse(defaults["emoji_only_enabled"])
+        self.assertEqual(defaults["emoji_set"], "")
+
+        settings = load_farm_settings({
+            "video_enabled": "on",
+            "video_source": "https://t.me/prikoly",
+            "video_share_percent": "150",
+            "dice_enabled": "on",
+            "dice_share_percent": "-5",
+            "dice_emoji": "\U0001f3af",
+            "emoji_only_enabled": "1",
+            "emoji_only_percent": "30",
+            "emoji_set": "\U0001f602 \U0001f602 \U0001f525",
+        })
+        self.assertTrue(settings["video_enabled"])
+        self.assertEqual(settings["video_source"], "@prikoly")
+        self.assertEqual(settings["video_share_percent"], 100)
+        self.assertTrue(settings["dice_enabled"])
+        self.assertEqual(settings["dice_share_percent"], 0)
+        self.assertEqual(settings["dice_emoji"], "\U0001f3af")
+        self.assertTrue(settings["emoji_only_enabled"])
+        self.assertEqual(settings["emoji_only_percent"], 30)
+        self.assertEqual(settings["emoji_set"], "\U0001f602 \U0001f525")
+
+        broken = load_farm_settings({"dice_emoji": "not-an-emoji", "video_share_percent": "abc"})
+        self.assertEqual(broken["dice_emoji"], "\U0001f3b2")
+        self.assertEqual(broken["video_share_percent"], 10)
+
     def test_farm_settings_are_clamped(self):
         settings = load_farm_settings({
             "min_delay_sec": -10,

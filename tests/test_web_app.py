@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -820,6 +821,67 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('name="music_source"', page.text)
         self.assertIn('name="gif_share_percent"', page.text)
         self.assertIn("@sad_tracky", page.text)
+
+    async def test_video_dice_and_emoji_settings_are_saved_and_validated(self):
+        base = {
+            "min_delay_sec": "1",
+            "max_delay_sec": "3",
+            "night_mode_start": "23:00",
+            "night_mode_end": "07:00",
+        }
+        ok = await self.client.post("/api/settings/save", data={
+            **base,
+            "video_enabled": "on",
+            "video_source": "https://t.me/prikoly",
+            "video_share_percent": "20",
+            "dice_enabled": "on",
+            "dice_share_percent": "7",
+            "dice_emoji": "\U0001f3af",
+            "emoji_only_enabled": "on",
+            "emoji_only_percent": "25",
+            "emoji_set": "\U0001f602 \U0001f525",
+        })
+        self.assertEqual(ok.status_code, 200, ok.text)
+        farm_settings = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertTrue(farm_settings["video_enabled"])
+        self.assertEqual(farm_settings["video_source"], "@prikoly")
+        self.assertEqual(farm_settings["video_share_percent"], 20)
+        self.assertTrue(farm_settings["dice_enabled"])
+        self.assertEqual(farm_settings["dice_share_percent"], 7)
+        self.assertEqual(farm_settings["dice_emoji"], "\U0001f3af")
+        self.assertTrue(farm_settings["emoji_only_enabled"])
+        self.assertEqual(farm_settings["emoji_only_percent"], 25)
+        self.assertEqual(farm_settings["emoji_set"], "\U0001f602 \U0001f525")
+
+        missing_source = await self.client.post("/api/settings/save", data={
+            **base, "video_enabled": "on", "video_source": "",
+        })
+        self.assertEqual(missing_source.status_code, 422)
+        self.assertIn("Источник видео", missing_source.json()["detail"])
+
+        bad_dice = await self.client.post("/api/settings/save", data={
+            **base, "dice_emoji": "\U0001f4a9",
+        })
+        self.assertEqual(bad_dice.status_code, 422)
+        self.assertIn("Кубик", bad_dice.json()["detail"])
+
+        disabled = await self.client.post("/api/settings/save", data=base)
+        self.assertEqual(disabled.status_code, 200)
+        cleared = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertFalse(cleared["dice_enabled"])
+        self.assertFalse(cleared["emoji_only_enabled"])
+        self.assertFalse(cleared["video_enabled"])
+
+        page = await self.client.get("/settings")
+        self.assertIn('name="video_source"', page.text)
+        self.assertIn('name="dice_share_percent"', page.text)
+        self.assertIn("Дартс", page.text)
+        self.assertIn('name="emoji_set"', page.text)
+        self.assertIn("популярный набор", page.text)
+
+        # The dice picker offers exactly the animations Telegram accepts.
+        options = re.findall(r'<option value="([^"]+)"[^>]*>Кубик', page.text)
+        self.assertEqual(len(options), 1, "кубик — первый вариант списка")
 
     async def test_chatfarm_start_persists_autonomous_and_followup_switches(self):
         await db.upsert_account(

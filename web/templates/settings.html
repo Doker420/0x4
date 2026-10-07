@@ -70,6 +70,25 @@
         <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">Трек уходит репостом отдельным сообщением, текст хода при этом публикуется.</span></div>
       </div>
       <span class="help">Треки берутся из последних сообщений источника и не повторяются, пока не закончатся. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
+
+      <div class="check-row" style="margin-top:14px"><input id="video_enabled" name="video_enabled" type="checkbox" {% if settings.video_enabled %}checked{% endif %}><label for="video_enabled">Отправлять видео из канала с приколами</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="video_source">Источник видео</label><input id="video_source" name="video_source" type="text" value="{{ settings.video_source }}" placeholder="@prikoly"><span class="help">Ссылка на канал с видео (например @prikoly или https://t.me/prikoly) или его числовой ID. Аккаунт берёт последние видео и отправляет их как медиа.</span></div>
+        <div class="field"><label for="video_share_percent">Доля видео в отправках, %</label><input id="video_share_percent" name="video_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.video_share_percent }}"><span class="help">Ролики копируются в чат как медиа, каждый аккаунт берёт разные и без повторов, пока список не закончится.</span></div>
+      </div>
+
+      <div class="check-row" style="margin-top:14px"><input id="dice_enabled" name="dice_enabled" type="checkbox" {% if settings.dice_enabled %}checked{% endif %}><label for="dice_enabled">Разрешить аккаунтам кидать кубик</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="dice_share_percent">Доля кубиков в отправках, %</label><input id="dice_share_percent" name="dice_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.dice_share_percent }}"><span class="help">С этой вероятностью ход заменяется случайным броском Telegram — цифра выпадает сама, аккаунт её не выбирает.</span></div>
+        <div class="field"><label for="dice_emoji">Что кидать</label><select id="dice_emoji" name="dice_emoji">{% for emoji in dice_emoji %}<option value="{{ emoji }}" {% if settings.dice_emoji == emoji %}selected{% endif %}>{{ dice_emoji_names[emoji] }} {{ emoji }}</option>{% endfor %}</select><span class="help">Кубик 🎲, дартс, боулинг, баскетбол, футбол или слоты — анимацию считает Telegram.</span></div>
+      </div>
+
+      <div class="check-row" style="margin-top:14px"><input id="emoji_only_enabled" name="emoji_only_enabled" type="checkbox" {% if settings.emoji_only_enabled %}checked{% endif %}><label for="emoji_only_enabled">Отвечать одним эмодзи</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="emoji_only_percent">Доля таких ответов, %</label><input id="emoji_only_percent" name="emoji_only_percent" type="number" min="0" max="100" step="1" value="{{ settings.emoji_only_percent }}"><span class="help">Ответ на вопрос иногда уходит одним популярным эмодзи вместо фразы.</span></div>
+        <div class="field"><label for="emoji_set">Набор эмодзи</label><input id="emoji_set" name="emoji_set" type="text" value="{{ settings.emoji_set }}" placeholder="😂 ❤️ 🔥 👍 🤔"><span class="help">Пусто — популярный набор (😂 ❤️ 🔥 👍 😍 🎉 🙌 😉 🤔 👀 💯 ✨ 😄 🙏 😎 🤣 😅 😊 🥰 😘). Можно вписать свои через пробел.</span></div>
+      </div>
+      <span class="help">Гифки каждый раз запрашиваются случайные у провайдера (GIPHY/Tenor) и не повторяются между аккаунтами, пока есть свежие.</span>
     </section>
 
     <section class="card">

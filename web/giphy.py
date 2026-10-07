@@ -24,11 +24,20 @@ async def _get_keys() -> tuple[str, str]:
     return giphy_key, tenor_key
 
 
-async def search_gif(query: str, limit: int = 20) -> List[str]:
+# Neutral tags used when a turn has no text to search by, so every account that
+# posts "just a gif" gets a different kind of reaction instead of the same one.
+RANDOM_GIF_TAGS = (
+    "funny", "lol", "reaction", "excited", "okay", "thumbs up", "no way",
+    "surprised", "happy dance", "eye roll", "thinking", "celebrate",
+)
+
+
+async def search_gif(query: str, limit: int = 20, offset: int = 0) -> List[str]:
     query = (query or "").strip()[:120]
     if not query:
         return []
     limit = max(1, min(int(limit), 50))
+    offset = max(0, int(offset))
     giphy_key, tenor_key = await _get_keys()
     urls: List[str] = []
 
@@ -37,7 +46,10 @@ async def search_gif(query: str, limit: int = 20) -> List[str]:
             try:
                 response = await client.get(
                     "https://api.giphy.com/v1/gifs/search",
-                    params={"api_key": giphy_key, "q": query, "limit": limit, "rating": "pg-13"},
+                    params={
+                        "api_key": giphy_key, "q": query, "limit": limit,
+                        "offset": offset, "rating": "pg-13",
+                    },
                 )
                 response.raise_for_status()
                 for item in response.json().get("data", []):
@@ -56,7 +68,10 @@ async def search_gif(query: str, limit: int = 20) -> List[str]:
             try:
                 response = await client.get(
                     "https://tenor.googleapis.com/v2/search",
-                    params={"key": tenor_key, "q": query, "limit": limit, "media_filter": "gif"},
+                    params={
+                        "key": tenor_key, "q": query, "limit": limit,
+                        "pos": offset, "media_filter": "gif",
+                    },
                 )
                 response.raise_for_status()
                 for item in response.json().get("results", []):
@@ -71,9 +86,71 @@ async def search_gif(query: str, limit: int = 20) -> List[str]:
     return urls
 
 
-async def random_gif(query: str = "") -> Optional[str]:
-    urls = await search_gif(query or "funny", limit=25)
-    return random.choice(urls) if urls else None
+async def _giphy_random_url(client: httpx.AsyncClient, key: str, tag: str) -> Optional[str]:
+    """GIPHY has a dedicated random endpoint: a different gif on every call."""
+    try:
+        response = await client.get(
+            "https://api.giphy.com/v1/gifs/random",
+            params={"api_key": key, "tag": tag, "rating": "pg-13"},
+        )
+        response.raise_for_status()
+        images = ((response.json() or {}).get("data") or {}).get("images") or {}
+        url = (
+            images.get("downsized", {}).get("url")
+            or images.get("fixed_height", {}).get("url")
+            or images.get("original", {}).get("url")
+        )
+        return str(url) if url else None
+    except Exception as exc:
+        log.warning("GIPHY random failed (%s)", type(exc).__name__)
+        return None
+
+
+async def random_gif(query: str = "", avoid: Optional[List[str]] = None) -> Optional[str]:
+    """Return a random gif, trying hard not to repeat one that was just used.
+
+    Uses the provider's random endpoint plus a randomised search offset, so two
+    accounts reacting to the same line still get different gifs.
+    """
+    tag = (query or "").strip()[:120] or random.choice(RANDOM_GIF_TAGS)
+    skipped = {str(url) for url in (avoid or ()) if url}
+    giphy_key, tenor_key = await _get_keys()
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        candidates: List[str] = []
+        if giphy_key:
+            url = await _giphy_random_url(client, giphy_key, tag)
+            if url:
+                candidates.append(url)
+            if tag in RANDOM_GIF_TAGS:
+                # A neutral tag means "anything funny works": widen the pool.
+                url = await _giphy_random_url(client, giphy_key, random.choice(RANDOM_GIF_TAGS))
+                if url:
+                    candidates.append(url)
+        if tenor_key:
+            offset = random.randint(0, 60)
+            try:
+                response = await client.get(
+                    "https://tenor.googleapis.com/v2/search",
+                    params={
+                        "key": tenor_key, "q": tag, "limit": 10,
+                        "pos": offset, "media_filter": "gif",
+                    },
+                )
+                response.raise_for_status()
+                for item in response.json().get("results", []):
+                    formats = item.get("media_formats", {})
+                    media = formats.get("gif") or formats.get("mediumgif") or formats.get("tinygif")
+                    url = media.get("url") if isinstance(media, dict) else None
+                    if url:
+                        candidates.append(str(url))
+            except Exception as exc:
+                log.warning("Tenor random search failed (%s)", type(exc).__name__)
+        if not candidates:
+            candidates = await search_gif(tag, limit=25, offset=random.randint(0, 60))
+
+        fresh = [url for url in dict.fromkeys(candidates) if url not in skipped]
+        return random.choice(fresh or list(dict.fromkeys(candidates))) if (fresh or candidates) else None
 
 
 async def download_gif(url: str, directory: Path) -> Path:
