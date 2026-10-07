@@ -738,6 +738,41 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-giphy-key", settings.text)
         self.assertEqual(settings.json()["farm"]["agent_prompt"], "Reply briefly.")
 
+    async def test_night_mode_window_is_saved_and_rejected_when_malformed(self):
+        ok = await self.client.post("/api/settings/save", data={
+            "agent_prompt": "Reply briefly.",
+            "min_delay_sec": "1",
+            "max_delay_sec": "3",
+            "media_text": "100",
+            "media_gif": "0",
+            "media_sticker": "0",
+            "media_photo": "0",
+            "media_voice": "0",
+            "night_mode_enabled": "on",
+            "night_mode_start": "22:30",
+            "night_mode_end": "06:15",
+        })
+        self.assertEqual(ok.status_code, 200, ok.text)
+        saved = await self.client.get("/api/settings")
+        farm_settings = saved.json()["farm"]
+        self.assertTrue(farm_settings["night_mode_enabled"])
+        self.assertEqual(farm_settings["night_mode_start"], "22:30")
+        self.assertEqual(farm_settings["night_mode_end"], "06:15")
+
+        bad = await self.client.post("/api/settings/save", data={
+            "min_delay_sec": "1",
+            "max_delay_sec": "3",
+            "night_mode_start": "7:5",
+            "night_mode_end": "06:15",
+        })
+        self.assertEqual(bad.status_code, 422)
+        self.assertIn("ЧЧ:ММ", bad.json()["detail"])
+
+        page = await self.client.get("/settings")
+        self.assertIn("Ночной режим", page.text)
+        self.assertIn('name="night_mode_start"', page.text)
+        self.assertIn("Сервер UTC", page.text)
+
     async def test_protected_page_redirects_without_cookie(self):
         unauthenticated = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"

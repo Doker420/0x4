@@ -50,6 +50,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings["rest_min_sec"], settings["rest_max_sec"])
         self.assertFalse(settings["post_opening"])
 
+    def test_night_mode_window_is_validated_as_server_utc_clock(self):
+        defaults = load_farm_settings({})
+        self.assertFalse(defaults["night_mode_enabled"])
+        self.assertEqual(defaults["night_mode_start"], "23:00")
+        self.assertEqual(defaults["night_mode_end"], "07:00")
+
+        settings = load_farm_settings({
+            "night_mode_enabled": "on",
+            "night_mode_start": "1:05",
+            "night_mode_end": "7:30",
+        })
+        self.assertTrue(settings["night_mode_enabled"])
+        self.assertEqual(settings["night_mode_start"], "01:05")
+        self.assertEqual(settings["night_mode_end"], "07:30")
+
+        invalid = load_farm_settings({"night_mode_start": "25:00", "night_mode_end": "oops"})
+        self.assertEqual(invalid["night_mode_start"], "23:00")
+        self.assertEqual(invalid["night_mode_end"], "07:00")
+
     def test_farm_settings_are_clamped(self):
         settings = load_farm_settings({
             "min_delay_sec": -10,

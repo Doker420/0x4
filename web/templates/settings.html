@@ -39,6 +39,16 @@
     </section>
 
     <section class="card">
+      <div class="card-head"><div><h2>Ночной режим</h2><p class="subtle">Окно тишины по времени сервера. Часовой пояс не переводится — всё считается в UTC.</p></div><span class="pill badge-ok" id="server_utc_badge">Сервер UTC: {{ server_utc_now }}</span></div>
+      <div class="check-row"><input id="night_mode_enabled" name="night_mode_enabled" type="checkbox" {% if settings.night_mode_enabled %}checked{% endif %}><label for="night_mode_enabled">Включить ночной режим (пауза активности)</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="night_mode_start">Начало, UTC (ЧЧ:ММ)</label><input id="night_mode_start" name="night_mode_start" type="time" step="60" value="{{ settings.night_mode_start }}" required><span class="help">Например 23:00 — по времени сервера в UTC.</span></div>
+        <div class="field"><label for="night_mode_end">Конец, UTC (ЧЧ:ММ)</label><input id="night_mode_end" name="night_mode_end" type="time" step="60" value="{{ settings.night_mode_end }}" required><span class="help">Например 07:00 — по времени сервера в UTC. Окно через полночь поддерживается.</span></div>
+      </div>
+      <span class="help">В этом окне аккаунты не публикуют ходы сценария, не отвечают на сообщения, не ставят реакции и не выходят с автономными сообщениями; входящие сообщения по-прежнему сохраняются в контекст. Время берётся с сервера в UTC — сверьтесь с текущим значением справа от заголовка. Изменения применятся при следующем запуске чат-фермы.</span>
+    </section>
+
+    <section class="card">
       <div class="card-head"><div><h2>Баланс ответов</h2><p class="subtle">Относительные веса, не обязаны в сумме давать 100.</p></div></div>
       {% set bias = settings.default_media_bias %}
       <div class="field"><label for="media_text">Текст, %</label><input id="media_text" name="media_text" type="number" min="0" step="1" value="{{ (bias.text * 100)|round|int }}"></div>

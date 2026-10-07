@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,7 @@ from . import auth, chat_context, db, giphy, manager, mass_actions, tasks
 from .config import (
     DEFAULT_FARM_SETTINGS,
     DEFAULT_MEDIA_BIAS,
+    clock_to_minutes,
     load_farm_settings,
     normalize_media_bias,
     parse_roulette_numbers,
@@ -719,6 +721,7 @@ async def chatfarm_page(request: Request, web_auth: Optional[str] = Cookie(defau
             "topic_prefill": topic_prefill,
             "history_source_prefill": history_source_prefill,
             "history_topic_prefill": history_topic_prefill,
+            "server_utc_now": datetime.now(timezone.utc).strftime("%H:%M"),
         },
     )
 
@@ -990,8 +993,8 @@ async def api_chatfarm_start(
         "history_topic_id": effective_history_topic,
         "history_auto_join": auto_join_history_enabled,
         "scenario_turns": 20 if behavior_only else scenario_turns,
-        "joke_every": 0 if behavior_only or topicless_history_dialogue else joke_every,
-        "rest_every": 0 if behavior_only or topicless_history_dialogue else rest_every,
+        "joke_every": 0 if behavior_only else joke_every,
+        "rest_every": 0 if behavior_only else rest_every,
         "rest_min_sec": 60 if behavior_only else rest_min_sec,
         "rest_max_sec": 120 if behavior_only else rest_max_sec,
         "roulette_numbers": "0-36" if behavior_only else roulette_numbers.strip(),
@@ -1333,6 +1336,7 @@ async def settings_page(request: Request, web_auth: Optional[str] = Cookie(defau
         request,
         "settings.html",
         {"settings": settings, "keys": keys,
+         "server_utc_now": datetime.now(timezone.utc).strftime("%H:%M"),
          "deepseek_available": ai.available, "deepseek_connected": ai.connected},
     )
 
@@ -1371,6 +1375,9 @@ async def api_settings_save(
     media_voice: float = Form(default=8),
     giphy_key: str = Form(default=""),
     tenor_key: str = Form(default=""),
+    night_mode_enabled: Optional[str] = Form(default=None),
+    night_mode_start: str = Form(default="23:00"),
+    night_mode_end: str = Form(default="07:00"),
     clear_giphy_key: Optional[str] = Form(default=None),
     clear_tenor_key: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
@@ -1380,6 +1387,10 @@ async def api_settings_save(
         raise HTTPException(422, "Задайте корректный интервал задержки")
     if len(agent_prompt.strip()) > 5000:
         raise HTTPException(422, "Общие указания агента: максимум 5000 символов")
+    night_start = clock_to_minutes(night_mode_start)
+    night_end = clock_to_minutes(night_mode_end)
+    if night_start is None or night_end is None:
+        raise HTTPException(422, "Укажите время ночного режима в формате ЧЧ:ММ (время сервера, UTC)")
     model = deepseek_model.strip().lower()
     if model not in {"default", "expert"}:
         raise HTTPException(422, "Режим DeepSeek должен быть default или expert")
@@ -1398,6 +1409,9 @@ async def api_settings_save(
         "deepseek_thinking": deepseek_thinking is not None,
         "deepseek_search": deepseek_search is not None,
         "default_media_bias": media_bias,
+        "night_mode_enabled": night_mode_enabled is not None,
+        "night_mode_start": f"{night_start // 60:02d}:{night_start % 60:02d}",
+        "night_mode_end": f"{night_end // 60:02d}:{night_end % 60:02d}",
     })
     await db.set_setting("farm_settings", json.dumps(saved, ensure_ascii=False))
     if clear_giphy_key is not None:

@@ -31,7 +31,7 @@ import socket
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -545,6 +545,39 @@ TOPIC_PROMPT = """Придумай ОДНУ новую тему для обсу�
 REACTION_PROMPT = """Выбери ОДНУ реакцию-эмодзи для сообщения: "{text}"
 Ответь только одним эмодзи из: 👍 ❤️ 🔥 😁 🤔 👏 🎉 😢 🤯
 Эмодзи:"""
+
+
+def _clock_minutes(value: Any) -> int | None:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour * 60 + minute
+
+
+def night_mode_active(settings: Any, now: datetime | None = None) -> bool:
+    """Check the configured quiet window; all times are server UTC."""
+    if not isinstance(settings, dict) or not settings.get("night_mode_enabled"):
+        return False
+    start = _clock_minutes(settings.get("night_mode_start"))
+    end = _clock_minutes(settings.get("night_mode_end"))
+    if start is None or end is None:
+        return False
+    if start == end:
+        return True
+    moment = now or datetime.now(timezone.utc)
+    current = moment.hour * 60 + moment.minute
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def night_mode_label(settings: Any) -> str:
+    if not isinstance(settings, dict):
+        return ""
+    return f"{settings.get('night_mode_start', '?')}–{settings.get('night_mode_end', '?')} UTC"
 
 
 def build_context(history: deque[dict[str, Any]], limit: int = 12) -> str:
@@ -1728,6 +1761,13 @@ class FarmAccount:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
 
+        if night_mode_active(FARM_CFG.get("farm", {})):
+            log.info(
+                "[%s] ночной режим (%s): входящее %s сохранено как контекст, без ответа",
+                self.name, night_mode_label(FARM_CFG.get("farm", {})), message.id,
+            )
+            return
+
         if scenario_mode in {"combined", "history_dialogue"} and not is_question:
             log.info("[%s] входящее сообщение %s сохранено как контекст; вопрос не распознан", self.name, message.id)
             return
@@ -1826,6 +1866,9 @@ class FarmAccount:
             try:
                 await asyncio.sleep(random.uniform(min_delay, max_delay))
                 if not self._running or random.random() > self.reply_probability:
+                    continue
+                if night_mode_active(FARM_CFG.get("farm", {})):
+                    log.info("[%s] ночной режим: автономная активность приостановлена", self.name)
                     continue
                 await self._act()
             except asyncio.CancelledError:
@@ -2378,10 +2421,10 @@ async def run_scenario(
 
     min_delay = max(5.0, float(FARM_CFG.get("farm", {}).get("min_delay_sec", 20)))
     max_delay = max(min_delay, float(FARM_CFG.get("farm", {}).get("max_delay_sec", 45)))
-    rest_every = 0 if mode == "history_dialogue" else max(0, int(settings.get("rest_every", 6)))
+    rest_every = max(0, int(settings.get("rest_every", 6)))
     rest_min = max(15.0, float(settings.get("rest_min_sec", 60)))
     rest_max = max(rest_min, float(settings.get("rest_max_sec", 120)))
-    joke_every = 0 if mode == "history_dialogue" else max(0, int(settings.get("joke_every", 5)))
+    joke_every = max(0, int(settings.get("joke_every", 5)))
     turn_limit = max(0, int(settings.get("scenario_turns", 20)))
     turn_index = 0
     account_turn_counts = {account.name: 0 for account in accounts}
@@ -2398,6 +2441,16 @@ async def run_scenario(
             mode, len(accounts), turn_limit or "до ручной остановки", topic[:120],
         )
     while not stop_event.is_set() and (turn_limit == 0 or turn_index < turn_limit):
+        if night_mode_active(settings):
+            log.info(
+                "Ночной режим (%s): ходы приостановлены до %s UTC",
+                night_mode_label(settings), settings.get("night_mode_end", "?"),
+            )
+            for _ in range(6):
+                if stop_event.is_set():
+                    break
+                await asyncio.sleep(10)
+            continue
         if turn_index and rest_every and turn_index % rest_every == 0:
             rest = random.uniform(rest_min, rest_max)
             log.info("Сценарий: перерыв %.0f сек после %d ходов", rest, turn_index)
@@ -2425,15 +2478,21 @@ async def run_scenario(
         elif mode == "history_dialogue":
             account_turn_counts[account.name] += 1
             turn_number = account_turn_counts[account.name]
+            tell_joke = bool(joke_every and turn_number % joke_every == 0)
             source_item = await next_history_turn_item(state, account.name, turn_number)
-            text = await generate_history_dialogue_turn(
-                account.bridge,
-                state,
-                account.persona,
-                turn_number,
-                account_name=account.name,
-                global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
-            )
+            if tell_joke:
+                async with state.lock:
+                    joke_history = list(state.chat_history)
+                text = _choose_fresh_fallback(CLEAN_JOKES, joke_history, turn_number, "эту тему")
+            else:
+                text = await generate_history_dialogue_turn(
+                    account.bridge,
+                    state,
+                    account.persona,
+                    turn_number,
+                    account_name=account.name,
+                    global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
+                )
             # With no safe text, fall back to the media from that same archive message.
             media_item = account._pick_history_media(
                 force=not bool(text),
@@ -2449,7 +2508,9 @@ async def run_scenario(
                 sent = await account._send_history_dialogue_content(
                     text, reply_to=reply_to, media_item=media_item
                 )
-            if text and media_item:
+            if tell_joke:
+                action = "рассказал анекдот"
+            elif text and media_item:
                 action = f"продолжил разговор с медиа из назначенной истории ({media_item['media'].get('kind')})"
             elif text:
                 action = "продолжил разговор по назначенной истории"
@@ -2674,6 +2735,11 @@ async def run_farm() -> None:
     log.info("Подключаю %d аккаунтов к чату %s...", len(FARM_CFG["accounts"]), FARM_CFG["target_chat_id"])
     farm_settings = FARM_CFG["farm"]
     scenario_mode = farm_settings.get("scenario_mode", "reactive")
+    if farm_settings.get("night_mode_enabled"):
+        log.info(
+            "Ночной режим включён: %s UTC — ходы, автономные сообщения, реакции и ответы приостановлены",
+            night_mode_label(farm_settings),
+        )
     if scenario_mode == "reactive":
         log.info(
             "Режим без сценария: ответы на сообщения; сценарная цепочка отключена, автономная активность=%s",
@@ -2947,6 +3013,8 @@ async def run_farm() -> None:
             while True:
                 try:
                     await asyncio.sleep(random.uniform(60, 120))
+                    if night_mode_active(FARM_CFG.get("farm", {})):
+                        continue
                     if accounts:
                         await random.choice(accounts)._send_reaction_to_last()
                 except asyncio.CancelledError:

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import tempfile
 import types
@@ -395,6 +396,95 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             source_words = set(re.findall(r"[а-яёa-z]{4,}", source.casefold()))
             line_words = set(re.findall(r"[а-яёa-z]{4,}", line.casefold()))
             self.assertGreaterEqual(len(source_words & line_words), 2)
+
+    def test_night_mode_window_covers_wrap_around_and_same_day_ranges(self):
+        from datetime import datetime, timezone
+
+        settings = {
+            "night_mode_enabled": True,
+            "night_mode_start": "23:00",
+            "night_mode_end": "07:00",
+        }
+        self.assertTrue(farm.night_mode_active(settings, datetime(2026, 10, 7, 23, 30, tzinfo=timezone.utc)))
+        self.assertTrue(farm.night_mode_active(settings, datetime(2026, 10, 7, 3, 15, tzinfo=timezone.utc)))
+        self.assertFalse(farm.night_mode_active(settings, datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)))
+        self.assertFalse(farm.night_mode_active(settings, datetime(2026, 10, 7, 7, 0, tzinfo=timezone.utc)))
+
+        same_day = {**settings, "night_mode_start": "09:00", "night_mode_end": "18:00"}
+        self.assertTrue(farm.night_mode_active(same_day, datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)))
+        self.assertFalse(farm.night_mode_active(same_day, datetime(2026, 10, 7, 20, 0, tzinfo=timezone.utc)))
+
+        self.assertFalse(farm.night_mode_active({**settings, "night_mode_enabled": False},
+                                                datetime(2026, 10, 7, 23, 30, tzinfo=timezone.utc)))
+        self.assertEqual(farm.night_mode_label(settings), "23:00–07:00 UTC")
+
+    async def test_history_dialogue_pauses_turns_during_the_night_window(self):
+        from datetime import datetime, timezone
+
+        state = farm.FarmState()
+        state.account_contexts = {
+            "a": [{"author": "участник 1", "participant_id": 1, "message_id": 1,
+                   "text": "Пальмы у моря", "source_text": "Пальмы у моря",
+                   "direction": "context", "kind": "text"}],
+            "b": [],
+        }
+        accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]
+        stop_event = farm.asyncio.Event()
+        settings = {
+            "scenario_mode": "history_dialogue",
+            "scenario_topic": "",
+            "scenario_turns": 1,
+            "joke_every": 0,
+            "rest_every": 0,
+            "post_opening": False,
+            "night_mode_enabled": True,
+            "night_mode_start": "00:00",
+            "night_mode_end": "23:59",
+        }
+
+        async def stop_soon() -> None:
+            await asyncio.sleep(0.2)
+            stop_event.set()
+
+        stopper = asyncio.create_task(stop_soon())
+        try:
+            with patch.object(
+                farm, "night_mode_active",
+                new=lambda *_args, **_kwargs: True,
+            ):
+                await farm.run_scenario(accounts, state, stop_event, settings)
+        finally:
+            await stopper
+
+        self.assertEqual([account.sent for account in accounts], [[], []])
+
+    async def test_history_dialogue_turn_can_tell_a_joke(self):
+        state = farm.FarmState()
+        state.account_contexts = {"a": [{
+            "author": "участник 1", "participant_id": 1, "message_id": 1,
+            "text": "Пальмы у моря", "source_text": "Пальмы у моря",
+            "direction": "context", "kind": "text",
+        }], "b": []}
+        accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]
+        stop_event = farm.asyncio.Event()
+        settings = {
+            "scenario_mode": "history_dialogue",
+            "scenario_topic": "",
+            "scenario_turns": 2,
+            "joke_every": 1,
+            "rest_every": 0,
+            "post_opening": False,
+        }
+
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(
+            farm, "generate_history_dialogue_turn", new=AsyncMock(return_value="")
+        ):
+            await farm.run_scenario(accounts, state, stop_event, settings)
+
+        sent_texts = [item["text"] for account in accounts for item in account.sent]
+        self.assertEqual(len(sent_texts), 2)
+        for text in sent_texts:
+            self.assertIn(text, farm.CLEAN_JOKES)
 
     async def test_history_turn_without_archive_media_still_sends_gifs_stickers_and_media(self):
         state = farm.FarmState()

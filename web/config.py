@@ -37,6 +37,9 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "rest_max_sec": 120,
     "roulette_numbers": "0-36",
     "post_opening": True,
+    "night_mode_enabled": False,
+    "night_mode_start": "23:00",
+    "night_mode_end": "07:00",
 }
 
 
@@ -163,7 +166,32 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
     settings["rest_max_sec"] = max(settings["rest_min_sec"], settings["rest_max_sec"])
     settings["roulette_numbers"] = str(settings.get("roulette_numbers") or "0-36").strip()[:256]
     settings["post_opening"] = _as_bool(settings.get("post_opening"))
+    settings["night_mode_enabled"] = _as_bool(settings.get("night_mode_enabled"))
+    settings["night_mode_start"] = parse_clock(
+        settings.get("night_mode_start"), DEFAULT_FARM_SETTINGS["night_mode_start"]
+    )
+    settings["night_mode_end"] = parse_clock(
+        settings.get("night_mode_end"), DEFAULT_FARM_SETTINGS["night_mode_end"]
+    )
     return settings
+
+
+def parse_clock(value: Any, fallback: str) -> str:
+    """Validate a UTC wall-clock time given as ``HH:MM``."""
+    minutes = clock_to_minutes(value)
+    if minutes is None:
+        return fallback
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def clock_to_minutes(value: Any) -> int | None:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour * 60 + minute
 
 
 def _as_bool(value: Any) -> bool:

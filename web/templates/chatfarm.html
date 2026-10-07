@@ -87,6 +87,7 @@
           </div>
         </div>
         <div id="post_opening_row" class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
+      <p class="help">Время сервера сейчас: <strong>{{ server_utc_now }} UTC</strong>. Ночной режим (окно тишины, время в UTC) настраивается в разделе «Поведение» и действует на ходы, ответы, реакции и автономные сообщения.</p>
         <p id="scenario_runtime_help" class="help">Нет сценарной темы, стартового сообщения и цепочки авто-диалога; используются сохранённые настройки поведения аккаунтов.</p>
       </div>
       <div class="field">
@@ -174,12 +175,6 @@ function updateScenarioForm() {
   document.getElementById('scenario_topic_field').hidden = historyDialogue;
   document.getElementById('post_opening_row').hidden = historyDialogue;
   postOpening.disabled = historyDialogue;
-  for (const id of ['joke_every_field', 'rest_every_field', 'rest_duration_fields']) {
-    document.getElementById(id).hidden = historyDialogue;
-  }
-  for (const id of ['joke_every', 'rest_every', 'rest_min_sec', 'rest_max_sec']) {
-    document.getElementById(id).disabled = historyDialogue;
-  }
   const historySource = document.getElementById('history_source');
   historySource.required = historyDialogue;
   historySource.disabled = !useHistory;
@@ -197,7 +192,7 @@ function updateScenarioForm() {
   document.getElementById('roulette_numbers').required = roulette;
   document.getElementById('scenario_turn_label').textContent = roulette ? 'Ходов рулетки' : 'Ходов цепочки диалога';
   document.getElementById('scenario_turn_help').textContent = historyDialogue
-    ? 'По умолчанию 8 последовательных шагов развития по истории; 0 — продолжать до ручной остановки. Поставьте положительный лимит, чтобы не гонять один и тот же архивный контекст.'
+    ? 'Сколько ходов делает диалог по истории; 0 — продолжать до ручной остановки. Архив перебирается по кругу, поэтому лимит можно ставить любым.'
     : combined
       ? 'По умолчанию — бесконечная цепочка; положительное число ограничит диалог, а ответы участникам останутся активны.'
       : mode === 'discussion'
@@ -216,7 +211,7 @@ function updateScenarioForm() {
           ? 'Аккаунты сами ведут цепочку: следующий участник отвечает на предыдущую реплику и развивает тему.'
           : 'Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; автономная активность — только если отдельно разрешена там. Тему вводить не нужно.';
   document.getElementById('scenario_runtime_help').textContent = historyDialogue
-    ? 'Общая тема и стартовая публикация отключены; анекдоты и длинные сценарные паузы тоже. Аккаунты общаются сообщениями из собранной истории своего участника — коротко и разговорно, с опечатками и смайлами, плюс гифки, стикеры, фото, видео и голосовые. Работает и без DeepSeek: реплики берутся из назначенного архива. Ответы на вопросы живых участников и реакции остаются активны; роли синтетические, стиль реальных авторов не копируется.'
+    ? 'Общая тема и стартовая публикация отключены. Анекдоты и длинные паузы работают как обычно. Аккаунты общаются сообщениями из собранной истории своего участника — коротко и разговорно, с опечатками и смайлами, плюс гифки, стикеры, фото, видео и голосовые. Работает и без DeepSeek: реплики берутся из назначенного архива. Ответы на вопросы живых участников и реакции остаются активны; роли синтетические, стиль реальных авторов не копируется.'
     : combined
       ? 'Сообщения в выбранной теме попадают в контекст. Вопросы и просьбы распознаются по смыслу — знак вопроса не обязателен; один случайный аккаунт может ответить реплаем. Обычные сообщения остаются контекстом без автоматического ответа. После лимита диалога ответы продолжаются до ручной остановки.'
       : roulette
