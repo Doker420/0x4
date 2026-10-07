@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -532,6 +533,112 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(response.status_code, 422)
         self.assertIn("сессию для чтения истории", response.json()["detail"])
+
+    async def test_farm_log_reader_survives_a_line_over_the_stream_limit(self):
+        """Раньше одна огромная строка лога убивала читатель и вместе с ним ферму."""
+        reader = asyncio.StreamReader(limit=64 * 1024)
+        giant = b'{"file_part": 0, "data": "' + b"x" * (300 * 1024) + b'"}'
+        reader.feed_data(giant + b"\n")
+        reader.feed_data("обычная строка после гигантской\n".encode("utf-8"))
+        reader.feed_eof()
+
+        # Так падал прежний читатель: readline() не выдерживает строку больше лимита.
+        with self.assertRaises(ValueError):
+            await self._readline_with_limit(giant)
+
+        process = SimpleNamespace(pid=4321, returncode=None, stdout=reader, wait=AsyncMock(return_value=0))
+        with tempfile.TemporaryDirectory() as tempdir:
+            log_path = Path(tempdir) / "farm.log"
+            with (
+                patch.object(web_app, "FARM_PROCESS", process),
+                patch.object(web_app, "FARM_LOG_TASK", None),
+                patch.object(web_app, "FARM_LOG_FILE", log_path),
+            ):
+                with patch.object(web_app.manager.manager, "finish_farm", new=AsyncMock()) as finish:
+                    process.returncode = 0  # ферма завершилась штатно, уже после вывода
+                    await web_app._stream_farm_logs(process)
+                    finish.assert_awaited_once()
+
+            content = log_path.read_text(encoding="utf-8")
+        self.assertIn("обычная строка после гигантской", content)
+        self.assertIn("file_part", content)
+        for line in content.splitlines():
+            self.assertLessEqual(
+                len(line), web_app.FARM_LOG_MAX_LINE_CHARS + 100,
+                "гигантская строка должна попасть в лог обрезанной",
+            )
+
+    async def _readline_with_limit(self, payload: bytes):
+        """Повторить поведение прежнего читателя: readline() на длинной строке."""
+        reader = asyncio.StreamReader(limit=64 * 1024)
+        reader.feed_data(payload + b"\n")
+        reader.feed_eof()
+        return await reader.readline()
+
+    async def test_farm_log_reader_keeps_the_farm_alive_when_the_pipe_breaks(self):
+        class BrokenStream:
+            """Поток, который падает именно той ошибкой, что была в логе панели."""
+
+            def __init__(self):
+                self.calls = 0
+
+            async def read(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("Separator is not found, and chunk exceed the limit")
+                if self.calls == 2:
+                    return "починенная строка лога\n".encode("utf-8")
+                return b""
+
+        released = asyncio.Event()
+
+        async def wait_for_process():
+            await released.wait()
+            return 0
+
+        process = SimpleNamespace(
+            pid=999, returncode=None, stdout=BrokenStream(), wait=wait_for_process
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            log_path = Path(tempdir) / "farm.log"
+            with (
+                patch.object(web_app, "FARM_PROCESS", process),
+                patch.object(web_app, "FARM_LOG_TASK", None),
+                patch.object(web_app, "FARM_LOG_FILE", log_path),
+                patch.object(web_app.manager.manager, "finish_farm", new=AsyncMock()) as finish,
+            ):
+                task = asyncio.create_task(web_app._stream_farm_logs(process))
+                await asyncio.sleep(0.3)
+                # Ошибка чтения уже случилась, но ферма ещё работает: панель не
+                # должна ни отпускать процесс, ни считать его остановленным.
+                self.assertEqual(finish.await_count, 0)
+                self.assertIs(web_app.FARM_PROCESS, process)
+                process.returncode = 0
+                released.set()
+                await asyncio.wait_for(task, timeout=5)
+                finish.assert_awaited_once()
+            content = log_path.read_text(encoding="utf-8")
+        self.assertIn("починенная строка лога", content, "читатель обязан продолжить после ошибки")
+        self.assertIsNone(web_app.FARM_PROCESS, "после завершения процесса ссылку можно отпустить")
+
+    async def test_farm_log_is_rotated_instead_of_growing_forever(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            log_path = Path(tempdir) / "farm.log"
+            with (
+                patch.object(web_app, "FARM_LOG_FILE", log_path),
+                patch.object(web_app, "FARM_LOG_MAX_BYTES", 2000),
+                patch.object(web_app, "FARM_LOG_KEEP_BYTES", 400),
+                patch.object(web_app, "_FARM_LOG_WRITTEN", 0),
+            ):
+                for index in range(200):
+                    web_app._write_farm_log_line(f"строка {index} " + "x" * 50)
+
+                size = log_path.stat().st_size
+                tail = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertLessEqual(size, 2000 + 200, "лог должен урезаться по лимиту")
+        self.assertTrue(tail, "после урезания в логе остаётся хвост")
+        self.assertIn("строка 199", tail[-1])
 
     async def test_start_handler_collects_context_before_spawning_farm(self):
         events = []

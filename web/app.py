@@ -138,6 +138,17 @@ async def _h_chat_context_collect(payload: dict) -> dict:
 FARM_PROCESS: Optional[asyncio.subprocess.Process] = None
 FARM_LOG_TASK: Optional[asyncio.Task] = None
 FARM_LOG_FILE = db.DATA_DIR / "farm.log"
+# farm.py (especially with Pyrogram debug output) can print a single enormous
+# line — a raw Telegram object dump. Such a line must never break the reader,
+# so the stream is consumed in bounded chunks and long lines are truncated.
+FARM_LOG_CHUNK_BYTES = 65536
+FARM_LOG_MAX_LINE_CHARS = 4000
+FARM_LOG_MAX_PENDING_BYTES = 512 * 1024
+FARM_STREAM_LIMIT = 4 * 1024 * 1024
+# The log is rotated by bytes so a long debug session cannot fill the disk.
+FARM_LOG_MAX_BYTES = 8 * 1024 * 1024
+FARM_LOG_KEEP_BYTES = 2 * 1024 * 1024
+_FARM_LOG_WRITTEN = 0
 
 
 def _current_owner(web_auth: Optional[str]) -> dict:
@@ -1075,29 +1086,137 @@ async def api_chatfarm_start(
     return {"ok": True, "task_id": task_id, "collecting_history": collect_history}
 
 
-async def _stream_farm_logs(process: asyncio.subprocess.Process) -> None:
-    global FARM_PROCESS, FARM_LOG_TASK
+def _rotate_farm_log() -> None:
+    """Keep only the recent tail of the log file."""
+    global _FARM_LOG_WRITTEN
     try:
-        if process.stdout:
+        with FARM_LOG_FILE.open("rb") as logfile:
+            logfile.seek(0, os.SEEK_END)
+            size = logfile.tell()
+            logfile.seek(max(0, size - FARM_LOG_KEEP_BYTES))
+            tail = logfile.read()
+        FARM_LOG_FILE.write_bytes(tail)
+        _FARM_LOG_WRITTEN = len(tail)
+        log.info("Лог фермы урезан: оставлено %d КБ из %d КБ", len(tail) // 1024, size // 1024)
+    except OSError:
+        _FARM_LOG_WRITTEN = 0
+        log.exception("Не удалось урезать лог фермы")
+
+
+def _write_farm_log_line(text: str) -> None:
+    global _FARM_LOG_WRITTEN
+    FARM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with FARM_LOG_FILE.open("a", encoding="utf-8", errors="replace") as logfile:
+        logfile.write(text + "\n")
+    _FARM_LOG_WRITTEN += len(text) + 1
+    if _FARM_LOG_WRITTEN > FARM_LOG_MAX_BYTES:
+        _rotate_farm_log()
+    log.info("[farm.py] %s", text)
+
+
+def _farm_log_text(raw: bytes) -> str:
+    return raw.decode("utf-8", "replace").rstrip("\r")
+
+
+def _truncate_farm_log_text(text: str) -> str:
+    if len(text) <= FARM_LOG_MAX_LINE_CHARS:
+        return text
+    return text[:FARM_LOG_MAX_LINE_CHARS] + f" … [строка обрезана, всего {len(text)} символов]"
+
+
+def _drain_farm_log_lines(pending: bytes, oversized: bool) -> tuple[bytes, bool]:
+    """Write every complete line from the buffer, then return the leftover bytes.
+
+    ``oversized`` marks that the beginning of the current line was already
+    reported, so its tail is consumed silently instead of overflowing the log.
+    """
+    while True:
+        index = pending.find(b"\n")
+        if index < 0:
+            break
+        line, pending = pending[:index], pending[index + 1:]
+        if oversized:
+            oversized = False
+            continue
+        _write_farm_log_line(_truncate_farm_log_text(_farm_log_text(line)))
+    if len(pending) > FARM_LOG_MAX_PENDING_BYTES:
+        _write_farm_log_line(_truncate_farm_log_text(_farm_log_text(pending)) + " … [строка не дописана]")
+        pending = b""
+        oversized = True
+    return pending, oversized
+
+
+async def _stream_farm_logs(process: asyncio.subprocess.Process) -> None:
+    """Copy farm.py output into the panel log without ever breaking the stream.
+
+    ``StreamReader.readline()`` raises ValueError when one line is longer than
+    the stream limit. Previously that exception escaped this coroutine: the
+    reader died, the pipe got closed, and farm.py stopped with BrokenPipeError.
+    Now the stream is read in bounded chunks, over-long lines are truncated, and
+    read errors are retried — a single bad line can no longer stop the farm.
+    """
+    global FARM_PROCESS, FARM_LOG_TASK
+    stream = process.stdout
+    pending = b""
+    oversized = False
+    read_errors = 0
+    try:
+        if stream is not None:
             while True:
-                line = await process.stdout.readline()
-                if not line:
+                try:
+                    chunk = await stream.read(FARM_LOG_CHUNK_BYTES)
+                except asyncio.CancelledError:
+                    raise
+                except (ValueError, asyncio.LimitOverrunError, asyncio.IncompleteReadError) as exc:
+                    # Oversized line or a broken buffer: drop what is buffered and
+                    # keep reading. Complete lines that follow must not be lost, so
+                    # the remainder is written normally.
+                    read_errors += 1
+                    if read_errors <= 3 or read_errors % 20 == 0:
+                        log.warning("Строка лога фермы превысила лимит чтения: %s", exc)
+                    pending = b""
+                    oversized = False
+                    await asyncio.sleep(min(0.1 * read_errors, 1.0))
+                    continue
+                except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                    log.warning("Поток лога фермы закрылся: %s", exc)
                     break
-                text = line.decode("utf-8", "replace").rstrip()
-                with FARM_LOG_FILE.open("a", encoding="utf-8", errors="replace") as logfile:
-                    logfile.write(text + "\n")
-                log.info("[farm.py] %s", text)
+                except Exception as exc:
+                    # Never leave the pipe unread: farm.py would block on its next
+                    # log write. Back off a little and retry instead of dying.
+                    read_errors += 1
+                    if read_errors <= 3 or read_errors % 20 == 0:
+                        log.warning("Ошибка чтения лога фермы (попытка %d): %s", read_errors, exc)
+                    await asyncio.sleep(min(0.2 * read_errors, 2.0))
+                    continue
+                if not chunk:
+                    break
+                read_errors = 0
+                pending, oversized = _drain_farm_log_lines(pending + chunk, oversized)
         await process.wait()
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("Ошибка чтения лога фермы")
     finally:
-        if FARM_PROCESS is process:
-            FARM_PROCESS = None
-        if FARM_LOG_TASK is asyncio.current_task():
+        if pending and not oversized:
+            try:
+                _write_farm_log_line(_truncate_farm_log_text(_farm_log_text(pending)))
+            except OSError:
+                log.exception("Не удалось дописать лог фермы")
+        if _FARM_LOG_WRITTEN > FARM_LOG_MAX_BYTES:
+            _rotate_farm_log()
+        current = asyncio.current_task()
+        if FARM_LOG_TASK is current:
             FARM_LOG_TASK = None
-        await manager.manager.finish_farm()
+        if process.returncode is None:
+            # farm.py is still running: never drop the process reference, or the
+            # pipe is garbage-collected and the farm dies on the next log write.
+            log.warning("Чтение лога остановилось, но farm.py ещё работает — процесс остаётся под контролем панели")
+        else:
+            if FARM_PROCESS is process:
+                FARM_PROCESS = None
+            await manager.manager.finish_farm()
 
 
 @tasks.register("start_chatfarm")
@@ -1199,6 +1318,8 @@ async def _h_start_chatfarm(payload: dict) -> dict:
     try:
         FARM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         FARM_LOG_FILE.write_text("", encoding="utf-8")
+        global _FARM_LOG_WRITTEN
+        _FARM_LOG_WRITTEN = 0
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",
@@ -1209,6 +1330,7 @@ async def _h_start_chatfarm(payload: dict) -> dict:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            limit=FARM_STREAM_LIMIT,
         )
     except BaseException:
         await manager.manager.finish_farm()

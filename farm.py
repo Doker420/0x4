@@ -3963,10 +3963,13 @@ def main() -> int:
         format="%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s",
         stream=sys.stdout,
     )
-    if args.debug:
-        logging.getLogger("pyrogram").setLevel(logging.DEBUG)
-    else:
-        logging.getLogger("pyrogram").setLevel(logging.WARNING)
+    # Pyrogram prints whole raw Telegram objects at DEBUG level — single lines of
+    # hundreds of kilobytes that used to break the panel's log reader. Our own
+    # logging stays verbose with --debug; Pyrogram only when explicitly asked.
+    pyrogram_debug = os.getenv("FARM_PYROGRAM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    logging.getLogger("pyrogram").setLevel(
+        logging.DEBUG if (args.debug and pyrogram_debug) else logging.WARNING
+    )
 
     if args.check_only:
         asyncio.run(_check_only()); return 0
