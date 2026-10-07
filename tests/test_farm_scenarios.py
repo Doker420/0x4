@@ -22,6 +22,9 @@ class FakeScenarioAccount:
     def _pick_kind(self):
         return "text"
 
+    def _plan_turn_media(self):
+        return "text"
+
     async def _send_text(self, text, reply_to=None):
         message_id = len(self.sent) + 1 + self.user_id * 100
         self.sent.append({"text": text, "reply_to": reply_to, "message_id": message_id})
@@ -79,6 +82,53 @@ class FakeMediaClient:
             from_user=types.SimpleNamespace(id=100),
             chat=types.SimpleNamespace(id=kwargs["chat_id"]),
         )
+
+
+class FakeIdleAccount:
+    """Minimal account stub for the idle activity helper."""
+
+    def __init__(self, name, state):
+        self.name = name
+        self.state = state
+        self.sent = []
+
+    async def _send_farm_media(self, kind, reply_to=None):
+        self.sent.append({"kind": kind})
+        return True
+
+    async def _send_text(self, text, reply_to=None):
+        self.sent.append({"text": text})
+        return True
+
+
+class FakeMusicAccount:
+    """Account stub that records reposted tracks."""
+
+    def __init__(self):
+        self.name = "music-bot"
+        self.state = farm.FarmState()
+        self.client = types.SimpleNamespace(
+            copy_message=AsyncMock(return_value=types.SimpleNamespace(id=555))
+        )
+        self.recorded = []
+
+    def _send_kwargs(self, reply_to=None):
+        return {"chat_id": -1001234567890, "reply_to_message_id": reply_to}
+
+    async def _record(self, msg, text, kind):
+        self.recorded.append((int(msg.id), text, kind))
+
+
+class FakeMusicClient:
+    def __init__(self, track_ids):
+        self.track_ids = list(track_ids)
+
+    def get_chat_history(self, source, limit=50):
+        async def generator():
+            for identifier in self.track_ids[:limit]:
+                yield types.SimpleNamespace(id=identifier, audio=object(), voice=None, document=None)
+
+        return generator()
 
 
 class EmptyDonor:
@@ -396,6 +446,130 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             source_words = set(re.findall(r"[а-яёa-z]{4,}", source.casefold()))
             line_words = set(re.findall(r"[а-яёa-z]{4,}", line.casefold()))
             self.assertGreaterEqual(len(source_words & line_words), 2)
+
+    async def test_idle_activity_revives_the_chat_with_one_account_at_a_time(self):
+        from datetime import datetime, timedelta
+
+        state = farm.FarmState()
+        accounts = [FakeIdleAccount(name, state) for name in ("a", "b", "c")]
+        settings = {
+            "idle_enabled": True,
+            "idle_after_sec": 60,
+            "idle_cooldown_sec": 60,
+            "idle_gif_percent": 100,
+        }
+        quiet_since = datetime.now().timestamp() - 600
+        state.last_activity = datetime.fromtimestamp(quiet_since)
+
+        self.assertTrue(await farm.idle_activity_tick(accounts, state, settings))
+        self.assertEqual([len(account.sent) for account in accounts], [1, 0, 0])
+        self.assertEqual(accounts[0].sent[0]["kind"], "gif")
+
+        # Inside the cooldown nobody else joins, so 30 accounts stay silent together.
+        self.assertFalse(await farm.idle_activity_tick(accounts, state, settings))
+        self.assertEqual([len(account.sent) for account in accounts], [1, 0, 0])
+
+        # Once the cooldown passes the next account in the rotation takes the turn.
+        later = datetime.now() + timedelta(seconds=120)
+        self.assertTrue(await farm.idle_activity_tick(accounts, state, settings, now=later))
+        self.assertEqual([len(account.sent) for account in accounts], [1, 1, 0])
+
+    async def test_idle_activity_stays_quiet_when_disabled_busy_or_at_night(self):
+        from datetime import datetime
+
+        state = farm.FarmState()
+        accounts = [FakeIdleAccount("a", state)]
+        base = {
+            "idle_enabled": True,
+            "idle_after_sec": 60,
+            "idle_cooldown_sec": 60,
+            "idle_gif_percent": 0,
+        }
+        state.last_activity = datetime.fromtimestamp(datetime.now().timestamp() - 600)
+
+        self.assertFalse(await farm.idle_activity_tick(accounts, state, {**base, "idle_enabled": False}))
+
+        busy_state = farm.FarmState()
+        busy_state.last_activity = datetime.now()
+        self.assertFalse(
+            await farm.idle_activity_tick([FakeIdleAccount("b", busy_state)], busy_state, base)
+        )
+
+        night = {
+            **base,
+            "night_mode_enabled": True,
+            "night_mode_start": "00:00",
+            "night_mode_end": "23:59",
+        }
+        self.assertFalse(await farm.idle_activity_tick(accounts, state, night))
+
+    async def test_history_archive_messages_are_not_reused_until_the_archive_is_exhausted(self):
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [
+            {
+                "author": "участник 1", "participant_id": 1, "message_id": index + 1,
+                "text": f"Запись номер {index + 1} из истории чата", "source_text": f"Запись номер {index + 1} из истории чата",
+                "direction": "context", "kind": "text",
+            }
+            for index in range(3)
+        ]}
+
+        used = []
+        for turn in range(1, 4):
+            item = await farm.next_history_turn_item(state, "bot", turn)
+            used.append(int(item["message_id"]))
+
+        self.assertEqual(sorted(used), [1, 2, 3])
+        self.assertEqual(sorted(state.used_archive_ids["bot"]), [1, 2, 3])
+
+        # Only after every assigned message was spoken does the next pass start.
+        item = await farm.next_history_turn_item(state, "bot", 4)
+        self.assertEqual(sorted(state.used_archive_ids["bot"]), [int(item["message_id"])])
+
+    def test_turn_media_plan_prefers_gifs_and_music_by_configured_share(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        account.music = None
+        farm.FARM_CFG["farm"] = {
+            "gif_share_percent": 100,
+            "music_share_percent": 0,
+            "music_enabled": False,
+        }
+        self.assertEqual(account._plan_turn_media(), "gif")
+
+        farm.FARM_CFG["farm"]["gif_share_percent"] = 0
+        self.assertEqual(account._plan_turn_media(), "text")
+
+        farm.FARM_CFG["farm"]["music_share_percent"] = 100
+        # Music reposts stay off until the source is enabled and tracks were found.
+        self.assertEqual(account._plan_turn_media(), "text")
+        farm.FARM_CFG["farm"]["music_enabled"] = True
+        account.music = object()
+        self.assertEqual(account._plan_turn_media(), "music")
+
+    async def test_music_reposter_cycles_tracks_without_repeats(self):
+        reposter = farm.MusicReposter("@sad_tracky")
+        await reposter.refresh([FakeMusicClient([11, 12, 13])])
+        self.assertEqual(sorted(reposter.track_ids), [11, 12, 13])
+
+        first_pass = [reposter.next_track() for _ in range(3)]
+        self.assertEqual(sorted(first_pass), [11, 12, 13])
+        second_pass = [reposter.next_track() for _ in range(3)]
+        self.assertEqual(sorted(second_pass), [11, 12, 13])
+
+        account = FakeMusicAccount()
+        self.assertTrue(await reposter.send(account))
+        kwargs = account.client.copy_message.await_args.kwargs
+        self.assertEqual(kwargs["from_chat_id"], "@sad_tracky")
+        self.assertIn(kwargs["message_id"], [11, 12, 13])
+        self.assertEqual(kwargs["reply_to_message_id"], None)
+        self.assertEqual(account.recorded, [(555, "", "audio")])
+
+    async def test_music_reposter_without_source_does_not_break_the_turn(self):
+        reposter = farm.MusicReposter("@sad_tracky")
+        await reposter.refresh([FakeMusicClient([])])
+        self.assertEqual(reposter.next_track(), None)
+        self.assertFalse(await reposter.send(FakeMusicAccount()))
 
     def test_night_mode_window_covers_wrap_around_and_same_day_ranges(self):
         from datetime import datetime, timezone

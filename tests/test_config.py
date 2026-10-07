@@ -69,6 +69,45 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(invalid["night_mode_start"], "23:00")
         self.assertEqual(invalid["night_mode_end"], "07:00")
 
+    def test_idle_and_music_settings_are_normalized(self):
+        defaults = load_farm_settings({})
+        self.assertFalse(defaults["idle_enabled"])
+        self.assertEqual(defaults["idle_after_sec"], 900)
+        self.assertEqual(defaults["idle_cooldown_sec"], 600)
+        self.assertEqual(defaults["idle_gif_percent"], 70)
+        self.assertEqual(defaults["gif_share_percent"], 25)
+        self.assertFalse(defaults["music_enabled"])
+        self.assertEqual(defaults["music_source"], "@sad_tracky")
+        self.assertEqual(defaults["music_share_percent"], 10)
+
+        settings = load_farm_settings({
+            "idle_enabled": "yes",
+            "idle_after_sec": "1200",
+            "idle_cooldown_sec": "300",
+            "idle_gif_percent": "150",
+            "gif_share_percent": "-5",
+            "music_enabled": "on",
+            "music_source": "https://t.me/sad_tracky/12",
+            "music_share_percent": "40.4",
+        })
+        self.assertTrue(settings["idle_enabled"])
+        self.assertEqual(settings["idle_after_sec"], 1200)
+        self.assertEqual(settings["idle_cooldown_sec"], 300)
+        self.assertEqual(settings["idle_gif_percent"], 100)
+        self.assertEqual(settings["gif_share_percent"], 0)
+        self.assertTrue(settings["music_enabled"])
+        self.assertEqual(settings["music_source"], "@sad_tracky")
+        self.assertEqual(settings["music_share_percent"], 40)
+
+        cleaned = load_farm_settings({
+            "idle_after_sec": "1",
+            "idle_cooldown_sec": "abc",
+            "music_source": "не источник",
+        })
+        self.assertEqual(cleaned["idle_after_sec"], 60)
+        self.assertEqual(cleaned["idle_cooldown_sec"], 600)
+        self.assertEqual(cleaned["music_source"], "@sad_tracky")
+
     def test_farm_settings_are_clamped(self):
         settings = load_farm_settings({
             "min_delay_sec": -10,

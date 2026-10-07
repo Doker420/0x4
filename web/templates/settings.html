@@ -49,6 +49,28 @@
     </section>
 
     <section class="card">
+      <div class="card-head"><div><h2>Простой чата</h2><p class="subtle">Оживление, когда участники молчат. Роли разделяются: за один интервал пишет только один аккаунт по очереди.</p></div></div>
+      <div class="check-row"><input id="idle_enabled" name="idle_enabled" type="checkbox" {% if settings.idle_enabled %}checked{% endif %}><label for="idle_enabled">Включить оживление при простое</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="idle_after_sec">Молчание до оживления, сек</label><input id="idle_after_sec" name="idle_after_sec" type="number" min="60" max="86400" step="10" value="{{ settings.idle_after_sec }}"><span class="help">Например 900 — чат молчит 15 минут, прежде чем аккаунт напишет.</span></div>
+        <div class="field"><label for="idle_cooldown_sec">Пауза между оживлениями, сек</label><input id="idle_cooldown_sec" name="idle_cooldown_sec" type="number" min="60" max="86400" step="10" value="{{ settings.idle_cooldown_sec }}"><span class="help">Минимальный интервал между такими сообщениями: не даёт всем аккаунтам заговорить разом.</span></div>
+      </div>
+      <div class="field"><label for="idle_gif_percent">Доля гифок при простое, %</label><input id="idle_gif_percent" name="idle_gif_percent" type="number" min="0" max="100" step="1" value="{{ settings.idle_gif_percent }}"><span class="help">С какой вероятностью вместо короткой фразы аккаунт отправит гифку. Аккаунты чередуются по кругу, так что одновременно пишет один.</span></div>
+      <span class="help">Оживление не срабатывает в ночном окне и не мешает живым диалогам: любой входящий сдвигает таймер простоя. Изменения применятся при следующем запуске чат-фермы.</span>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>Гифки и музыка</h2><p class="subtle">Доли в обычных отправках и репост треков из выбранного источника.</p></div></div>
+      <div class="field"><label for="gif_share_percent">Больше гифок: доля гифок в отправках, %</label><input id="gif_share_percent" name="gif_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.gif_share_percent }}"><span class="help">Эта доля ходов отправляется гифкой в дополнение к весам из «Баланса ответов».</span></div>
+      <div class="check-row"><input id="music_enabled" name="music_enabled" type="checkbox" {% if settings.music_enabled %}checked{% endif %}><label for="music_enabled">Отправлять музыку репостом из источника</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="music_source">Источник музыки</label><input id="music_source" name="music_source" type="text" value="{{ settings.music_source }}" placeholder="@sad_tracky"><span class="help">Например @sad_tracky или числовой ID канала. Аккаунт должен быть подписан или иметь доступ к истории.</span></div>
+        <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">Трек уходит репостом отдельным сообщением, текст хода при этом публикуется.</span></div>
+      </div>
+      <span class="help">Треки берутся из последних сообщений источника и не повторяются, пока не закончатся. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
+    </section>
+
+    <section class="card">
       <div class="card-head"><div><h2>Баланс ответов</h2><p class="subtle">Относительные веса, не обязаны в сумме давать 100.</p></div></div>
       {% set bias = settings.default_media_bias %}
       <div class="field"><label for="media_text">Текст, %</label><input id="media_text" name="media_text" type="number" min="0" step="1" value="{{ (bias.text * 100)|round|int }}"></div>

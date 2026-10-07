@@ -19,6 +19,7 @@ from . import auth, chat_context, db, giphy, manager, mass_actions, tasks
 from .config import (
     DEFAULT_FARM_SETTINGS,
     DEFAULT_MEDIA_BIAS,
+    chat_reference,
     clock_to_minutes,
     load_farm_settings,
     normalize_media_bias,
@@ -193,6 +194,26 @@ def _media_weights(text: float, gif: float, sticker: float, photo: float, voice:
     if sum(values.values()) <= 0:
         raise HTTPException(status_code=422, detail="Сумма весов медиа должна быть больше нуля")
     return normalize_media_bias(values)
+
+
+def _percent_field(value: float, label: str, default: float = 0.0) -> int:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{label}: укажите число от 0 до 100") from exc
+    if not math.isfinite(result) or not 0 <= result <= 100:
+        raise HTTPException(status_code=422, detail=f"{label}: укажите число от 0 до 100")
+    return int(round(result))
+
+
+def _seconds_field(value: float, label: str, low: int = 60, high: int = 86400) -> int:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{label}: укажите количество секунд") from exc
+    if not math.isfinite(result) or not low <= result <= high:
+        raise HTTPException(status_code=422, detail=f"{label}: укажите значение от {low} до {high} секунд")
+    return int(round(result))
 
 
 def _safe_error(exc: Exception) -> str:
@@ -1378,6 +1399,14 @@ async def api_settings_save(
     night_mode_enabled: Optional[str] = Form(default=None),
     night_mode_start: str = Form(default="23:00"),
     night_mode_end: str = Form(default="07:00"),
+    idle_enabled: Optional[str] = Form(default=None),
+    idle_after_sec: float = Form(default=DEFAULT_FARM_SETTINGS["idle_after_sec"]),
+    idle_cooldown_sec: float = Form(default=DEFAULT_FARM_SETTINGS["idle_cooldown_sec"]),
+    idle_gif_percent: float = Form(default=DEFAULT_FARM_SETTINGS["idle_gif_percent"]),
+    gif_share_percent: float = Form(default=DEFAULT_FARM_SETTINGS["gif_share_percent"]),
+    music_enabled: Optional[str] = Form(default=None),
+    music_source: str = Form(default=DEFAULT_FARM_SETTINGS["music_source"]),
+    music_share_percent: float = Form(default=DEFAULT_FARM_SETTINGS["music_share_percent"]),
     clear_giphy_key: Optional[str] = Form(default=None),
     clear_tenor_key: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
@@ -1391,6 +1420,11 @@ async def api_settings_save(
     night_end = clock_to_minutes(night_mode_end)
     if night_start is None or night_end is None:
         raise HTTPException(422, "Укажите время ночного режима в формате ЧЧ:ММ (время сервера, UTC)")
+    music_ref = chat_reference(music_source.strip())
+    if not music_ref:
+        raise HTTPException(
+            422, "Источник музыки: укажите @username канала или его числовой ID, например @sad_tracky"
+        )
     model = deepseek_model.strip().lower()
     if model not in {"default", "expert"}:
         raise HTTPException(422, "Режим DeepSeek должен быть default или expert")
@@ -1412,6 +1446,14 @@ async def api_settings_save(
         "night_mode_enabled": night_mode_enabled is not None,
         "night_mode_start": f"{night_start // 60:02d}:{night_start % 60:02d}",
         "night_mode_end": f"{night_end // 60:02d}:{night_end % 60:02d}",
+        "idle_enabled": idle_enabled is not None,
+        "idle_after_sec": _seconds_field(idle_after_sec, "Простой до оживления"),
+        "idle_cooldown_sec": _seconds_field(idle_cooldown_sec, "Пауза между оживлениями"),
+        "idle_gif_percent": _percent_field(idle_gif_percent, "Доля гифок при простое"),
+        "gif_share_percent": _percent_field(gif_share_percent, "Доля гифок в отправках"),
+        "music_enabled": music_enabled is not None,
+        "music_source": music_ref,
+        "music_share_percent": _percent_field(music_share_percent, "Доля музыки в отправках"),
     })
     await db.set_setting("farm_settings", json.dumps(saved, ensure_ascii=False))
     if clear_giphy_key is not None:

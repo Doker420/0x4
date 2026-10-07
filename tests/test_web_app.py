@@ -773,6 +773,54 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('name="night_mode_start"', page.text)
         self.assertIn("Сервер UTC", page.text)
 
+    async def test_idle_and_music_settings_are_saved_and_validated(self):
+        base = {
+            "min_delay_sec": "1",
+            "max_delay_sec": "3",
+            "night_mode_start": "23:00",
+            "night_mode_end": "07:00",
+        }
+        ok = await self.client.post("/api/settings/save", data={
+            **base,
+            "idle_enabled": "on",
+            "idle_after_sec": "600",
+            "idle_cooldown_sec": "300",
+            "idle_gif_percent": "80",
+            "gif_share_percent": "35",
+            "music_enabled": "on",
+            "music_source": "https://t.me/sad_tracky",
+            "music_share_percent": "15",
+        })
+        self.assertEqual(ok.status_code, 200, ok.text)
+        farm_settings = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertTrue(farm_settings["idle_enabled"])
+        self.assertEqual(farm_settings["idle_after_sec"], 600)
+        self.assertEqual(farm_settings["idle_cooldown_sec"], 300)
+        self.assertEqual(farm_settings["idle_gif_percent"], 80)
+        self.assertEqual(farm_settings["gif_share_percent"], 35)
+        self.assertTrue(farm_settings["music_enabled"])
+        self.assertEqual(farm_settings["music_source"], "@sad_tracky")
+        self.assertEqual(farm_settings["music_share_percent"], 15)
+
+        bad_source = await self.client.post("/api/settings/save", data={**base, "music_source": "канал без ссылки"})
+        self.assertEqual(bad_source.status_code, 422)
+        self.assertIn("@sad_tracky", bad_source.json()["detail"])
+
+        bad_percent = await self.client.post("/api/settings/save", data={**base, "gif_share_percent": "150"})
+        self.assertEqual(bad_percent.status_code, 422)
+        self.assertIn("гифок", bad_percent.json()["detail"])
+
+        bad_idle = await self.client.post("/api/settings/save", data={**base, "idle_after_sec": "1"})
+        self.assertEqual(bad_idle.status_code, 422)
+        self.assertIn("секунд", bad_idle.json()["detail"])
+
+        page = await self.client.get("/settings")
+        self.assertIn("Простой чата", page.text)
+        self.assertIn('name="idle_after_sec"', page.text)
+        self.assertIn('name="music_source"', page.text)
+        self.assertIn('name="gif_share_percent"', page.text)
+        self.assertIn("@sad_tracky", page.text)
+
     async def test_protected_page_redirects_without_cookie(self):
         unauthenticated = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"

@@ -40,6 +40,14 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "night_mode_enabled": False,
     "night_mode_start": "23:00",
     "night_mode_end": "07:00",
+    "idle_enabled": False,
+    "idle_after_sec": 900,
+    "idle_cooldown_sec": 600,
+    "idle_gif_percent": 70,
+    "gif_share_percent": 25,
+    "music_enabled": False,
+    "music_source": "@sad_tracky",
+    "music_share_percent": 10,
 }
 
 
@@ -173,6 +181,17 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
     settings["night_mode_end"] = parse_clock(
         settings.get("night_mode_end"), DEFAULT_FARM_SETTINGS["night_mode_end"]
     )
+
+    settings["idle_enabled"] = _as_bool(settings.get("idle_enabled"))
+    settings["idle_after_sec"] = _bounded_int(settings.get("idle_after_sec"), 900, 60, 86400)
+    settings["idle_cooldown_sec"] = _bounded_int(settings.get("idle_cooldown_sec"), 600, 60, 86400)
+    settings["idle_gif_percent"] = _percent(settings.get("idle_gif_percent"), 70)
+    settings["gif_share_percent"] = _percent(settings.get("gif_share_percent"), 25)
+    settings["music_enabled"] = _as_bool(settings.get("music_enabled"))
+    settings["music_source"] = chat_reference(
+        settings.get("music_source"), DEFAULT_FARM_SETTINGS["music_source"]
+    )
+    settings["music_share_percent"] = _percent(settings.get("music_share_percent"), 10)
     return settings
 
 
@@ -192,6 +211,41 @@ def clock_to_minutes(value: Any) -> int | None:
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
     return hour * 60 + minute
+
+
+def _percent(value: Any, default: int) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float(default)
+    if not math.isfinite(number):
+        number = float(default)
+    return int(max(0, min(100, round(number))))
+
+
+def chat_reference(value: Any, fallback: str = "") -> str:
+    """Keep a chat reference as @username or a numeric id, without URLs."""
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    if text.startswith("http") or text.startswith("t.me"):
+        # Accept a pasted link by keeping only the chat name, never the URL itself.
+        segments = [part for part in re.split(r"[/#?]", text) if part]
+        candidate = ""
+        for segment in segments:
+            if segment.casefold() in {"http:", "https:", "t.me", "www.t.me", "c", "joinchat", "s"}:
+                continue
+            candidate = segment
+            break
+        text = candidate
+        if text and not text.startswith("@") and not text.lstrip("-").isdigit():
+            text = f"@{text}"
+    text = text.strip()
+    if re.fullmatch(r"@[A-Za-z0-9_]{3,64}", text):
+        return text
+    if re.fullmatch(r"-?\d{5,20}", text):
+        return text
+    return fallback
 
 
 def _as_bool(value: Any) -> bool:

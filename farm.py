@@ -23,6 +23,7 @@ import hashlib
 from difflib import SequenceMatcher
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -33,7 +34,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from web.config import normalize_media_bias, parse_roulette_numbers
 
@@ -303,10 +304,20 @@ class FarmState:
         # Full anonymized donor history grouped by the one participant assigned to each account.
         # Kept separate from the bounded live-chat buffer and reloaded from chat_contexts on start.
         self.account_contexts: dict[str, list[dict[str, Any]]] = {}
+        # Archive messages already spoken by each account, so no line repeats twice.
+        self.used_archive_ids: dict[str, set[int]] = {}
+        self.last_activity: datetime | None = None
+        self.started_at: datetime = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.last_idle_post: datetime | None = None
+        self.idle_cursor: int = 0
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
         self._seen_ids: set[tuple[int, int]] = set()
+
+    def mark_activity(self, moment: datetime | None = None) -> None:
+        """Stamp the last human or bot message so idle detection can measure silence."""
+        self.last_activity = moment or datetime.now(timezone.utc).replace(tzinfo=None)
 
     def remember_message(self, chat_id: int, message_id: int) -> bool:
         key = (int(chat_id), int(message_id))
@@ -324,11 +335,21 @@ class FarmState:
             "topic": self.topic,
             "last_outgoing_message_id": self.last_outgoing_message_id,
             "account_participant_ids": self.account_participant_ids,
+            "used_archive_ids": {account: sorted(ids) for account, ids in self.used_archive_ids.items()},
         }
 
     def load(self, data: dict[str, Any]) -> None:
         self.chat_history = deque(data.get("chat_history", []), maxlen=60)
         self.account_contexts = {}
+        self.used_archive_ids = {}
+        raw_used = data.get("used_archive_ids")
+        if isinstance(raw_used, dict):
+            for account, ids in raw_used.items():
+                try:
+                    if account:
+                        self.used_archive_ids[str(account)] = {int(value) for value in ids or ()}
+                except (TypeError, ValueError):
+                    continue
         self.topic = data.get("topic", "общее общение")
         message_id = data.get("last_outgoing_message_id")
         self.last_outgoing_message_id = int(message_id) if message_id else None
@@ -918,15 +939,28 @@ def _human_message_for_turn(history: list[dict[str, Any]], turn_number: int) -> 
     return ""
 
 
-def _assigned_history_item(history: list[dict[str, Any]], turn_number: int) -> dict[str, Any] | None:
-    """Rotate through every usable message in this account's one assigned source archive."""
+def _assigned_history_item(
+    history: list[dict[str, Any]],
+    turn_number: int,
+    used_ids: set[int] | None = None,
+) -> dict[str, Any] | None:
+    """Rotate through every usable archive message, skipping the ones already spoken."""
     messages = [
         item for item in reversed(history)
         if len(_history_source_text(item)) >= 6 or _local_history_media_path(item)
     ]
     if not messages:
         return None
-    return messages[(max(1, int(turn_number)) - 1) % len(messages)]
+    offset = (max(1, int(turn_number)) - 1) % len(messages)
+    rotated = messages[offset:] + messages[:offset]
+    if used_ids:
+        for item in rotated:
+            message_id = item.get("message_id")
+            if message_id is None or int(message_id) not in used_ids:
+                return item
+        # Every assigned message was already used: start a new pass over the archive.
+        used_ids.clear()
+    return rotated[0]
 
 
 def _assigned_history_seed(history: list[dict[str, Any]], turn_number: int) -> str:
@@ -1485,74 +1519,111 @@ async def generate_history_dialogue_turn(
     *,
     account_name: str,
     global_prompt: str = "",
+    source_item: dict[str, Any] | None = None,
 ) -> str:
-    """Generate a topicless turn anchored strictly to this account's assigned archive."""
-    async with state.lock:
-        donor_history, live_history = _state_history_parts(state, account_name)
-        history = [*donor_history[-8:], *live_history[-60:]]
-        source_text = _assigned_history_seed(donor_history, turn_number)
-        source_context = build_context(deque(donor_history[-12:]), limit=12)
-        synthetic_turns = [item for item in live_history if item.get("direction") == "outgoing"][-8:]
-        conversation_context = build_context(deque(synthetic_turns), limit=8)
-    if not source_text:
-        return ""
-
-    previous_turn = (
-        _short_context_line(str(synthetic_turns[-1].get("text") or ""), 240)
-        if synthetic_turns else "(пока нет реплик)"
-    )
-    if bridge and getattr(bridge, "is_ready", False):
-        prompt = HISTORY_DIALOGUE_TURN_PROMPT.format(
-            persona=persona[:500],
-            global_prompt=global_prompt[:2000] or "соблюдай синтетическую роль и пиши естественно",
-            history_seed=_short_context_line(source_text, 360),
-            source_context=source_context,
-            conversation_context=conversation_context,
-            previous_turn=previous_turn,
+    """Speak with the assigned archive: one casual line per archive message, never twice."""
+    for attempt in range(3):
+        item = source_item if (source_item is not None and attempt == 0) else (
+            await next_history_turn_item(state, account_name, turn_number + attempt)
         )
-        try:
-            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
-            if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
-                return ""
-            rejected = bool(text) and (
-                _is_canned_reply(text)
-                or _is_circular_dialogue_reply(text)
-                or is_dialogue_echo(text, history)
-                or not _history_reply_is_anchored(text, source_context)
+        if item is None:
+            return ""
+        async with state.lock:
+            donor_history, live_history = _state_history_parts(state, account_name)
+            history = [*donor_history[-8:], *live_history[-60:]]
+            source_context = build_context(deque(donor_history[-12:]), limit=12)
+            synthetic_turns = [
+                row for row in live_history if row.get("direction") == "outgoing"
+            ][-8:]
+            conversation_context = build_context(deque(synthetic_turns), limit=8)
+        source_text = _history_source_text(item)
+        if not source_text:
+            continue
+
+        previous_turn = (
+            _short_context_line(str(synthetic_turns[-1].get("text") or ""), 240)
+            if synthetic_turns else "(пока нет реплик)"
+        )
+        text = ""
+        if bridge and getattr(bridge, "is_ready", False):
+            prompt = HISTORY_DIALOGUE_TURN_PROMPT.format(
+                persona=persona[:500],
+                global_prompt=global_prompt[:2000] or "соблюдай синтетическую роль и пиши естественно",
+                history_seed=_short_context_line(source_text, 360),
+                source_context=source_context,
+                conversation_context=conversation_context,
+                previous_turn=previous_turn,
             )
-            if rejected:
-                log.warning("[%s] history turn was generic or ungrounded; retrying once", persona[:32])
-                retry_prompt = (
-                    prompt
-                    + "\n\nПредыдущая реплика не опиралась на твой назначенный архив. Перепиши её, "
-                    "используя конкретный факт или слово из собственного исторического контекста. "
-                    "Не вводи новую тему и не копируй исходную формулировку."
-                )
-                text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+            try:
+                text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
                 if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
-                    return ""
-                if text and (
+                    text = ""
+                rejected = bool(text) and (
                     _is_canned_reply(text)
                     or _is_circular_dialogue_reply(text)
                     or is_dialogue_echo(text, history)
+                    or _line_already_sent(text, history)
                     or not _history_reply_is_anchored(text, source_context)
-                ):
-                    text = ""
-            if text:
-                return text
-        except Exception:
-            log.exception("[%s] history dialogue generation failed", persona[:32])
+                )
+                if rejected:
+                    log.warning("[%s] history turn was generic, repeated or ungrounded; retrying", persona[:32])
+                    retry_prompt = (
+                        prompt
+                        + "\n\nПредыдущая реплика повторяла уже сказанное или не опиралась на твой назначенный архив. "
+                        "Возьми другую деталь из архива и перескажи её иначе, своими словами. "
+                        "Не вводи новую тему и не копируй исходную формулировку."
+                    )
+                    text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                    if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
+                        text = ""
+                    if text and (
+                        _is_canned_reply(text)
+                        or _is_circular_dialogue_reply(text)
+                        or is_dialogue_echo(text, history)
+                        or _line_already_sent(text, history)
+                        or not _history_reply_is_anchored(text, source_context)
+                    ):
+                        text = ""
+            except Exception:
+                log.exception("[%s] history dialogue generation failed", persona[:32])
 
-    return _history_offline_turn(source_text, persona, history)
+        if not text:
+            text = _history_offline_turn(source_text, persona, history)
+        if text and not _line_already_sent(text, history):
+            return text
+        if text:
+            log.info("[%s] история: реплика уже звучала, беру следующее сообщение архива", persona[:32])
+    return ""
+
+
+def _normalize_line(text: str) -> str:
+    return " ".join(re.findall(r"[\w]+", str(text or "").casefold(), flags=re.UNICODE))
+
+
+def _line_already_sent(text: str, history: list[dict[str, Any]]) -> bool:
+    candidate = _normalize_line(text)
+    if len(candidate) < 8:
+        return False
+    for item in reversed(list(history)[-40:]):
+        if item.get("direction") != "outgoing":
+            continue
+        if _normalize_line(str(item.get("text") or "")) == candidate:
+            return True
+    return False
 
 
 async def next_history_turn_item(
-    state: FarmState, account_name: str, turn_number: int
+    state: FarmState, account_name: str, turn_number: int, *, reserve: bool = True
 ) -> dict[str, Any] | None:
     """Return the assigned archive message this turn is based on (text and/or media)."""
     async with state.lock:
         donor_history, _live_history = _state_history_parts(state, account_name)
-    return _assigned_history_item(donor_history, turn_number)
+        used_ids = state.used_archive_ids.setdefault(account_name, set())
+        item = _assigned_history_item(donor_history, turn_number, used_ids)
+        message_id = item.get("message_id") if item else None
+        if reserve and message_id is not None:
+            used_ids.add(int(message_id))
+    return item
 
 
 async def generate_reaction(bridge: Any, text: str) -> str:
@@ -1567,6 +1638,81 @@ async def generate_reaction(bridge: Any, text: str) -> str:
             pass
     return random.choice(["👍", "🔥", "❤️", "👏", "😁"])
     return random.choice(allowed)
+
+
+IDLE_LINES = (
+    "тихо стало 🙂",
+    "все пропали, да? 😄",
+    "ну что, кто живой 👀",
+    "тишина, только я тут 🙂",
+    "а че все молчат 😄",
+    "ну и тишина тут 👀",
+    "кто-нибудь ещё в сети? 🙂",
+    "вот это затишье 😄",
+)
+
+
+class MusicReposter:
+    """Repost tracks from a public music source without repeating the same one."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.track_ids: list[int] = []
+        self.cursor = 0
+        self.failed = False
+
+    async def refresh(self, clients: list[Any]) -> None:
+        if self.failed or not self.source:
+            return
+        for client in clients:
+            try:
+                found: list[int] = []
+                async for message in client.get_chat_history(self.source, limit=60):
+                    if getattr(message, "audio", None) or getattr(message, "voice", None):
+                        found.append(int(message.id))
+                    elif getattr(message, "document", None) and "audio" in str(
+                        getattr(message.document, "mime_type", "") or ""
+                    ):
+                        found.append(int(message.id))
+                    if len(found) >= 25:
+                        break
+                if found:
+                    random.shuffle(found)
+                    self.track_ids = found
+                    self.cursor = 0
+                    log.info("Музыка: доступно треков для репоста=%d из %s", len(found), self.source)
+                    return
+            except Exception:
+                log.warning("Музыка: источник %s не прочитан этим аккаунтом", self.source, exc_info=True)
+        self.failed = True
+        log.warning("Музыка: источник %s недоступен, репосты отключены", self.source)
+
+    def next_track(self) -> int | None:
+        if not self.track_ids:
+            return None
+        if self.cursor >= len(self.track_ids):
+            random.shuffle(self.track_ids)
+            self.cursor = 0
+        track_id = self.track_ids[self.cursor]
+        self.cursor += 1
+        return track_id
+
+    async def send(self, account: Any, reply_to: Any = None) -> bool:
+        track_id = self.next_track()
+        if track_id is None:
+            return False
+        try:
+            message = await account.client.copy_message(
+                from_chat_id=self.source,
+                message_id=track_id,
+                **account._send_kwargs(reply_to),
+            )
+            await account._record(message, "", "audio")
+            log.info("[%s] музыка: репост трека %s из %s", account.name, track_id, self.source)
+            return True
+        except Exception:
+            log.exception("[%s] музыка: не удалось отправить трек %s", account.name, track_id)
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1745,6 +1891,17 @@ class FarmAccount:
 
         text = self._message_text(message)
         is_question = self._looks_like_question(text)
+        # A message that answers one of our own lines is an invitation to keep talking.
+        reply_target = getattr(message, "reply_to_message_id", None)
+        if reply_target is not None:
+            async with self.state.lock:
+                direct_reply = any(
+                    item.get("direction") == "outgoing"
+                    and str(item.get("message_id")) == str(reply_target)
+                    for item in self.state.chat_history
+                )
+            if direct_reply:
+                is_question = True
         chat_id = int(message.chat.id)
         async with self.state.lock:
             if not self.state.remember_message(chat_id, int(message.id)):
@@ -1760,6 +1917,7 @@ class FarmAccount:
                 "is_question": is_question,
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
+            self.state.mark_activity()
 
         if night_mode_active(FARM_CFG.get("farm", {})):
             log.info(
@@ -1997,6 +2155,8 @@ class FarmAccount:
         kind: str,
     ) -> bool:
         """Send one readable dialogue turn and optionally attach/append configured media."""
+        if kind == "music":
+            return await self._send_turn_with_music(text, reply_to=reply_to)
         if kind == "text":
             return await self._send_text(text, reply_to=reply_to)
         if kind == "gif":
@@ -2156,8 +2316,10 @@ class FarmAccount:
                 return True
             if not allow_account_media:
                 return False
-            # A media-only turn still uses this account's gifs, stickers, photos or voice.
-            kind = self._pick_kind()
+            # A media-only turn still uses this account's gifs, stickers, photos, voice or music.
+            kind = self._plan_turn_media()
+            if kind == "music" and await self._send_music(reply_to=reply_to):
+                return True
             if kind == "text":
                 kind = random.choice(["gif", "sticker", "photo", "voice"])
             return await self._send_farm_media(kind, reply_to=reply_to)
@@ -2172,8 +2334,10 @@ class FarmAccount:
         if media_item:
             await self._send_history_media(media_item, reply_to=text_message_id)
         elif allow_account_media:
-            kind = self._pick_kind()
-            if kind != "text":
+            kind = self._plan_turn_media()
+            if kind == "music":
+                await self._send_music(reply_to=text_message_id)
+            elif kind != "text":
                 await self._send_farm_media(kind, reply_to=text_message_id, caption=text)
         # Keep the text turn as the chain anchor rather than a captionless attachment.
         async with self.state.lock:
@@ -2184,6 +2348,53 @@ class FarmAccount:
         kinds = list(self.media_bias)
         weights = [self.media_bias[kind] for kind in kinds]
         return random.choices(kinds, weights=weights, k=1)[0]
+
+    def _turn_media_share(self, key: str, default: int = 0) -> float:
+        try:
+            value = float(FARM_CFG.get("farm", {}).get(key, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        return value / 100.0 if math.isfinite(value) else default / 100.0
+
+    def _plan_turn_media(self) -> str:
+        """Pick this turn's media: a music repost, a boosted gif, or the weighted kind."""
+        farm_cfg = FARM_CFG.get("farm", {})
+        if (
+            farm_cfg.get("music_enabled")
+            and getattr(self, "music", None) is not None
+            and random.random() < self._turn_media_share("music_share_percent")
+        ):
+            return "music"
+        if random.random() < self._turn_media_share("gif_share_percent"):
+            return "gif"
+        return self._pick_kind()
+
+    async def _send_music(self, reply_to: TGMessage | int | None = None) -> bool:
+        reposter = getattr(self, "music", None)
+        if reposter is None:
+            return False
+        return await reposter.send(self, reply_to)
+
+    async def _send_turn_with_music(
+        self,
+        text: str,
+        *,
+        reply_to: TGMessage | int | None,
+    ) -> bool:
+        """Post the turn text and, separately, a reposted track."""
+        text = str(text or "").strip()
+        if not text:
+            return await self._send_music(reply_to=reply_to)
+        sent = await self._send_text(text, reply_to=reply_to)
+        if not sent:
+            return False
+        async with self.state.lock:
+            text_message_id = self.state.last_outgoing_message_id
+        if text_message_id:
+            await self._send_music(reply_to=text_message_id)
+            async with self.state.lock:
+                self.state.last_outgoing_message_id = text_message_id
+        return True
 
     def _send_kwargs(self, reply_to: TGMessage | int | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"chat_id": int(FARM_CFG["target_chat_id"])}
@@ -2382,6 +2593,7 @@ class FarmAccount:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
             self.state.last_outgoing_message_id = int(msg.id)
+            self.state.mark_activity()
 
 
 async def run_scenario(
@@ -2492,6 +2704,7 @@ async def run_scenario(
                     turn_number,
                     account_name=account.name,
                     global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
+                    source_item=source_item,
                 )
             # With no safe text, fall back to the media from that same archive message.
             media_item = account._pick_history_media(
@@ -2530,7 +2743,7 @@ async def run_scenario(
                 global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
                 account_name=account.name,
             )
-            kind = account._pick_kind()
+            kind = account._plan_turn_media()
             async with state.outgoing_lock:
                 async with state.lock:
                     reply_to = state.last_outgoing_message_id
@@ -2723,6 +2936,59 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
     return local_cfg, farm_settings
 
 
+async def idle_activity_tick(
+    accounts: list[Any],
+    state: FarmState,
+    settings: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Post one low-noise line when the chat has been silent for too long.
+
+    Only a single account speaks per idle window and they take turns, so a quiet
+    room is revived by a rotating voice instead of the whole farm at once.
+    """
+    if not settings.get("idle_enabled") or not accounts:
+        return False
+    moment = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    if night_mode_active(settings, moment):
+        return False
+    idle_after = int(settings.get("idle_after_sec") or 900)
+    cooldown = int(settings.get("idle_cooldown_sec") or 600)
+    async with state.lock:
+        last_seen = state.last_activity or state.started_at
+    silence = (moment - last_seen).total_seconds()
+    if silence < idle_after:
+        return False
+    if state.last_idle_post is not None:
+        since_last_idle = (moment - state.last_idle_post).total_seconds()
+        if since_last_idle < cooldown:
+            return False
+    state.last_idle_post = moment
+    account = accounts[state.idle_cursor % len(accounts)]
+    state.idle_cursor = (state.idle_cursor + 1) % len(accounts)
+    async with state.lock:
+        recent = list(state.chat_history)
+    text = _choose_fresh_fallback(
+        IDLE_LINES, [item.get("text", "") for item in recent], len(recent) + 1, "эту тему"
+    )
+    use_gif = random.random() < (int(settings.get("idle_gif_percent") or 0) / 100.0)
+    posted = False
+    async with state.outgoing_lock:
+        if use_gif:
+            posted = bool(await account._send_farm_media("gif", reply_to=None))
+        if not posted:
+            posted = bool(await account._send_text(text))
+        if posted:
+            log.info("[idle] %s оживил чат после %.0f с тишины", account.name, silence)
+        else:
+            log.info("[idle] %s не смог отправить оживление", account.name)
+    if posted:
+        async with state.lock:
+            state.mark_activity(moment)
+    return posted
+
+
 async def run_farm() -> None:
     global FARM_CFG
 
@@ -2739,6 +3005,20 @@ async def run_farm() -> None:
         log.info(
             "Ночной режим включён: %s UTC — ходы, автономные сообщения, реакции и ответы приостановлены",
             night_mode_label(farm_settings),
+        )
+    if farm_settings.get("idle_enabled"):
+        log.info(
+            "Простой чата: оживление после %s с тишины, пауза между оживлениями %s с, гифок %s%% — пишет один аккаунт по очереди",
+            farm_settings["idle_after_sec"],
+            farm_settings["idle_cooldown_sec"],
+            farm_settings["idle_gif_percent"],
+        )
+    if farm_settings.get("music_enabled"):
+        log.info(
+            "Музыка: репост из %s, доля музыки %s%%, доля гифок %s%%",
+            farm_settings["music_source"],
+            farm_settings["music_share_percent"],
+            farm_settings["gif_share_percent"],
         )
     if scenario_mode == "reactive":
         log.info(
@@ -2923,6 +3203,7 @@ async def run_farm() -> None:
     saver: asyncio.Task | None = None
     watchdog: asyncio.Task | None = None
     reactor: asyncio.Task | None = None
+    idler: asyncio.Task | None = None
     scenario_task: asyncio.Task | None = None
     try:
         for account_cfg in FARM_CFG["accounts"]:
@@ -2966,6 +3247,14 @@ async def run_farm() -> None:
                 )
         for account in accounts:
             account.farm_accounts = accounts
+            account.music = None
+
+        if farm_settings.get("music_enabled"):
+            music = MusicReposter(str(farm_settings.get("music_source") or "@sad_tracky"))
+            await music.refresh([account.client for account in accounts if account.client is not None])
+            if music.track_ids:
+                for account in accounts:
+                    account.music = music
 
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
         if scenario_mode == "reactive":
@@ -3022,14 +3311,29 @@ async def run_farm() -> None:
                 except Exception:
                     log.exception("reaction_worker err")
 
+        async def idle_activity_worker() -> None:
+            """Keep the room alive when nobody writes: one account joins at a time."""
+            while True:
+                try:
+                    await asyncio.sleep(20)
+                except asyncio.CancelledError:
+                    break
+                try:
+                    await idle_activity_tick(accounts, state, farm_settings)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("idle_activity_worker err")
+
         saver = asyncio.create_task(autosave(), name="farm-autosave")
         if bridge:
             watchdog = asyncio.create_task(bridge_watchdog(), name="farm-watchdog")
         reactor = asyncio.create_task(reaction_worker(), name="farm-reactor")
+        idler = asyncio.create_task(idle_activity_worker(), name="farm-idle")
         await stop_event.wait()
 
     finally:
-        active_tasks = [task for task in (saver, watchdog, reactor, scenario_task) if task is not None]
+        active_tasks = [task for task in (saver, watchdog, reactor, idler, scenario_task) if task is not None]
         for task in active_tasks:
             task.cancel()
         if active_tasks:

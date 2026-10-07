@@ -382,6 +382,64 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
 
         account._answer_incoming.assert_awaited_once_with(message, "Спасибо, ответ помог.")
 
+    async def test_history_mode_joins_a_dialogue_when_someone_answers_our_line(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "history_dialogue"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = farm.FarmState()
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        account.state.chat_history.append(
+            {"author": "unit", "text": "Я писал про море", "message_id": 77, "direction": "outgoing"}
+        )
+        message = types.SimpleNamespace(
+            id=83,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=205, is_bot=False, username="tester", first_name="Test"),
+            text="Согласен, море реально шумит",
+            reply_to_message_id=77,
+        )
+
+        with patch.object(farm.random, "random", return_value=0):
+            await account._on_incoming(None, message)
+        await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_awaited_once_with(message, "Согласен, море реально шумит")
+
+    async def test_history_mode_ignores_a_plain_incoming_line_without_stopping_it(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "history_dialogue"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = farm.FarmState()
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=84,
+            empty=False,
+            service=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=206, is_bot=False, username="tester", first_name="Test"),
+            text="Просто делюсь новостью без вопроса",
+        )
+
+        with patch.object(farm.random, "random", return_value=0):
+            await account._on_incoming(None, message)
+        await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_not_awaited()
+        self.assertEqual(account.state.chat_history[-1]["text"], "Просто делюсь новостью без вопроса")
+        self.assertIsNotNone(account.state.last_activity)
+
     def test_forum_topic_uses_reply_to_top_message_id(self):
         farm.FARM_CFG["topic_id"] = 42
         account = farm.FarmAccount.__new__(farm.FarmAccount)
