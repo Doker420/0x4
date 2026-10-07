@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from fastapi import Cookie, FastAPI, File, Form, HTTPException, Request, UploadF
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import auth, chat_context, db, giphy, manager, mass_actions, tasks
+from . import auth, channels, chat_context, db, giphy, manager, mass_actions, tasks
 from .config import (
     DEFAULT_FARM_SETTINGS,
     DEFAULT_MEDIA_BIAS,
@@ -216,15 +217,34 @@ def _seconds_field(value: float, label: str, low: int = 60, high: int = 86400) -
     return int(round(result))
 
 
+async def _persist_farm_switches(**values: Any) -> None:
+    """Save the behaviour toggles that the chat page exposes next to the farm start button."""
+    raw = await db.get_setting("farm_settings", "")
+    try:
+        current = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        current = {}
+    if not isinstance(current, dict):
+        current = {}
+    current.update(values)
+    await db.set_setting("farm_settings", json.dumps(load_farm_settings(current), ensure_ascii=False))
+
+
 def _safe_error(exc: Exception) -> str:
     return str(exc).strip()[:300] or type(exc).__name__
 
 
 # ─── Lifecycle ───
+CHANNEL_SCHEDULER: asyncio.Task | None = None
+
+
 @app.on_event("startup")
 async def _startup() -> None:
+    global CHANNEL_SCHEDULER
     await db.init_db()
     await tasks.runner.start()
+    if CHANNEL_SCHEDULER is None:
+        CHANNEL_SCHEDULER = asyncio.create_task(channels.scheduler_loop(), name="channel-scheduler")
     try:
         await ai.start()
     except Exception:
@@ -233,7 +253,11 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global FARM_PROCESS, FARM_LOG_TASK
+    global FARM_PROCESS, FARM_LOG_TASK, CHANNEL_SCHEDULER
+    if CHANNEL_SCHEDULER is not None:
+        CHANNEL_SCHEDULER.cancel()
+        await asyncio.gather(CHANNEL_SCHEDULER, return_exceptions=True)
+        CHANNEL_SCHEDULER = None
     await tasks.runner.stop()
     process = FARM_PROCESS
     if process is not None and process.returncode is None:
@@ -879,6 +903,9 @@ async def api_chatfarm_start(
     rest_max_sec: int = Form(default=120),
     roulette_numbers: str = Form(default="0-36"),
     post_opening: Optional[str] = Form(default=None),
+    proactive_enabled: Optional[str] = Form(default=None),
+    followups_enabled: Optional[str] = Form(default=None),
+    followups_max: int = Form(default=DEFAULT_FARM_SETTINGS["followups_max"]),
     automation_ack: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
 ):
@@ -1020,8 +1047,17 @@ async def api_chatfarm_start(
         "rest_max_sec": 120 if behavior_only else rest_max_sec,
         "roulette_numbers": "0-36" if behavior_only else roulette_numbers.strip(),
         "post_opening": not behavior_only and not topicless_history_dialogue and post_opening is not None,
+        "proactive_enabled": proactive_enabled is not None,
+        "followups_enabled": followups_enabled is not None,
+        "followups_max": max(0, min(3, int(followups_max))),
         "automation_acknowledged": automation_ack is not None,
     }
+    # Keep these switches where they are used: the same toggles live in «Поведение».
+    await _persist_farm_switches(
+        proactive_enabled=proactive_enabled is not None,
+        followups_enabled=followups_enabled is not None,
+        followups_max=max(0, min(3, int(followups_max))),
+    )
     history_invite_token = (
         _store_invite_reference(history_source_reference)
         if collect_history and history_source_reference and history_source_reference.get("invite_hash")
@@ -1153,6 +1189,9 @@ async def _h_start_chatfarm(payload: dict) -> dict:
         "FARM_OVERRIDE_REST_MAX": str(payload.get("rest_max_sec", 120)),
         "FARM_OVERRIDE_ROULETTE_NUMBERS": str(payload.get("roulette_numbers", "0-36")),
         "FARM_OVERRIDE_POST_OPENING": "1" if payload.get("post_opening", True) else "0",
+        "FARM_OVERRIDE_PROACTIVE": "1" if payload.get("proactive_enabled") else "0",
+        "FARM_OVERRIDE_FOLLOWUPS": "1" if payload.get("followups_enabled") else "0",
+        "FARM_OVERRIDE_FOLLOWUPS_MAX": str(int(payload.get("followups_max", 2) or 0)),
     })
     await manager.manager.prepare_for_farm()
     try:
@@ -1266,7 +1305,11 @@ async def api_post_comment(
 async def mass_page(request: Request, web_auth: Optional[str] = Cookie(default=None)):
     _current_owner(web_auth)
     accounts = [_account_for_ui(row) for row in await db.list_accounts(enabled_only=True)]
-    return _render(request, "mass.html", {"accounts": accounts})
+    return _render(request, "mass.html", {
+        "accounts": accounts,
+        "channels": await db.list_channels(),
+        "server_utc_now": datetime.now(timezone.utc).strftime("%H:%M"),
+    })
 
 
 @app.post("/api/mass/join")
@@ -1306,6 +1349,166 @@ async def api_create_group(
     _current_owner(web_auth)
     task_id = await tasks.runner.submit("create_group", {"account": account, "title": title})
     return {"ok": True, "task_id": task_id}
+
+
+# ─── Channels ───
+@app.post("/api/channels/create")
+async def api_channel_create(
+    account: str = Form(...),
+    title: str = Form(...),
+    about: str = Form(default=""),
+    username: str = Form(default=""),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    title = title.strip()
+    if not title:
+        raise HTTPException(422, "Укажите название канала")
+    if len(title) > 255:
+        raise HTTPException(422, "Название канала: максимум 255 символов")
+    description = about.strip()
+    if len(description) > 255:
+        raise HTTPException(422, "Описание канала: максимум 255 символов")
+    clean_username = username.strip().lstrip("@")
+    if clean_username and not re.fullmatch(r"[A-Za-z0-9_]{5,32}", clean_username):
+        raise HTTPException(
+            422, "Публичный username: только латиница, цифры и подчёркивание, от 5 до 32 символов"
+        )
+    task_id = await tasks.runner.submit(
+        "channel_create",
+        {"account": account, "title": title, "about": description, "username": clean_username},
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/channels/{channel_id}/profile")
+async def api_channel_profile(
+    channel_id: int,
+    title: str = Form(default=""),
+    about: str = Form(default=""),
+    username: str = Form(default=""),
+    make_public: Optional[str] = Form(default=None),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    channel = await db.get_channel(channel_id)
+    if not channel:
+        raise HTTPException(404, "Канал не найден")
+    clean_username = username.strip().lstrip("@")
+    if clean_username and not re.fullmatch(r"[A-Za-z0-9_]{5,32}", clean_username):
+        raise HTTPException(
+            422, "Публичный username: только латиница, цифры и подчёркивание, от 5 до 32 символов"
+        )
+    if make_public is not None and not clean_username:
+        raise HTTPException(422, "Для публичного канала укажите username")
+    if len(about.strip()) > 255:
+        raise HTTPException(422, "Описание канала: максимум 255 символов")
+    task_id = await tasks.runner.submit(
+        "channel_update",
+        {
+            "channel_id": int(channel_id),
+            "title": title.strip(),
+            "about": about.strip(),
+            "username": clean_username,
+            "make_public": make_public is not None,
+        },
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/channels/{channel_id}/settings")
+async def api_channel_settings(
+    channel_id: int,
+    repost_enabled: Optional[str] = Form(default=None),
+    repost_source: str = Form(default=""),
+    repost_interval_min: int = Form(default=60),
+    repost_limit: int = Form(default=5),
+    post_enabled: Optional[str] = Form(default=None),
+    post_source: str = Form(default="saved"),
+    post_bot: str = Form(default="@post"),
+    post_text: str = Form(default=""),
+    post_time: str = Form(default="10:00"),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    if not await db.get_channel(channel_id):
+        raise HTTPException(404, "Канал не найден")
+    try:
+        values = channels.normalize_channel_settings(
+            repost_enabled=repost_enabled is not None,
+            repost_source=repost_source,
+            repost_interval_min=repost_interval_min,
+            repost_limit=repost_limit,
+            post_enabled=post_enabled is not None,
+            post_source=post_source,
+            post_bot=post_bot,
+            post_text=post_text,
+            post_time=post_time,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    await db.update_channel(channel_id, **values)
+    return {"ok": True, "channel": await db.get_channel(channel_id)}
+
+
+@app.post("/api/channels/{channel_id}/repost")
+async def api_channel_repost(
+    channel_id: int,
+    source: str = Form(default=""),
+    limit: int = Form(default=0),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    if not await db.get_channel(channel_id):
+        raise HTTPException(404, "Канал не найден")
+    task_id = await tasks.runner.submit(
+        "channel_repost",
+        {
+            "channel_id": int(channel_id),
+            "source": source.strip(),
+            "limit": max(0, min(channels.REPOST_MAX_LIMIT, int(limit or 0))),
+        },
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/channels/{channel_id}/post")
+async def api_channel_post(
+    channel_id: int,
+    source: str = Form(default=""),
+    bot: str = Form(default=""),
+    text: str = Form(default=""),
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    channel = await db.get_channel(channel_id)
+    if not channel:
+        raise HTTPException(404, "Канал не найден")
+    source_kind = (source.strip() or str(channel.get("post_source") or "saved")).lower()
+    if source_kind not in channels.POST_SOURCES:
+        raise HTTPException(422, "Источник поста: «Избранное» или бот")
+    task_id = await tasks.runner.submit(
+        "channel_post",
+        {
+            "channel_id": int(channel_id),
+            "source": source_kind,
+            "bot": bot.strip(),
+            "text": text.strip()[:4000],
+        },
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/channels/{channel_id}/delete")
+async def api_channel_delete(
+    channel_id: int,
+    web_auth: Optional[str] = Cookie(default=None),
+):
+    _current_owner(web_auth)
+    if not await db.get_channel(channel_id):
+        raise HTTPException(404, "Канал не найден")
+    await db.delete_channel(channel_id)
+    return {"ok": True}
 
 
 # ─── Parser ───
@@ -1385,6 +1588,8 @@ async def api_settings_save(
     qa_probability: float = Form(default=0.25),
     clone_probability: float = Form(default=0.25),
     proactive_enabled: Optional[str] = Form(default=None),
+    followups_enabled: Optional[str] = Form(default=None),
+    followups_max: int = Form(default=DEFAULT_FARM_SETTINGS["followups_max"]),
     typing_simulation: Optional[str] = Form(default=None),
     deepseek_model: str = Form(default="default"),
     deepseek_thinking: Optional[str] = Form(default=None),
@@ -1438,6 +1643,8 @@ async def api_settings_save(
         "qa_probability": _probability(qa_probability, "Вероятность Q&A"),
         "clone_probability": _probability(clone_probability, "Вероятность диалогов"),
         "proactive_enabled": proactive_enabled is not None,
+        "followups_enabled": followups_enabled is not None,
+        "followups_max": max(0, min(3, int(followups_max))),
         "typing_simulation": typing_simulation is not None,
         "deepseek_model": model,
         "deepseek_thinking": deepseek_thinking is not None,

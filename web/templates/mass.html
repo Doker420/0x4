@@ -19,9 +19,63 @@
     <div class="field"><label>Название группы</label><input name="title" placeholder="Название" required></div>
     <button type="submit" class="secondary">Создать группу</button>
   </form></section>
+  <section class="card"><h2>Создать канал</h2><form onsubmit="runAction('/api/channels/create',event)">
+    <div class="field"><label>Аккаунт-создатель</label><select name="account" required>{% for a in accounts %}<option value="{{ a.name }}">{{ a.name }}</option>{% endfor %}</select></div>
+    <div class="field"><label>Название канала</label><input name="title" maxlength="255" placeholder="Название" required></div>
+    <div class="field"><label>Описание канала (bio)</label><input name="about" maxlength="255" placeholder="О чём канал"><span class="help">Попадает в шапку канала; до 255 символов.</span></div>
+    <div class="field"><label>Публичный username <span class="subtle">(необязательно)</span></label><input name="username" placeholder="my_channel" pattern="[A-Za-z0-9_]{5,32}"><span class="help">Если указать — канал сразу станет публичным: t.me/username. Username можно изменить ниже.</span></div>
+    <button type="submit" class="secondary">Создать канал</button>
+  </form></section>
 </div>
+<section class="card" style="margin-top:16px">
+  <div class="card-head"><div><h2>Мои каналы</h2><p class="subtle">Оформление, репостинг из другого канала и ежедневный пост. Время указывается по серверу в UTC — сейчас <strong>{{ server_utc_now }} UTC</strong>. Расписание выполняется автоматически, пока запущена панель.</p></div></div>
+  {% for c in channels %}
+    <div class="card compact" style="margin:12px 0;background:rgba(8,15,23,.48)">
+      <div class="card-head"><div><h3>{{ c.title or ('Канал ' ~ c.chat_id) }}</h3><p class="subtle">{{ '@' + c.username if c.username else 'приватный канал' }} · ID {{ c.chat_id }} · управляет аккаунт {{ c.account }}</p></div></div>
+      <form onsubmit="runAction('/api/channels/{{ c.id }}/profile',event)" class="grid-2">
+        <div class="field"><label>Название</label><input name="title" maxlength="255" value="{{ c.title or '' }}"></div>
+        <div class="field"><label>Описание (bio)</label><input name="about" maxlength="255" value="{{ c.about or '' }}"></div>
+        <div class="field"><label>Публичный username</label><input name="username" value="{{ c.username or '' }}" placeholder="my_channel" pattern="[A-Za-z0-9_]{5,32}"><span class="help">Оставьте пустым и отметьте чекбокс — если нужно снять публичность.</span></div>
+        <label class="check-row" style="align-items:flex-end"><input type="checkbox" name="make_public"><span>Сделать канал публичным (применить username)</span></label>
+        <button type="submit" class="secondary">Сохранить оформление</button>
+      </form>
+      <form onsubmit="saveChannelSettings(event, {{ c.id }})" style="margin-top:14px">
+        <label class="check-row"><input type="checkbox" name="repost_enabled" {% if c.repost_enabled %}checked{% endif %}><span>Репостинг из другого канала в свой</span></label>
+        <div class="grid-2">
+          <div class="field"><label>Канал-источник</label><input name="repost_source" value="{{ c.repost_source or '' }}" placeholder="@channel, ссылка или ID"><span class="help">Аккаунту нужен доступ к истории источника.</span></div>
+          <div class="field"><label>Проверять каждые, мин</label><input name="repost_interval_min" type="number" min="5" max="1440" value="{{ c.repost_interval_min or 60 }}"></div>
+          <div class="field"><label>Сколько новых постов за раз</label><input name="repost_limit" type="number" min="1" max="50" value="{{ c.repost_limit or 5 }}"></div>
+        </div>
+        <span class="help">Новые посты копируются в ваш канал как собственные, без ссылки на источник, по одному с паузой.</span>
+        <label class="check-row" style="margin-top:10px"><input type="checkbox" name="post_enabled" {% if c.post_enabled %}checked{% endif %}><span>Ежедневный пост</span></label>
+        <div class="grid-2">
+          <div class="field"><label>Откуда брать пост</label><select name="post_source">
+            <option value="saved" {% if (c.post_source or 'saved') == 'saved' %}selected{% endif %}>Последний пост из «Избранного»</option>
+            <option value="bot" {% if c.post_source == 'bot' %}selected{% endif %}>Через бот (@post)</option>
+          </select></div>
+          <div class="field"><label>Бот для публикации</label><input name="post_bot" value="{{ c.post_bot or '@post' }}"><span class="help">Бот должен быть админом канала и привязан к нему; аккаунт отправляет ему текст.</span></div>
+          <div class="field"><label>Время поста, UTC</label><input name="post_time" type="time" step="60" value="{{ c.post_time or '10:00' }}"></div>
+          <div class="field"><label>Текст для бота</label><input name="post_text" maxlength="4000" value="{{ c.post_text or '' }}" placeholder="Текст, который уйдёт боту"></div>
+        </div>
+        <span class="help">Один пост в сутки: как только наступает указанное время UTC, публикуется то, что ещё не публиковалось.</span>
+        <button type="submit">Сохранить расписание</button>
+      </form>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <form onsubmit="runAction('/api/channels/{{ c.id }}/repost',event)"><button type="submit" class="secondary small">Репост сейчас</button></form>
+        <form onsubmit="runAction('/api/channels/{{ c.id }}/post',event)"><button type="submit" class="secondary small">Опубликовать сейчас</button></form>
+        <form onsubmit="deleteChannel(event, {{ c.id }})"><button type="submit" class="secondary small">Убрать из панели</button></form>
+      </div>
+    </div>
+  {% else %}
+    <p class="subtle">Каналов пока нет. Создайте первый блоком «Создать канал» выше — он появится здесь с настройками.</p>
+  {% endfor %}
+</section>
 <div id="mass_output" class="notice" hidden></div>
 <script>
 async function runAction(url,event){event.preventDefault();const output=document.getElementById('mass_output');showMessage(output,'Добавляю задачу…');try{const data=await postForm(url,event.target);showMessage(output,`Задача №${data.task_id} добавлена.`, 'success');}catch(error){showMessage(output,error.message,'error');}}
+
+async function saveChannelSettings(event,id){event.preventDefault();const output=document.getElementById('mass_output');showMessage(output,'Сохраняю настройки канала…');try{await postForm(`/api/channels/${id}/settings`,event.target);showMessage(output,'Настройки канала сохранены.','success');setTimeout(()=>location.reload(),700);}catch(error){showMessage(output,error.message,'error');}}
+
+async function deleteChannel(event,id){event.preventDefault();if(!confirm('Убрать канал из панели? Сам канал в Telegram останется, расписание перестанет работать.'))return;const output=document.getElementById('mass_output');try{await postForm(`/api/channels/${id}/delete`,event.target);showMessage(output,'Канал убран из панели.','success');setTimeout(()=>location.reload(),700);}catch(error){showMessage(output,error.message,'error');}}
 </script>
 {% endblock %}

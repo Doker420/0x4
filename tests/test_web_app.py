@@ -821,6 +821,141 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('name="gif_share_percent"', page.text)
         self.assertIn("@sad_tracky", page.text)
 
+    async def test_chatfarm_start_persists_autonomous_and_followup_switches(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        payload = {
+            "accounts": "alpha",
+            "target_id": "-1001234567890",
+            "automation_ack": "on",
+            "proactive_enabled": "on",
+            "followups_enabled": "on",
+            "followups_max": "9",
+        }
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=91) as submit:
+            response = await self.client.post("/api/chatfarm/start", data=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        submitted = submit.await_args.args[1]
+        self.assertTrue(submitted["proactive_enabled"])
+        self.assertTrue(submitted["followups_enabled"])
+        self.assertEqual(submitted["followups_max"], 3)
+
+        farm_settings = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertTrue(farm_settings["proactive_enabled"])
+        self.assertTrue(farm_settings["followups_enabled"])
+        self.assertEqual(farm_settings["followups_max"], 3)
+
+        # Unchecked boxes turn the same switches off and stay saved.
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=92) as submit:
+            response = await self.client.post(
+                "/api/chatfarm/start",
+                data={key: value for key, value in payload.items() if key not in {
+                    "proactive_enabled", "followups_enabled", "followups_max"
+                }},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        submitted = submit.await_args.args[1]
+        self.assertFalse(submitted["proactive_enabled"])
+        self.assertFalse(submitted["followups_enabled"])
+        farm_settings = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertFalse(farm_settings["proactive_enabled"])
+
+    async def test_behaviour_page_exposes_autonomous_messages_switch(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        chatfarm = await self.client.get("/chatfarm")
+        self.assertIn('name="proactive_enabled"', chatfarm.text)
+        self.assertIn('name="followups_enabled"', chatfarm.text)
+        self.assertIn("Автономные сообщения", chatfarm.text)
+
+        page = await self.client.get("/settings")
+        self.assertIn("Автономные сообщения", page.text)
+        self.assertIn('name="proactive_enabled"', page.text)
+        self.assertIn('name="followups_max"', page.text)
+
+        saved = await self.client.post("/api/settings/save", data={
+            "min_delay_sec": "1",
+            "max_delay_sec": "3",
+            "followups_enabled": "on",
+            "followups_max": "7",
+        })
+        self.assertEqual(saved.status_code, 200, saved.text)
+        farm_settings = (await self.client.get("/api/settings")).json()["farm"]
+        self.assertTrue(farm_settings["followups_enabled"])
+        self.assertEqual(farm_settings["followups_max"], 3)
+
+    async def test_channel_endpoints_create_schedule_and_remove(self):
+        await db.upsert_account(
+            "creator", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        bad_username = await self.client.post("/api/channels/create", data={
+            "account": "creator", "title": "Новости", "username": "bad name!",
+        })
+        self.assertEqual(bad_username.status_code, 422)
+        self.assertIn("username", bad_username.json()["detail"].lower())
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=120) as submit:
+            created = await self.client.post("/api/channels/create", data={
+                "account": "creator", "title": "Новости", "about": "Коротко о главном",
+                "username": "daily_news",
+            })
+        self.assertEqual(created.status_code, 200, created.text)
+        submitted = submit.await_args.args[1]
+        self.assertEqual(submitted["username"], "daily_news")
+        self.assertEqual(submitted["about"], "Коротко о главном")
+
+        channel_id = await db.add_channel("creator", -1001777000001, title="Новости")
+
+        page = await self.client.get("/mass")
+        self.assertIn("Создать канал", page.text)
+        self.assertIn("Мои каналы", page.text)
+        self.assertIn("Ежедневный пост", page.text)
+        self.assertIn("Репостинг из другого канала в свой", page.text)
+        self.assertIn("Новости", page.text)
+        self.assertIn("UTC", page.text)
+        schedule = await self.client.post(f"/api/channels/{channel_id}/settings", data={
+            "repost_enabled": "on",
+            "repost_source": "@news",
+            "repost_interval_min": "1",
+            "repost_limit": "500",
+            "post_enabled": "on",
+            "post_source": "bot",
+            "post_bot": "post",
+            "post_text": "Доброе утро",
+            "post_time": "9:05",
+        })
+        self.assertEqual(schedule.status_code, 200, schedule.text)
+        channel = schedule.json()["channel"]
+        self.assertEqual(channel["repost_interval_min"], 5)
+        self.assertEqual(channel["repost_limit"], 50)
+        self.assertEqual(channel["post_bot"], "@post")
+        self.assertEqual(channel["post_time"], "09:05")
+
+        bad_time = await self.client.post(f"/api/channels/{channel_id}/settings", data={
+            "post_enabled": "on", "post_time": "7:5",
+        })
+        self.assertEqual(bad_time.status_code, 422)
+        self.assertIn("ЧЧ:ММ", bad_time.json()["detail"])
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=121) as submit:
+            repost = await self.client.post(f"/api/channels/{channel_id}/repost")
+            post = await self.client.post(f"/api/channels/{channel_id}/post", data={"source": "saved"})
+        self.assertEqual(repost.status_code, 200, repost.text)
+        self.assertEqual(post.status_code, 200, post.text)
+        self.assertEqual(submit.await_args.args[1]["source"], "saved")
+
+        bad_source = await self.client.post(f"/api/channels/{channel_id}/post", data={"source": "unknown"})
+        self.assertEqual(bad_source.status_code, 422)
+
+        missing = await self.client.post("/api/channels/999999/settings", data={"post_time": "10:00"})
+        self.assertEqual(missing.status_code, 404)
+
+        removed = await self.client.post(f"/api/channels/{channel_id}/delete")
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertIsNone(await db.get_channel(channel_id))
+
     async def test_protected_page_redirects_without_cookie(self):
         unauthenticated = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"

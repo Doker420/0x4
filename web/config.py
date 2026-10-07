@@ -23,6 +23,8 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "qa_probability": 0.25,
     "clone_probability": 0.25,
     "proactive_enabled": False,
+    "followups_enabled": True,
+    "followups_max": 2,
     "typing_simulation": True,
     "deepseek_model": "default",
     "deepseek_thinking": False,
@@ -155,6 +157,8 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
 
     settings["agent_prompt"] = str(settings.get("agent_prompt") or DEFAULT_FARM_SETTINGS["agent_prompt"]).strip()[:5000]
     settings["proactive_enabled"] = _as_bool(settings.get("proactive_enabled"))
+    settings["followups_enabled"] = _as_bool(settings.get("followups_enabled"))
+    settings["followups_max"] = _bounded_int(settings.get("followups_max"), 2, 0, 3)
     settings["typing_simulation"] = _as_bool(settings.get("typing_simulation"))
     settings["deepseek_thinking"] = _as_bool(settings.get("deepseek_thinking"))
     settings["deepseek_search"] = _as_bool(settings.get("deepseek_search"))

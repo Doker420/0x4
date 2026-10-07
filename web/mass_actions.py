@@ -87,6 +87,148 @@ async def create_channel(name: str, title: str, about: str = "") -> Dict[str, An
     return {"id": chat.id, "title": chat.title}
 
 
+# ─── Каналы: создание, оформление, репостинг, ежедневный пост ───
+async def create_channel_full(
+    name: str,
+    title: str,
+    about: str = "",
+    username: str = "",
+) -> Dict[str, Any]:
+    """Create a channel, fill its description and optionally make it public."""
+    client = await manager.get_client(name)
+    chat = await client.create_channel(title, about or "")
+    result: Dict[str, Any] = {"id": int(chat.id), "title": chat.title, "username": "", "about": about or ""}
+    if about:
+        try:
+            await client.set_chat_description(int(chat.id), about)
+        except Exception as exc:
+            log.warning("create_channel: не удалось задать описание: %s", exc)
+            result["about_error"] = str(exc)
+    if username:
+        clean = str(username).strip().lstrip("@")
+        if clean:
+            try:
+                await client.set_chat_username(int(chat.id), clean)
+                result["username"] = clean
+            except Exception as exc:
+                log.warning("create_channel: не удалось задать публичный username: %s", exc)
+                result["username_error"] = str(exc)
+    return result
+
+
+async def update_channel_profile(
+    name: str,
+    chat_ref: int | str,
+    *,
+    title: str = "",
+    about: str = "",
+    username: str = "",
+    make_public: bool = False,
+) -> Dict[str, Any]:
+    """Change a channel/chat title, bio (description) and public username."""
+    client = await manager.get_client(name)
+    result: Dict[str, Any] = {}
+    if title:
+        await client.set_chat_title(chat_ref, title)
+        result["title"] = title
+    if about:
+        await client.set_chat_description(chat_ref, about)
+        result["about"] = about
+    if make_public:
+        clean = str(username).strip().lstrip("@")
+        if not clean:
+            raise ValueError("Для публичного канала укажите username")
+        await client.set_chat_username(chat_ref, clean)
+        result["username"] = clean
+    elif username:
+        clean = str(username).strip().lstrip("@")
+        await client.set_chat_username(chat_ref, clean or None)
+        result["username"] = clean
+    return result
+
+
+async def repost_new_posts(
+    name: str,
+    source_ref: str | int,
+    target_ref: str | int,
+    limit: int = 5,
+    last_message_id: int = 0,
+) -> Dict[str, Any]:
+    """Copy new posts from another channel into our own, oldest first, without a forward header."""
+    client = await manager.get_client(name)
+    limit = max(1, min(int(limit), 50))
+    collected: list = []
+    async for message in client.get_chat_history(source_ref, limit=limit * 3):
+        if int(message.id) <= int(last_message_id or 0):
+            break
+        collected.append(message)
+        if len(collected) >= limit:
+            break
+    sent = 0
+    newest = int(last_message_id or 0)
+    for message in reversed(collected):
+        try:
+            await client.copy_message(
+                chat_id=target_ref,
+                from_chat_id=source_ref,
+                message_id=int(message.id),
+            )
+            sent += 1
+            newest = max(newest, int(message.id))
+            await asyncio.sleep(random.uniform(2, 6))
+        except Exception as exc:
+            log.warning("repost: сообщение %s не скопировано: %s", message.id, exc)
+    return {"sent": sent, "last_message_id": newest, "checked": len(collected)}
+
+
+async def publish_saved_post(name: str, target_ref: str | int, last_post_id: int = 0) -> Dict[str, Any]:
+    """Publish the newest Saved Messages post of this account into the channel."""
+    client = await manager.get_client(name)
+    async for message in client.get_chat_history("me", limit=10):
+        if int(message.id) <= int(last_post_id or 0):
+            return {"sent": 0, "skipped": "Новых постов в избранном нет", "last_post_id": int(last_post_id or 0)}
+        await client.copy_message(
+            chat_id=target_ref,
+            from_chat_id="me",
+            message_id=int(message.id),
+        )
+        return {"sent": 1, "last_post_id": int(message.id)}
+    return {"sent": 0, "skipped": "В избранном нет сообщений", "last_post_id": int(last_post_id or 0)}
+
+
+async def publish_via_bot(
+    name: str,
+    target_ref: str | int,
+    bot: str = "@post",
+    text: str = "",
+) -> Dict[str, Any]:
+    """Hand the prepared content to a posting bot that is already connected to the channel."""
+    body = (text or "").strip()
+    if not body:
+        return {"sent": 0, "skipped": "Нет текста для публикации через бота"}
+    client = await manager.get_client(name)
+    handle = str(bot or "@post").strip()
+    if not handle.startswith("@"):
+        handle = f"@{handle.lstrip('@')}"
+    await client.send_message(handle, body)
+    return {"sent": 1, "bot": handle, "target": str(target_ref)}
+
+
+async def run_daily_post(channel: Dict[str, Any]) -> Dict[str, Any]:
+    """Publish one daily post according to the channel configuration."""
+    source = str(channel.get("post_source") or "saved")
+    if source == "bot":
+        return await publish_via_bot(
+            channel["account"],
+            int(channel["chat_id"]),
+            str(channel.get("post_bot") or "@post"),
+            str(channel.get("post_text") or ""),
+        )
+    return await publish_saved_post(
+        channel["account"], int(channel["chat_id"]), int(channel.get("post_last_id") or 0)
+    )
+
+
 # ─── Парсинг участников чата ───
 async def parse_users(reader_name: str, chat_id: int | str, limit: int = 1000) -> List[Dict[str, Any]]:
     client = await manager.get_client(reader_name)

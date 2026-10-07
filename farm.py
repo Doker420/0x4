@@ -310,6 +310,9 @@ class FarmState:
         self.started_at: datetime = datetime.now(timezone.utc).replace(tzinfo=None)
         self.last_idle_post: datetime | None = None
         self.idle_cursor: int = 0
+        # Media keys (donor files, configured links, provider URLs) used recently,
+        # shared by every account so two accounts do not open with the same gif.
+        self.recent_media: deque[str] = deque(maxlen=200)
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
@@ -318,6 +321,13 @@ class FarmState:
     def mark_activity(self, moment: datetime | None = None) -> None:
         """Stamp the last human or bot message so idle detection can measure silence."""
         self.last_activity = moment or datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def media_seen(self, key: str) -> bool:
+        return bool(key) and key in self.recent_media
+
+    def mark_media(self, key: str) -> None:
+        if key:
+            self.recent_media.append(key)
 
     def remember_message(self, chat_id: int, message_id: int) -> bool:
         key = (int(chat_id), int(message_id))
@@ -465,6 +475,10 @@ class DonorCorpus:
     def sample_media(self, kind: str) -> dict[str, Any] | None:
         pool = self.media_by_kind.get(kind) or []
         return random.choice(pool) if pool else None
+
+    def media_pool(self, kind: str) -> list[dict[str, Any]]:
+        """Every stored media item of this kind, so senders can rotate instead of repeating."""
+        return list(self.media_by_kind.get(kind) or [])
 
     def sample_fragment(self, min_size: int = 3, max_size: int = 8) -> list[dict]:
         pool = [f for f in self.fragments if min_size <= len(f) <= max_size]
@@ -773,6 +787,56 @@ async def generate_answer(bridge: Any, state: FarmState, persona: str, question:
         except Exception as e:
             log.warning("A gen error: %s", e)
     return "Думаю, в этом определённо есть смысл."
+
+
+FOLLOWUP_LINES = (
+    "И да, это ещё зависит от деталей 🙂",
+    "Плюсую, тут правда важно не торопиться",
+    "Согласен, и это обычно самый рабочий вариант",
+    "Ещё бы я посмотрел на сроки — они часто всё решают",
+    "Ага, мелочи потом сильнее всего мешают 🙂",
+    "Добавлю: проще проверить на одном маленьком шаге",
+    "Вот-вот, примерно об этом и речь",
+    "И это тоже стоит учесть, да 🙂",
+)
+
+
+FOLLOWUP_PROMPT = (
+    "Ты участник обычного группового чата. На вопрос собеседника уже ответил другой участник.\n"
+    "Добавь ОДНУ короткую реплику (1 предложение, максимум 120 символов), которая слегка развивает тему "
+    "или добавляет одну конкретную деталь по существу вопроса.\n"
+    "Нельзя: повторять уже сказанное дословно, здороваться, благодарить за вопрос, задавать встречный вопрос, "
+    "рассуждать о том, что ты бот или автоматизированный аккаунт, и уводить разговор в сторону.\n"
+    "Пиши как в живом чате, коротко и по делу.\n\n"
+    "Вопрос собеседника:\n{question}\n\n"
+    "Уже сказанное в этом обмене:\n{previous}\n\n"
+    "Твоя реплика:"
+)
+
+
+async def generate_followup_line(
+    bridge: Any,
+    state: FarmState,
+    persona: str,
+    question: str,
+    previous_lines: list[str],
+) -> str:
+    """One short line that slightly continues the answered question, nothing more."""
+    async with state.lock:
+        history = list(state.chat_history)
+    spoken = [line for line in previous_lines if line] or [question]
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            previous = "\n".join(f"— {line[:160]}" for line in spoken[-3:])
+            prompt = FOLLOWUP_PROMPT.format(persona=persona, question=str(question)[:280], previous=previous)
+            text = (await bridge.ask(prompt)).strip().strip('"').strip("\u00ab\u00bb")[:160]
+            if text and not _is_canned_reply(text) and not is_dialogue_echo(text, history):
+                return text
+            if text:
+                log.info("[%s] реплика подхвата отклонена как повтор или шаблон", persona[:20])
+        except Exception as exc:
+            log.warning("[%s] follow-up generation error: %s", persona[:20], exc)
+    return _choose_natural_reply(FOLLOWUP_LINES, history)
 
 
 async def generate_new_topic(bridge: Any, state: FarmState, donor: DonorCorpus) -> str:
@@ -1946,7 +2010,7 @@ class FarmAccount:
             return
         log.info("[%s] ответ на сообщение %s запланирован реплаем", responder.name, message.id)
         task = asyncio.create_task(
-            responder._answer_incoming(message, text),
+            responder._answer_with_followups(message, text, candidates, is_question=is_question),
             name=f"reply-{responder.name}-{message.id}",
         )
         responder._background_tasks.add(task)
@@ -2001,7 +2065,8 @@ class FarmAccount:
             return False
         return bool(QUESTION_START_RE.match(candidate) or QUESTION_PHRASE_RE.search(candidate))
 
-    async def _answer_incoming(self, message: TGMessage, incoming_text: str) -> None:
+    async def _answer_incoming(self, message: TGMessage, incoming_text: str) -> int | None:
+        """Answer this message with a reply and report the id of the sent message."""
         farm_cfg = FARM_CFG.get("farm", {})
         min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
         max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
@@ -2011,10 +2076,69 @@ class FarmAccount:
             await asyncio.sleep(delay)
         async with self.state.outgoing_lock:
             sent = await self._send_reply(reply_to=message, incoming_text=incoming_text)
+            reply_id = self.state.last_outgoing_message_id if sent else None
         if sent:
             log.info("[%s] реплай на сообщение %s отправлен", self.name, message.id)
         else:
             log.warning("[%s] не удалось отправить реплай на сообщение %s", self.name, message.id)
+        return reply_id
+
+    async def _answer_with_followups(
+        self,
+        message: TGMessage,
+        incoming_text: str,
+        candidates: list["FarmAccount"],
+        *,
+        is_question: bool = False,
+    ) -> None:
+        """Answer, then let one or two other accounts pick the topic up briefly."""
+        reply_id = await self._answer_incoming(message, incoming_text)
+        if not is_question or not reply_id:
+            return
+        await self._pick_up_topic(incoming_text, reply_id, candidates)
+
+    async def _pick_up_topic(
+        self,
+        incoming_text: str,
+        reply_id: int,
+        candidates: list["FarmAccount"],
+    ) -> None:
+        """Let a couple of other accounts add one short line each, without over-developing."""
+        farm_cfg = FARM_CFG.get("farm", {})
+        if not farm_cfg.get("followups_enabled"):
+            return
+        limit = int(farm_cfg.get("followups_max") or 0)
+        if limit <= 0:
+            return
+        others = [account for account in candidates if account is not self and account._running]
+        if not others:
+            return
+        random.shuffle(others)
+        spoken: list[str] = [incoming_text]
+        chain_target: int | None = reply_id
+        for account in others[:limit]:
+            if chain_target is None:
+                return
+            await asyncio.sleep(random.uniform(3, 12))
+            if night_mode_active(FARM_CFG.get("farm", {})):
+                log.info("[%s] ночной режим: подхват темы остановлен", account.name)
+                return
+            if random.random() >= account.reply_probability:
+                log.info("[%s] подхват темы пропущен по вероятности ответа", account.name)
+                continue
+            text = await generate_followup_line(
+                account.bridge, account.state, account.persona, incoming_text, spoken
+            )
+            if not text:
+                return
+            async with account.state.outgoing_lock:
+                sent = await account._send_text(text, reply_to=chain_target)
+                next_id = account.state.last_outgoing_message_id if sent else None
+            if not sent:
+                return
+            spoken.append(text)
+            chain_target = next_id
+            log.info("[%s] подхватил тему реплаем на %s", account.name, chain_target)
 
     async def _loop(self) -> None:
         farm_cfg = FARM_CFG.get("farm", {})
@@ -2433,22 +2557,16 @@ class FarmAccount:
             return False
 
     async def _send_sticker(self, reply_to: TGMessage | int | None = None) -> bool:
-        donor_item = self.donor.sample_media("sticker")
-        try:
-            if donor_item and donor_item.get("media_file"):
-                path = ROOT / donor_item["media_file"]
-                if path.is_file():
-                    msg = await self.client.send_sticker(sticker=str(path), **self._send_kwargs(reply_to))
-                    await self._record(msg, "", "sticker")
-                    log.info("[%s] sticker from donor", self.name)
-                    return True
-            stickers = FARM_CFG.get("stickers") or []
-            if stickers:
-                msg = await self.client.send_sticker(sticker=random.choice(stickers), **self._send_kwargs(reply_to))
+        sources = self._media_files("sticker", FARM_CFG.get("stickers"))
+        for source in self._ordered_media(sources):
+            try:
+                msg = await self.client.send_sticker(sticker=source, **self._send_kwargs(reply_to))
                 await self._record(msg, "", "sticker")
+                self.state.mark_media(source)
+                log.info("[%s] стикер отправлен: %s", self.name, source[:60])
                 return True
-        except Exception:
-            log.exception("[%s] sticker failed", self.name)
+            except Exception:
+                log.warning("[%s] стикер %s не отправился; пробую следующий", self.name, source[:60], exc_info=True)
         return False
 
     async def _send_gif(
@@ -2457,42 +2575,36 @@ class FarmAccount:
         search_text: str = "",
         caption: str = "",
     ) -> bool:
-        donor_item = self.donor.sample_media("gif")
+        """Send a gif picked at random from every available source, not the first one."""
         send_kwargs = self._send_kwargs(reply_to)
         if caption:
             send_kwargs["caption"] = caption[:1000]
-        try:
-            if donor_item and donor_item.get("media_file"):
-                path = ROOT / donor_item["media_file"]
-                if path.is_file():
-                    msg = await self.client.send_animation(animation=str(path), **send_kwargs)
-                    await self._record(msg, caption, "gif")
-                    log.info("[%s] GIF from donor", self.name)
-                    return True
-        except Exception:
-            log.exception("[%s] donor GIF failed; trying configured providers", self.name)
-
-        for configured in FARM_CFG.get("gifs") or []:
+        sources = self._media_files("gif", FARM_CFG.get("gifs"))
+        for source in self._ordered_media(sources):
             try:
-                msg = await self.client.send_animation(animation=configured, **send_kwargs)
+                msg = await self.client.send_animation(animation=source, **send_kwargs)
                 await self._record(msg, caption, "gif")
-                log.info("[%s] configured GIF sent", self.name)
+                self.state.mark_media(source)
+                log.info("[%s] GIF отправлена: %s", self.name, source[:60])
                 return True
             except Exception:
-                log.warning("[%s] configured GIF could not be sent; trying next", self.name, exc_info=True)
+                log.warning("[%s] GIF %s не отправилась; пробую следующую", self.name, source[:60], exc_info=True)
 
         downloaded: Path | None = None
         try:
-            from web.giphy import download_gif, random_gif
+            from web.giphy import download_gif, search_gif
 
             query = self._gif_query(search_text)
-            url = await random_gif(query)
+            urls = await search_gif(query, limit=25)
+            fresh = [url for url in urls if not self.state.media_seen(url)]
+            url = random.choice(fresh or urls) if urls else None
             if not url:
                 log.warning("[%s] GIF not sent: configure a GIPHY/Tenor key or add donor GIFs", self.name)
                 return False
             downloaded = await download_gif(url, DATA_DIR / "gif_cache")
             msg = await self.client.send_animation(animation=str(downloaded), **send_kwargs)
             await self._record(msg, caption, "gif")
+            self.state.mark_media(url)
             log.info("[%s] GIF sent from provider (%s)", self.name, query)
             return True
         except Exception:
@@ -2502,6 +2614,30 @@ class FarmAccount:
             if downloaded:
                 downloaded.unlink(missing_ok=True)
 
+    def _ordered_media(self, keys: list[str]) -> list[str]:
+        """Randomised send order that avoids media another account has just used."""
+        pool = [key for key in dict.fromkeys(str(key) for key in keys) if key]
+        if not pool:
+            return []
+        fresh = [key for key in pool if not self.state.media_seen(key)]
+        chosen = random.choice(fresh or pool)
+        rest = [key for key in pool if key != chosen]
+        random.shuffle(rest)
+        return [chosen, *rest]
+
+    def _media_files(self, kind: str, configured: list[Any] | None = None) -> list[str]:
+        """Donor files of this kind that still exist on disk, plus configured sources."""
+        paths: list[str] = []
+        for item in self.donor.media_pool(kind):
+            raw = str(item.get("media_file") or "").strip()
+            if raw and (ROOT / raw).is_file():
+                paths.append(str(ROOT / raw))
+        for value in configured or []:
+            value = str(value).strip()
+            if value:
+                paths.append(value)
+        return paths
+
     @staticmethod
     def _gif_query(text: str) -> str:
         words = [word.strip(".,!?;:()[]{}\"'«»") for word in (text or "").split()]
@@ -2509,23 +2645,20 @@ class FarmAccount:
         return query[:80] or "funny reaction"
 
     async def _send_photo(self, reply_to: TGMessage | int | None = None, caption: str = "") -> bool:
-        donor_item = self.donor.sample_media("photo")
         send_kwargs = self._send_kwargs(reply_to)
         if caption:
             send_kwargs["caption"] = caption[:1000]
-        try:
-            if donor_item and donor_item.get("media_file"):
-                path = ROOT / donor_item["media_file"]
-                if path.is_file():
-                    msg = await self.client.send_photo(photo=str(path), **send_kwargs)
-                    await self._record(msg, caption, "photo")
-                    log.info("[%s] photo from donor", self.name)
-                    return True
-            photos = FARM_CFG.get("photos") or []
-            if photos:
-                msg = await self.client.send_photo(photo=random.choice(photos), **send_kwargs)
+        sources = self._media_files("photo", FARM_CFG.get("photos"))
+        for source in self._ordered_media(sources):
+            try:
+                msg = await self.client.send_photo(photo=source, **send_kwargs)
                 await self._record(msg, caption, "photo")
+                self.state.mark_media(source)
+                log.info("[%s] фото отправлено: %s", self.name, source[:60])
                 return True
+            except Exception:
+                log.warning("[%s] фото %s не отправилось; пробую следующее", self.name, source[:60], exc_info=True)
+        try:
             from web.giphy import random_photo
 
             photo_url = await random_photo()
@@ -2539,21 +2672,21 @@ class FarmAccount:
         return False
 
     async def _send_voice(self, reply_to: TGMessage | int | None = None) -> bool:
-        donor_item = self.donor.sample_media("voice")
-        if not donor_item or not donor_item.get("media_file"):
-            return False
-        path = ROOT / donor_item["media_file"]
-        if not path.is_file():
-            return False
-        try:
-            await self._typing(1.5)
-            msg = await self.client.send_voice(voice=str(path), **self._send_kwargs(reply_to))
-            await self._record(msg, "", "voice")
-            log.info("[%s] voice from donor (%s)", self.name, path.name)
-            return True
-        except Exception:
-            log.exception("[%s] voice failed", self.name)
-            return False
+        sources = self._media_files("voice")
+        for source in self._ordered_media(sources):
+            path = Path(source)
+            if not path.is_file():
+                continue
+            try:
+                await self._typing(1.5)
+                msg = await self.client.send_voice(voice=str(path), **self._send_kwargs(reply_to))
+                await self._record(msg, "", "voice")
+                self.state.mark_media(source)
+                log.info("[%s] voice from donor (%s)", self.name, path.name)
+                return True
+            except Exception:
+                log.warning("[%s] голосовое %s не отправилось; пробую следующее", self.name, path.name, exc_info=True)
+        return False
 
     async def _send_reaction_to_last(self) -> None:
         async with self.state.lock:
@@ -2897,7 +3030,16 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
         raw_value = os.getenv(env_name)
         if raw_value not in (None, ""):
             farm_sub[setting] = float(raw_value)
+    bool_env_overrides = {
+        "proactive_enabled": "FARM_OVERRIDE_PROACTIVE",
+        "followups_enabled": "FARM_OVERRIDE_FOLLOWUPS",
+    }
+    for setting, env_name in bool_env_overrides.items():
+        raw_value = os.getenv(env_name)
+        if raw_value not in (None, ""):
+            farm_sub[setting] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
     scenario_env_overrides = {
+        "followups_max": "FARM_OVERRIDE_FOLLOWUPS_MAX",
         "scenario_mode": "FARM_OVERRIDE_SCENARIO_MODE",
         "scenario_topic": "FARM_OVERRIDE_SCENARIO_TOPIC",
         "scenario_turns": "FARM_OVERRIDE_SCENARIO_TURNS",

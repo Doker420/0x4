@@ -114,6 +114,30 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    title TEXT,
+    username TEXT,
+    about TEXT,
+    is_public INTEGER DEFAULT 0,
+    repost_enabled INTEGER DEFAULT 0,
+    repost_source TEXT,
+    repost_interval_min INTEGER DEFAULT 60,
+    repost_limit INTEGER DEFAULT 5,
+    repost_last_id INTEGER DEFAULT 0,
+    repost_last_at REAL DEFAULT 0,
+    post_enabled INTEGER DEFAULT 0,
+    post_source TEXT DEFAULT 'saved',
+    post_bot TEXT DEFAULT '@post',
+    post_text TEXT,
+    post_time TEXT DEFAULT '10:00',
+    post_last_id INTEGER DEFAULT 0,
+    post_last_date TEXT,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -298,6 +322,56 @@ async def update_task(task_id: int, **kwargs: Any) -> None:
     if kwargs:
         fields = ", ".join(f"{field}=?" for field in kwargs)
         await execute(f"UPDATE tasks SET {fields} WHERE id=?", (*kwargs.values(), task_id))
+
+
+# ─── Channels ───
+async def list_channels() -> List[Dict[str, Any]]:
+    return await fetch_all("SELECT * FROM channels ORDER BY id DESC")
+
+
+async def get_channel(channel_id: int) -> Optional[Dict[str, Any]]:
+    return await fetch_one("SELECT * FROM channels WHERE id=?", (int(channel_id),))
+
+
+async def add_channel(account: str, chat_id: int, **fields: Any) -> int:
+    allowed = {
+        "title", "username", "about", "is_public",
+        "repost_enabled", "repost_source", "repost_interval_min", "repost_limit",
+        "repost_last_id", "repost_last_at",
+        "post_enabled", "post_source", "post_bot", "post_text", "post_time",
+        "post_last_id", "post_last_date",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Недопустимые поля канала: {', '.join(sorted(unknown))}")
+    columns = ["account", "chat_id", *fields]
+    values = [str(account), int(chat_id), *fields.values()]
+    placeholders = ", ".join("?" for _ in columns)
+    return await execute(
+        f"INSERT INTO channels ({', '.join(columns)}, created_at) VALUES ({placeholders}, ?)",
+        (*values, time.time()),
+    )
+
+
+async def update_channel(channel_id: int, **fields: Any) -> None:
+    allowed = {
+        "title", "username", "about", "is_public",
+        "repost_enabled", "repost_source", "repost_interval_min", "repost_limit",
+        "repost_last_id", "repost_last_at",
+        "post_enabled", "post_source", "post_bot", "post_text", "post_time",
+        "post_last_id", "post_last_date",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Недопустимые поля канала: {', '.join(sorted(unknown))}")
+    if not fields:
+        return
+    assignment = ", ".join(f"{field}=?" for field in fields)
+    await execute(f"UPDATE channels SET {assignment} WHERE id=?", (*fields.values(), int(channel_id)))
+
+
+async def delete_channel(channel_id: int) -> None:
+    await execute("DELETE FROM channels WHERE id=?", (int(channel_id),))
 
 
 # ─── Settings ───

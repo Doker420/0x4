@@ -131,10 +131,62 @@ class FakeMusicClient:
         return generator()
 
 
+class FakeFollowUpAccount:
+    """Account stub that records every line it sends, including the reply chain."""
+
+    def __init__(self, name, state, user_id):
+        self.name = name
+        self.state = state
+        self.user_id = user_id
+        self.persona = f"persona {name}"
+        self.bridge = None
+        self.reply_probability = 1.0
+        self._running = True
+        self.sent = []
+        self.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+
+    async def _send_text(self, text, reply_to=None):
+        message_id = 500 + len(self.sent) + self.user_id * 10
+        self.sent.append({"text": text, "reply_to": reply_to, "message_id": message_id})
+        async with self.state.lock:
+            self.state.last_outgoing_message_id = message_id
+            self.state.chat_history.append({
+                "author": self.name,
+                "text": text,
+                "message_id": message_id,
+                "direction": "outgoing",
+                "kind": "text",
+            })
+        return True
+
+    async def _send_reply(self, reply_to=None, incoming_text=""):
+        return await self._send_text(f"ответ на: {incoming_text[:24]}", reply_to=reply_to)
+
+    async def _answer_incoming(self, message, incoming_text):
+        """Same contract as FarmAccount: reply and report the id of what was sent."""
+        sent = await self._send_reply(reply_to=message, incoming_text=incoming_text)
+        return self.sent[-1]["message_id"] if sent else None
+
+    async def _answer_with_followups(self, message, incoming_text, candidates, *, is_question=False):
+        return await farm.FarmAccount._answer_with_followups(
+            self, message, incoming_text, candidates, is_question=is_question
+        )
+
+    async def _pick_up_topic(self, incoming_text, reply_id, candidates):
+        return await farm.FarmAccount._pick_up_topic(self, incoming_text, reply_id, candidates)
+
+    def _plan_turn_media(self):
+        return "text"
+
+
 class EmptyDonor:
     @staticmethod
     def sample_media(_kind):
         return None
+
+    @staticmethod
+    def media_pool(_kind):
+        return []
 
 
 class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
@@ -570,6 +622,103 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         await reposter.refresh([FakeMusicClient([])])
         self.assertEqual(reposter.next_track(), None)
         self.assertFalse(await reposter.send(FakeMusicAccount()))
+
+
+    async def test_gif_sources_rotate_between_accounts(self):
+        state = farm.FarmState()
+        farm.FARM_CFG["gifs"] = ["gif-one", "gif-two", "gif-three"]
+        accounts = []
+        for index in range(3):
+            account = farm.FarmAccount.__new__(farm.FarmAccount)
+            account.name = f"acc{index}"
+            account.user_id = 1000 + index
+            account.state = state
+            account.client = FakeMediaClient()
+            account.donor = EmptyDonor()
+            account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+            account._typing = AsyncMock()
+            accounts.append(account)
+
+        for account in accounts:
+            self.assertTrue(await account._send_gif(reply_to=None))
+
+        used = [account.client.sent[0]["animation"] for account in accounts]
+        self.assertEqual(len(set(used)), 3, f"аккаунты отправили одинаковые гифки: {used}")
+
+        # The pool restarts on the next pass, still only using the configured gifs.
+        for account in accounts:
+            self.assertTrue(await account._send_gif(reply_to=None))
+        again = [account.client.sent[1]["animation"] for account in accounts]
+        self.assertTrue(set(again) <= {"gif-one", "gif-two", "gif-three"})
+
+    async def test_question_answer_is_picked_up_by_other_accounts(self):
+        farm.FARM_CFG["farm"].update({
+            "min_delay_sec": 0,
+            "max_delay_sec": 0,
+            "followups_enabled": True,
+            "followups_max": 2,
+        })
+        state = farm.FarmState()
+        accounts = [FakeFollowUpAccount(name, state, index + 1) for index, name in enumerate(("one", "two", "three"))]
+        message = types.SimpleNamespace(id=777, text="кто знает, как это починить?")
+
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(farm.random, "random", return_value=0):
+            await accounts[0]._answer_with_followups(message, "кто знает, как это починить?", accounts, is_question=True)
+
+        speakers = [account for account in accounts if account.sent]
+        self.assertEqual(len(speakers), 3)
+        primary_id = accounts[0].sent[0]["message_id"]
+        first = next(account for account in speakers if account.sent[0]["reply_to"] == primary_id)
+        second = next(account for account in speakers if account is not accounts[0] and account is not first)
+        self.assertEqual(second.sent[0]["reply_to"], first.sent[0]["message_id"])
+        self.assertLessEqual(len(second.sent[0]["text"]), 200)
+
+    async def test_followups_stay_off_when_disabled_or_message_is_not_a_question(self):
+        farm.FARM_CFG["farm"].update({
+            "min_delay_sec": 0,
+            "max_delay_sec": 0,
+            "followups_enabled": False,
+            "followups_max": 2,
+        })
+        state = farm.FarmState()
+        accounts = [FakeFollowUpAccount(name, state, index + 1) for index, name in enumerate(("one", "two", "three"))]
+        message = types.SimpleNamespace(id=778, text="кто знает, как это починить?")
+
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(farm.random, "random", return_value=0):
+            await accounts[0]._answer_with_followups(message, "кто знает, как это починить?", accounts, is_question=True)
+        self.assertEqual(sum(len(account.sent) for account in accounts), 1)
+
+        farm.FARM_CFG["farm"]["followups_enabled"] = True
+        plain_state = farm.FarmState()
+        plain_accounts = [
+            FakeFollowUpAccount(name, plain_state, index + 1) for index, name in enumerate(("four", "five", "six"))
+        ]
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(farm.random, "random", return_value=0):
+            await plain_accounts[0]._answer_with_followups(
+                types.SimpleNamespace(id=779, text="просто делюсь новостью"),
+                "просто делюсь новостью",
+                plain_accounts,
+                is_question=False,
+            )
+        self.assertEqual(sum(len(account.sent) for account in plain_accounts), 1)
+
+    async def test_followups_stop_during_the_night_window(self):
+        farm.FARM_CFG["farm"].update({
+            "min_delay_sec": 0,
+            "max_delay_sec": 0,
+            "followups_enabled": True,
+            "followups_max": 2,
+            "night_mode_enabled": True,
+            "night_mode_start": "00:00",
+            "night_mode_end": "23:59",
+        })
+        state = farm.FarmState()
+        accounts = [FakeFollowUpAccount(name, state, index + 1) for index, name in enumerate(("seven", "eight", "nine"))]
+        message = types.SimpleNamespace(id=780, text="подскажите, как настроить?")
+
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(farm.random, "random", return_value=0):
+            await accounts[0]._answer_with_followups(message, "подскажите, как настроить?", accounts, is_question=True)
+        self.assertEqual(sum(len(account.sent) for account in accounts), 1)
 
     def test_night_mode_window_covers_wrap_around_and_same_day_ranges(self):
         from datetime import datetime, timezone

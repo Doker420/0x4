@@ -108,6 +108,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cleaned["idle_cooldown_sec"], 600)
         self.assertEqual(cleaned["music_source"], "@sad_tracky")
 
+    def test_followup_settings_are_validated(self):
+        defaults = load_farm_settings({})
+        self.assertFalse(defaults["proactive_enabled"])
+        self.assertTrue(defaults["followups_enabled"])
+        self.assertEqual(defaults["followups_max"], 2)
+
+        settings = load_farm_settings({
+            "proactive_enabled": "on",
+            "followups_enabled": "yes",
+            "followups_max": "9",
+        })
+        self.assertTrue(settings["proactive_enabled"])
+        self.assertTrue(settings["followups_enabled"])
+        self.assertEqual(settings["followups_max"], 3)
+
+        off = load_farm_settings({"followups_enabled": "off", "followups_max": "-4"})
+        self.assertFalse(off["followups_enabled"])
+        self.assertEqual(off["followups_max"], 0)
+
     def test_farm_settings_are_clamped(self):
         settings = load_farm_settings({
             "min_delay_sec": -10,
