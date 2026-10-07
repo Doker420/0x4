@@ -1,3 +1,4 @@
+import re
 import tempfile
 import types
 import unittest
@@ -51,6 +52,14 @@ class FakeMediaClient:
         self.sent = []
 
     async def send_animation(self, **kwargs):
+        self.sent.append(kwargs)
+        return self._message(kwargs, len(self.sent))
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return self._message(kwargs, len(self.sent))
+
+    async def send_sticker(self, **kwargs):
         self.sent.append(kwargs)
         return self._message(kwargs, len(self.sent))
 
@@ -340,6 +349,88 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(account.client.sent[0]["reply_to_message_id"], 44)
             self.assertEqual(account.client.sent[1]["voice"], str(other_voice))
             self.assertEqual(account.client.sent[1]["reply_to_message_id"], 45)
+
+    async def test_offline_history_turn_speaks_with_the_collected_message(self):
+        source = "Смотрю цены на жильё у моря, дороговато выходит"
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1, "message_id": 4,
+            "text": source, "source_text": source,
+            "direction": "context", "kind": "text",
+        }]}
+
+        line = await farm.generate_history_dialogue_turn(
+            None, state, "Синтетическая роль: практичный собеседник", 1, account_name="bot"
+        )
+
+        source_words = set(re.findall(r"[а-яёa-z]{4,}", source.casefold()))
+        line_words = set(re.findall(r"[а-яёa-z]{4,}", line.casefold()))
+        self.assertGreaterEqual(len(source_words & line_words), 2)
+        self.assertTrue(any(emoji in line for emoji in farm._HISTORY_EMOJI))
+        self.assertNotIn("критерий", line.casefold())
+        self.assertNotIn("компромисс", line.casefold())
+        self.assertNotEqual(line.strip(), source)
+
+    async def test_offline_history_turns_rotate_through_the_whole_assigned_archive(self):
+        messages = [
+            "Зато дорога до пляжа занимает пять минут",
+            "Ночью тут реально тихо, слышно только море",
+            "Рядом с пляжем есть недорогие кафе",
+        ]
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1, "message_id": index + 1,
+            "text": text, "source_text": text, "direction": "context", "kind": "text",
+        } for index, text in enumerate(messages)]}
+
+        lines = [
+            await farm.generate_history_dialogue_turn(
+                None, state, "синтетическая роль", turn, account_name="bot"
+            )
+            for turn in range(1, 4)
+        ]
+
+        self.assertEqual(len(set(lines)), 3)
+        for line, source in zip(lines, reversed(messages)):
+            source_words = set(re.findall(r"[а-яёa-z]{4,}", source.casefold()))
+            line_words = set(re.findall(r"[а-яёa-z]{4,}", line.casefold()))
+            self.assertGreaterEqual(len(source_words & line_words), 2)
+
+    async def test_history_turn_without_archive_media_still_sends_gifs_stickers_and_media(self):
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1, "message_id": 31,
+            "text": "Пальмы у моря", "source_text": "Пальмы у моря",
+            "direction": "context", "kind": "text",
+        }]}
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "bot"
+        account.user_id = 9003
+        account.state = state
+        account.client = FakeMediaClient()
+        account.donor = EmptyDonor()
+        account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        account._typing = AsyncMock()
+        farm.FARM_CFG["gifs"] = ["configured-gif"]
+        farm.FARM_CFG["photos"] = ["configured-photo"]
+
+        sent = await account._send_history_dialogue_content(
+            "Пальмы у моря — деталь из истории.", reply_to=44, media_item=None
+        )
+        anchor_after_text = state.last_outgoing_message_id
+        media_only = await account._send_history_dialogue_content(
+            "", reply_to=45, media_item=None
+        )
+
+        self.assertTrue(sent)
+        self.assertTrue(media_only)
+        self.assertEqual(account.client.sent[0]["text"], "Пальмы у моря — деталь из истории.")
+        self.assertEqual(account.client.sent[0]["reply_to_message_id"], 44)
+        self.assertEqual(anchor_after_text, 901)
+        self.assertEqual(account.client.sent[1]["animation"], "configured-gif")
+        self.assertEqual(account.client.sent[1]["reply_to_message_id"], 901)
+        self.assertEqual(account.client.sent[2]["animation"], "configured-gif")
+        self.assertEqual(account.client.sent[2]["reply_to_message_id"], 45)
 
     async def test_history_turn_without_safe_text_uses_media_from_the_same_archive_message(self):
         with tempfile.TemporaryDirectory() as tempdir:

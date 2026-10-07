@@ -770,27 +770,36 @@ DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплик�
 {extra_instruction}
 Только текст реплики:"""
 
-HISTORY_DIALOGUE_TURN_PROMPT = """Ты — автоматизированный аккаунт группового чата с отдельной синтетической ролью. Не изображай реального автора сообщений, не копируй его стиль и не выдумывай личный опыт.
+HISTORY_DIALOGUE_TURN_PROMPT = """Ты — автоматизированный аккаунт группового чата с отдельной синтетической ролью. Не изображай реального автора сообщений, не подражай его стилю и не выдумывай личный опыт.
 
-Для этого режима НЕТ общей темы и нет заданного извне предмета разговора. Не пытайся придумать пустую или новую тему.
+Для этого режима НЕТ общей темы и нет заданного извне предмета разговора. Не придумывай тему и не строй рассуждение.
 
-Синтетическая роль этого аккаунта: {persona}
-Указания поведения аккаунта: {global_prompt}
-Роль и указания влияют на манеру ответа, но не задают тему. Если они подталкивают к предмету, которого нет в назначенном архиве, не вводи его.
+Разговор ведётся сообщениями из архива: возьми конкретную реплику из назначенного архива ниже и перескажи её своими словами как обычную короткую реплику в чате — так, будто просто общаешься в чате. Это обычная болтовня, а не разбор темы.
 
-Единственный архивный источник содержания для этого аккаунта — сообщения ниже. Он собран заранее и назначен только этому аккаунту; сообщения других авторов источника не используй.
-Выбранная реплика из собственного архива:
-{history_seed}
-Последние сообщения этого же автора из архива:
+Назначенный архив (только этого аккаунта, другие авторы недоступны):
 {source_context}
+Выбранная реплика из архива:
+{history_seed}
 
-Уже опубликованные реплики синтетических аккаунтов в целевом чате — только для связи между ходами:
+Уже отправленные реплики аккаунтов — только для связности, не повторяй их:
 {conversation_context}
 Последняя реплика в цепочке:
 {previous_turn}
+Синтетическая роль: {persona}
+Указания поведения: {global_prompt}
+Роль и указания влияют только на манеру речи, но не задают предмет разговора.
 
-Создай одну короткую естественную реплику в соответствии со своей синтетической ролью. Начни разговор с конкретной мысли, вопроса или детали, которая действительно есть в назначенном архиве; затем развивай только этот материал. Не добавляй общую тему, внешние факты, придуманный сюжет, шутки или пустые рассуждения. Не цитируй исходную формулировку дословно и не подражай автору. Если в архиве только медиа без подписи, не выдумывай его содержимое и верни ровно [NO_TEXT] — тогда будет отправлено только архивное медиа. Если из архивных текстов нечего безопасно сказать, тоже верни ровно [NO_TEXT].
-Не начинай с общих фраз вроде «Давайте обсудим», «Интересная тема» или «Согласен». До 200 символов. Верни только готовую реплику либо [NO_TEXT]."""
+Как писать:
+- одно короткое предложение, до 160 символов, разговорно и просто
+- перескажи суть выбранной архивной реплики своими словами; можно начать с короткой реакции («ну», «короче», «ахах», «вот это да», «ого»)
+- допустимы 1–2 естественные опечатки и разговорные сокращения («щас», «че», «норм», «ваще», «короче»), строчная буква в начале — это нормально
+- добавь 1–2 уместных эмодзи
+- не делай аналитических выводов, не вводи критерии, компромиссы и проверки, не задавай вопросов вида «что для вас важнее»
+- не добавляй новую тему, внешние факты и выдуманные детали; не описывай медиа, которого не видел
+- не копируй формулировку из архива дословно и не повторяй последнюю реплику цепочки
+- если из выбранной реплики нельзя безопасно ничего сказать (например, только медиа без подписи), верни ровно [NO_TEXT]
+
+Только готовая реплика либо [NO_TEXT]:"""
 
 CLEAN_JOKES = (
     "— Почему книга по математике грустила? — У неё было слишком много задач.",
@@ -917,59 +926,111 @@ def _history_reply_is_anchored(reply: str, source_context: str) -> bool:
     return bool(source_terms & reply_terms)
 
 
-def _history_offline_terms(text: str) -> str:
-    stopwords = {
-        "когда", "который", "которая", "которые", "почему", "потому", "чтобы", "здесь", "тогда",
-        "этого", "этими", "такой", "такие", "можно", "нужно", "будет", "очень", "просто", "вообще",
-        "кажется", "важно", "тема", "темы", "тему", "вопрос", "ответ", "сейчас", "говорит", "сказал",
-        "сказала", "может", "думаю", "согласен", "интересно", "посмотреть", "другой", "стороны",
-        "котором", "самый", "самая", "самое", "своей", "своего", "своими", "если", "именно",
-        "между", "среди", "сегодня", "вчера", "завтра", "этот", "эта", "эти", "это", "того", "тем",
-        "есть", "был", "была", "были", "было", "нет", "там", "тут", "пока", "потом", "тоже", "всегда",
-        "меня", "него", "нас", "они", "мне", "тебя", "кому", "куда", "где", "или", "уже", "лишь",
-        "только", "через", "около", "очень", "может", "ваши", "свои", "который", "которые",
-    }
-    terms: list[str] = []
-    for word in re.findall(r"[a-zа-яё]{4,}", str(text or "").casefold()):
-        if word not in stopwords and word not in terms:
-            terms.append(word)
-        if len(terms) == 3:
-            break
-    return ", ".join(terms)
+_HISTORY_SLANG = (
+    ("сейчас", "щас"),
+    ("что", "че"),
+    ("чтобы", "чтоб"),
+    ("нормально", "норм"),
+    ("вообще", "ваще"),
+    ("конечно", "канеш"),
+    ("смотрю", "гляжу"),
+    ("говорит", "говорит"),
+    ("может быть", "может"),
+    ("наверное", "наверн"),
+    ("интересно", "интересно"),
+    ("короче говоря", "короче"),
+)
+
+_HISTORY_LEADS: dict[str, tuple[str, ...]] = {
+    "практич": ("короче, ", "по факту, ", "ну ", "смотри, ", "в общем, "),
+    "аналит": ("по сути, ", "если по факту, ", "ну ", "вот ", "короче, "),
+    "любозн": ("а че, ", "слушай, ", "а ", "интересно, ", "ого, "),
+    "лаконич": ("короче, ", "ну ", "", "вкратце, "),
+    "творч": ("ого, ", "ахах, ", "представляю, ", "ну ", "вот это да, "),
+    "такт": ("ну ", "согласен, ", "в целом ", "по-моему, ", ""),
+    "модер": ("ну ", "короче, ", "в целом ", ""),
+}
+_DEFAULT_HISTORY_LEADS = ("ну ", "короче, ", "вот ", "в общем, ", "", "ахах, ")
+_HISTORY_OPENING_RE = re.compile(r"^(?:короче|ну|вобщем|в общем|вообще|ваще|зато|типа|смотри|слушай|короч)\b[,\s]*", re.IGNORECASE)
+_HISTORY_EMOJI = ("🙂", "😄", "😂", "🔥", "👀", "😅", "🤔", "👍", "✨", "🌿", "😎", "🤝")
+
+
+def _history_slang_line(text: str) -> str:
+    line = text
+    for source, replacement in _HISTORY_SLANG:
+        if source == replacement:
+            continue
+        line = re.sub(rf"\b{re.escape(source)}\b", replacement, line, count=1, flags=re.IGNORECASE)
+    return line
+
+
+def _history_inject_typo(text: str) -> str:
+    matches = [
+        match for match in re.finditer(r"[а-яёa-z]{5,}", text, re.IGNORECASE)
+        # Leave the first word readable; mutate a word later in the line.
+        if match.start() > 0 and len(match.group(0)) >= 5
+    ]
+    if not matches:
+        return text
+    match = random.choice(matches)
+    word = match.group(0)
+    # Keep the first two letters intact so the word still reads normally.
+    index = random.randrange(2, max(3, len(word) - 1))
+    roll = random.random()
+    if roll < 0.50:
+        mutated = word[:index] + word[index + 1:]
+    elif roll < 0.80:
+        mutated = word[:index] + word[index] + word[index:]
+    else:
+        mutated = word[:index - 1] + word[index] + word[index - 1] + word[index + 1:]
+    return text[:match.start()] + mutated + text[match.end():]
+
+
+def _history_short_line(text: str, limit: int = 150) -> str:
+    """Take one short clause of an archived message so the turn speaks with that content."""
+    clean = " ".join(str(text or "").split()).strip(" \"'\u00ab\u00bb\u201e\u201c")
+    if not clean:
+        return ""
+    clean = clean.rstrip(".!?…: ")
+    head, _, _rest = clean.partition(",")
+    if len(head.split()) < 5:
+        head = re.split(r"(?<=[\w])\s+(?:и|а|но|зато|потом|пока)\s+", clean, maxsplit=1)[0]
+    words = head.split()
+    if len(words) > 18:
+        head = " ".join(words[:18])
+    if len(head) > limit:
+        head = head[:limit].rstrip()
+    if not head:
+        return ""
+    return head[0].casefold() + head[1:]
+
+
+def _history_leads_for(persona: str) -> tuple[str, ...]:
+    role = str(persona or "").casefold()
+    for key, leads in _HISTORY_LEADS.items():
+        if key in role:
+            return leads
+    return _DEFAULT_HISTORY_LEADS
 
 
 def _history_offline_turn(source_text: str, persona: str, history: list[dict[str, Any]]) -> str:
-    """Ground an offline line in words from the assigned archive, never in a blank topic."""
-    terms = _history_offline_terms(source_text)
-    if not source_text.strip() or not terms:
+    """Speak with the collected archive message: short, casual, with typos and emoji."""
+    base = _history_short_line(source_text)
+    if not base:
         return ""
-    role = persona.casefold()
-    if "аналит" in role or "факт" in role:
-        candidates = (
-            f"В деталях «{terms}» я бы отделил наблюдение от предположения.",
-            f"Если опираться на «{terms}», полезно проверить одну конкретную деталь.",
-        )
-    elif "практич" in role or "шаг" in role:
-        candidates = (
-            f"Если опираться на детали «{terms}», я бы проверил одну из них на конкретном примере.",
-            f"Детали «{terms}» подсказывают практичный первый шаг — проверить один критерий.",
-        )
-    elif "любозн" in role or "уточня" in role:
-        candidates = (
-            f"Зацепили детали «{terms}». Какая из них здесь важнее всего?",
-            f"В истории отмечены «{terms}»; интересно, какая деталь сильнее влияет на ситуацию.",
-        )
-    elif "лаконич" in role or "кратко" in role:
-        candidates = (
-            f"Важные детали из архива — «{terms}»; остальное пока не додумываю.",
-            f"Зафиксирую «{terms}» как опору; для вывода данных пока мало.",
-        )
-    else:
-        candidates = (
-            f"Зацепили детали «{terms}». Я бы продолжил разговор с одной из них.",
-            f"Из истории выделяются «{terms}» — можно развить именно эту мысль.",
-        )
-    return _choose_natural_reply(candidates, history)
+    leads = _history_leads_for(persona)
+    candidates: list[str] = []
+    for offset in range(4):
+        line = _history_slang_line(base)
+        if random.random() < 0.8:
+            line = _history_inject_typo(line)
+        lead = leads[(len(candidates) + offset) % len(leads)]
+        # Do not stack a lead-in on a message that already opens with one.
+        if _HISTORY_OPENING_RE.match(line) and random.random() < 0.7:
+            lead = ""
+        emoji = _HISTORY_EMOJI[(len(candidates) + offset * 3) % len(_HISTORY_EMOJI)]
+        candidates.append(f"{lead}{line} {emoji}".strip())
+    return _choose_natural_reply(tuple(dict.fromkeys(candidates)), history)
 
 
 def _context_participant_id(item: dict[str, Any]) -> int | None:
@@ -2014,35 +2075,67 @@ class FarmAccount:
             log.exception("[%s] sending assigned archive media failed: %s", self.name, kind)
             return False
 
+    async def _send_farm_media(
+        self,
+        kind: str,
+        *,
+        reply_to: TGMessage | int | None,
+        caption: str = "",
+    ) -> bool:
+        """Send this account's own media (donor, configured files or providers) of the chosen kind."""
+        if kind == "gif":
+            return await self._send_gif(reply_to=reply_to, search_text=caption, caption=caption)
+        if kind == "sticker":
+            return await self._send_sticker(reply_to=reply_to)
+        if kind == "photo":
+            return await self._send_photo(reply_to=reply_to, caption=caption)
+        if kind == "voice":
+            return await self._send_voice(reply_to=reply_to)
+        return False
+
     async def _send_history_dialogue_content(
         self,
         text: str,
         *,
         reply_to: TGMessage | int | None,
         media_item: dict[str, Any] | None,
+        allow_account_media: bool = True,
     ) -> bool:
-        """Send generated text and, when selected, only media from this account's archive."""
+        """Send the turn text plus media: archive media when available, otherwise account media."""
         text = str(text or "").strip()
-        if not text and media_item is None:
-            return False
         media = media_item.get("media", {}) if media_item else {}
         kind = str(media.get("kind") or "")
         if media_item and text and kind in {"gif", "photo", "video"}:
             if await self._send_history_media(media_item, reply_to=reply_to, caption=text):
                 return True
-        if text:
-            sent_text = await self._send_text(text, reply_to=reply_to)
-            if not sent_text:
+        if not text:
+            if media_item and await self._send_history_media(media_item, reply_to=reply_to):
+                return True
+            if not allow_account_media:
                 return False
-            if media_item:
-                async with self.state.lock:
-                    text_message_id = self.state.last_outgoing_message_id
-                if text_message_id:
-                    await self._send_history_media(media_item, reply_to=text_message_id)
-                    async with self.state.lock:
-                        self.state.last_outgoing_message_id = text_message_id
+            # A media-only turn still uses this account's gifs, stickers, photos or voice.
+            kind = self._pick_kind()
+            if kind == "text":
+                kind = random.choice(["gif", "sticker", "photo", "voice"])
+            return await self._send_farm_media(kind, reply_to=reply_to)
+
+        sent_text = await self._send_text(text, reply_to=reply_to)
+        if not sent_text:
+            return False
+        async with self.state.lock:
+            text_message_id = self.state.last_outgoing_message_id
+        if not text_message_id:
             return True
-        return await self._send_history_media(media_item, reply_to=reply_to)
+        if media_item:
+            await self._send_history_media(media_item, reply_to=text_message_id)
+        elif allow_account_media:
+            kind = self._pick_kind()
+            if kind != "text":
+                await self._send_farm_media(kind, reply_to=text_message_id, caption=text)
+        # Keep the text turn as the chain anchor rather than a captionless attachment.
+        async with self.state.lock:
+            self.state.last_outgoing_message_id = text_message_id
+        return True
 
     def _pick_kind(self) -> str:
         kinds = list(self.media_bias)
