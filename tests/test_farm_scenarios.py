@@ -147,30 +147,45 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts[0].sent[1]["reply_to"], accounts[2].sent[0]["message_id"])
         self.assertIn(accounts[2].sent[0]["text"], farm.CLEAN_JOKES)
 
-    async def test_history_dialogue_mode_runs_a_media_chain_until_its_limit(self):
+    async def test_history_dialogue_mode_runs_without_common_topic_or_opener(self):
         state = farm.FarmState()
-        state.chat_history.append({
-            "author": "участник 1",
-            "text": "Между Мандремом и Ашвемом: пальмы, тишина и попугаи.",
-            "direction": "context",
-        })
+        state.account_participant_ids = {"a": 1, "b": 2}
+        state.chat_history.extend([
+            {
+                "author": "участник 1", "participant_id": 1,
+                "text": "Между Мандремом и Ашвемом: пальмы, тишина и попугаи.",
+                "direction": "context",
+            },
+            {
+                "author": "участник 2", "participant_id": 2,
+                "text": "Для меня важнее стоимость проживания и дорога до вокзала.",
+                "direction": "context",
+            },
+        ])
         accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]
         stop_event = farm.asyncio.Event()
         settings = {
             "scenario_mode": "history_dialogue",
-            "scenario_topic": "Обсуждение по истории чата",
+            "scenario_topic": "stale common topic must be ignored",
             "scenario_turns": 2,
             "joke_every": 0,
             "rest_every": 0,
-            "post_opening": False,
+            "post_opening": True,
         }
+        generate = AsyncMock(side_effect=["Развиваю первую историю.", "Развиваю вторую историю."])
 
-        with patch.object(farm.random, "uniform", return_value=0):
+        with patch.object(farm.random, "uniform", return_value=0), patch.object(
+            farm, "generate_dialogue_turn", new=generate
+        ):
             await farm.run_scenario(accounts, state, stop_event, settings)
 
         self.assertTrue(stop_event.is_set())
+        self.assertEqual(state.topic, "")
         self.assertEqual([len(account.sent) for account in accounts], [1, 1])
-        self.assertNotEqual(accounts[0].sent[0]["text"], accounts[1].sent[0]["text"])
+        self.assertEqual([call.args[2] for call in generate.await_args_list], ["", ""])
+        self.assertEqual([call.kwargs["account_name"] for call in generate.await_args_list], ["a", "b"])
+        self.assertEqual(accounts[0].sent[0]["text"], "Развиваю первую историю.")
+        self.assertEqual(accounts[1].sent[0]["text"], "Развиваю вторую историю.")
 
     async def test_combined_dialogue_finishes_without_stopping_incoming_replies(self):
         state = farm.FarmState()

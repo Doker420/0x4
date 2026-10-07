@@ -80,6 +80,23 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["farm"]["agent_prompt"], "Keep replies concise.")
         self.assertEqual(config["accounts"][0]["persona"], "short and friendly")
 
+    async def test_history_dialogue_runtime_clears_stale_topic_and_opening(self):
+        await db.set_setting("farm_settings", json.dumps({
+            "scenario_mode": "history_dialogue",
+            "scenario_topic": "Saved but hidden topic",
+            "post_opening": True,
+        }))
+        with patch.dict(os.environ, {
+            "FARM_OVERRIDE_SCENARIO_MODE": "history_dialogue",
+            "FARM_OVERRIDE_SCENARIO_TOPIC": "",
+            "FARM_OVERRIDE_POST_OPENING": "1",
+        }):
+            config, _settings = await farm._load_runtime_config()
+
+        self.assertEqual(config["farm"]["scenario_mode"], "history_dialogue")
+        self.assertEqual(config["farm"]["scenario_topic"], "")
+        self.assertFalse(config["farm"]["post_opening"])
+
     async def test_panel_settings_and_account_edits_feed_farm_runtime(self):
         config, settings = await farm._load_runtime_config()
         self.assertEqual(config["target_chat_id"], -1001234567890)

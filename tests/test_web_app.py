@@ -76,7 +76,12 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("права администратора не требуются", chatfarm.text)
         self.assertIn("Перед запуском взять последние сообщения как контекст", chatfarm.text)
         self.assertIn('name="history_source"', chatfarm.text)
-        self.assertIn("ID/ссылка чата-источника истории", chatfarm.text)
+        self.assertIn("ID целевого чата", chatfarm.text)
+        self.assertIn("ID чата-источника истории", chatfarm.text)
+        self.assertIn("historySource.required = historyDialogue;", chatfarm.text)
+        self.assertIn("document.getElementById('scenario_topic_field').hidden = historyDialogue;", chatfarm.text)
+        self.assertIn("document.getElementById('history_context_options').hidden = !useHistory;", chatfarm.text)
+        self.assertIn("Общая тема и стартовая публикация отключены", chatfarm.text)
         self.assertIn("бот 1 получает только сообщения обезличенного участника 1", chatfarm.text)
         self.assertIn('name="auto_join_history"', chatfarm.text)
         self.assertIn("Глубина истории, сообщений", chatfarm.text)
@@ -451,22 +456,31 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid_id.status_code, 422)
         self.assertIn("числового ID", invalid_id.json()["detail"])
 
-    async def test_dedicated_history_dialogue_mode_always_collects_history(self):
+    async def test_dedicated_history_dialogue_requires_source_but_no_common_topic(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(
                 name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
             )
+        base = {
+            "accounts": "alpha,beta",
+            "target_id": "-1001234567890",
+            "min_delay": "5",
+            "max_delay": "15",
+            "scenario_mode": "history_dialogue",
+            "scenario_topic": "stale topic must be ignored",
+            "context_reader": "alpha",
+            "history_limit": "60",
+            "post_opening": "on",
+            "automation_ack": "on",
+        }
+        missing_source = await self.client.post("/api/chatfarm/start", data=base)
+        self.assertEqual(missing_source.status_code, 422)
+        self.assertIn("источника истории отдельно", missing_source.json()["detail"])
+
         with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=74) as submit:
-            response = await self.client.post("/api/chatfarm/start", data={
-                "accounts": "alpha,beta",
-                "target_id": "-1001234567890",
-                "min_delay": "5",
-                "max_delay": "15",
-                "scenario_mode": "history_dialogue",
-                "context_reader": "alpha",
-                "history_limit": "60",
-                "automation_ack": "on",
-            })
+            response = await self.client.post(
+                "/api/chatfarm/start", data={**base, "history_source": "-1001234567899"}
+            )
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["collecting_history"])
@@ -474,6 +488,10 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["scenario_mode"], "history_dialogue")
         self.assertTrue(submitted["collect_history"])
         self.assertEqual(submitted["history_limit"], 60)
+        self.assertEqual(submitted["target_id"], -1001234567890)
+        self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
+        self.assertEqual(submitted["scenario_topic"], "")
+        self.assertFalse(submitted["post_opening"])
 
     async def test_chatfarm_history_reader_must_be_a_selected_account(self):
         for name in ("alpha", "beta"):
@@ -560,6 +578,42 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_CONTEXT_CHAT_ID"], "-1001234567899")
         collect.assert_awaited_once()
         spawn.assert_awaited_once()
+
+    async def test_history_dialogue_needs_two_distinct_donor_participants(self):
+        process = AsyncMock()
+        payload = {
+            "collect_history": True,
+            "target_id": -1001234567890,
+            "topic_id": 0,
+            "context_reader": "alpha",
+            "accounts": ["alpha", "beta"],
+            "history_limit": 60,
+            "history_reference": {
+                "chat_ref": -1001234567899, "invite_hash": None, "topic_id": None, "source": "id",
+            },
+            "history_topic_id": 0,
+            "history_auto_join": False,
+            "scenario_mode": "history_dialogue",
+        }
+        with (
+            patch.object(web_app, "FARM_PROCESS", None),
+            patch.object(web_app.manager.manager, "farm_sessions_busy", return_value=False),
+            patch.object(
+                web_app.chat_context,
+                "collect_chat_context",
+                new=AsyncMock(return_value={
+                    "chat_id": -1001234567899,
+                    "message_count": 20,
+                    "account_participant_ids": {"alpha": 1, "beta": 1},
+                }),
+            ) as collect,
+            patch.object(web_app.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "двух разных участников"):
+                await web_app._h_start_chatfarm(payload)
+
+        collect.assert_awaited_once()
+        spawn.assert_not_awaited()
 
     async def test_chatfarm_scenario_requires_multiple_accounts_and_valid_numbers(self):
         for name in ("alpha", "beta"):

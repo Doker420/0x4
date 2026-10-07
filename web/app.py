@@ -876,8 +876,9 @@ async def api_chatfarm_start(
     if collect_history and not 1 <= history_limit <= chat_context.MAX_HISTORY:
         raise HTTPException(422, f"Глубина истории должна быть от 1 до {chat_context.MAX_HISTORY}")
     behavior_only = scenario_mode == "reactive"
-    scenario_topic = "" if behavior_only else scenario_topic.strip()
-    if not scenario_topic and collect_history:
+    topicless_history_dialogue = scenario_mode == "history_dialogue"
+    scenario_topic = "" if behavior_only or topicless_history_dialogue else scenario_topic.strip()
+    if not scenario_topic and collect_history and not topicless_history_dialogue:
         scenario_topic = "Прозрачный сценарный диалог по общим идеям из недавней истории чата; без имитации участников."
     if len(scenario_topic) > 2000:
         raise HTTPException(422, "Тема или правила сценария: максимум 2000 символов")
@@ -900,6 +901,8 @@ async def api_chatfarm_start(
     auto_join_history_enabled = collect_history and auto_join_history is not None
     if collect_history:
         source_value = history_source.strip()
+        if topicless_history_dialogue and not source_value:
+            raise HTTPException(422, "Укажите ID или ссылку чата-источника истории отдельно от целевого чата")
         try:
             history_source_reference = (
                 chat_context.parse_chat_link(source_value)
@@ -945,7 +948,7 @@ async def api_chatfarm_start(
     if scenario_mode != "reactive":
         if len(clean_names) < 2:
             raise HTTPException(422, "Для сценария с диалогом выберите минимум два аккаунта")
-        if not scenario_topic:
+        if not scenario_topic and not topicless_history_dialogue:
             raise HTTPException(422, "Укажите общую тему или правила сценария")
         if min_delay < 5:
             raise HTTPException(422, "Для диалога между аккаунтами пауза должна быть не короче 5 секунд")
@@ -992,7 +995,7 @@ async def api_chatfarm_start(
         "rest_min_sec": 60 if behavior_only else rest_min_sec,
         "rest_max_sec": 120 if behavior_only else rest_max_sec,
         "roulette_numbers": "0-36" if behavior_only else roulette_numbers.strip(),
-        "post_opening": not behavior_only and post_opening is not None,
+        "post_opening": not behavior_only and not topicless_history_dialogue and post_opening is not None,
         "automation_acknowledged": automation_ack is not None,
     }
     history_invite_token = (
@@ -1070,6 +1073,19 @@ async def _h_start_chatfarm(payload: dict) -> dict:
             "download_media": False,
             "auto_join": bool(payload.get("history_auto_join", False)),
         })
+        if payload.get("scenario_mode") == "history_dialogue":
+            participant_ids = set()
+            for name, participant_id in (history_result.get("account_participant_ids") or {}).items():
+                if name in payload.get("accounts", []):
+                    try:
+                        participant_ids.add(int(participant_id))
+                    except (TypeError, ValueError):
+                        continue
+            if len(participant_ids) < 2:
+                raise RuntimeError(
+                    "Для диалога по истории нужны сообщения как минимум двух разных участников. "
+                    "Увеличьте глубину или выберите другой источник."
+                )
         assignments = ", ".join(
             f"{name} → участник {participant_id}"
             for name, participant_id in (history_result.get("account_participant_ids") or {}).items()

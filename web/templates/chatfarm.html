@@ -19,7 +19,7 @@
     {% if accounts %}
     <form id="farm_form" onsubmit="startFarm(event)">
       <div class="field">
-        <label for="target_id_input">Chat ID</label>
+        <label for="target_id_input">ID целевого чата <span class="subtle">(куда отправлять сообщения)</span></label>
         <input id="target_id_input" name="target_id" type="number" list="known_chat_targets" value="{{ target_prefill }}" placeholder="Например: -1001234567890" required>
         <datalist id="known_chat_targets">
           {% for target in targets %}<option value="{{ target.chat_id }}" label="{{ target.title or target.username or target.chat_id }}"></option>{% endfor %}
@@ -40,12 +40,12 @@
           <option value="history_dialogue">Диалог по истории чата</option>
           <option value="roulette">Рулетка — случайные числа</option>
         </select>
-        <span id="scenario_mode_help" class="help">Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; тему вводить не нужно.</span>
+        <span id="scenario_mode_help" class="help">Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; тему вводить не нужно. Для режима истории выберите «Диалог по истории чата» — появятся отдельные поля ID источника и глубины.</span>
       </div>
       <div class="notice warning" style="margin:0 0 10px">Автоматизируйте только чат, где у вас есть разрешение, и предупредите участников. Для чата назначения аккаунты должны быть участниками; явное авто-вступление доступно только для источника истории ниже.</div>
       <label class="check-row" style="align-items:flex-start;margin:0 0 16px"><input id="automation_ack" type="checkbox" name="automation_ack" required><span>У меня есть разрешение, я объявил в чате об автоматических сообщениях, выбранные аккаунты состоят в целевом чате и (если включу ниже) могут вступить в чат-источник.</span></label>
       <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
-        <div class="field">
+        <div class="field" id="scenario_topic_field">
           <label for="scenario_topic">Общая тема, вопрос или правила игры</label>
           <textarea id="scenario_topic" name="scenario_topic" rows="4" maxlength="2000" placeholder="Например: Рулетка началась — выберите число от 0 до 36. Участвуют только числа, опубликованные в чате. Или задайте вопрос для обсуждения."></textarea>
           <span class="help">Дайте тему или стартовый вопрос — дальше аккаунты будут сами строить цепочку: отвечать на предыдущую реплику, добавлять новый взгляд и иногда задавать следующий вопрос. Для новостной дискуссии вставьте заголовок; актуальные факты доступны только при установленном DeepSeek bridge и включённом веб-поиске.</span>
@@ -53,13 +53,13 @@
         <div id="history_context_fields" class="card compact" hidden style="margin:0 0 14px;background:rgba(8,15,23,.48)">
           <label class="check-row" style="align-items:flex-start;margin-bottom:10px">
             <input id="collect_context_history" type="checkbox" name="collect_context_history">
-            <span><strong>Перед запуском взять последние сообщения как контекст</strong><small>По умолчанию источник — целевой Chat ID выше. При необходимости можно указать отдельный чат-донор.</small></span>
+            <span><strong>Перед запуском взять последние сообщения как контекст</strong><small>В других сценарных режимах пустой источник означает целевой чат. В режиме истории источник указывается явно и отдельно от цели.</small></span>
           </label>
           <div id="history_context_options" hidden>
             <div class="field">
-              <label for="history_source">ID/ссылка чата-источника истории <span class="subtle">(необязательно)</span></label>
-              <input id="history_source" name="history_source" type="text" maxlength="512" value="{{ history_source_prefill }}" placeholder="Пусто — целевой чат; иначе ID, @username или ссылка t.me">
-              <span class="help">История будет собрана до старта и применена как контекст к диалогу в целевом чате. Вставьте числовой ID, публичный username или ссылку (включая invite-ссылку).</span>
+              <label for="history_source">ID чата-источника истории</label>
+              <input id="history_source" name="history_source" type="text" maxlength="512" value="{{ history_source_prefill }}" placeholder="-1001234567890, @username или ссылка t.me">
+              <span class="help">Для режима «Диалог по истории чата» укажите источник отдельно от целевого чата выше. Поддерживаются числовой ID, публичный username и ссылка (включая invite-ссылку); история будет собрана до старта.</span>
             </div>
             <div class="grid-2">
               <div class="field"><label for="history_limit_input">Глубина истории, сообщений</label><input id="history_limit_input" name="history_limit" type="number" min="1" max="300" step="1" value="100"><span class="help">От 1 до 300 последних сообщений.</span></div>
@@ -86,7 +86,7 @@
             <div class="field"><label for="rest_max_sec">До, сек</label><input id="rest_max_sec" name="rest_max_sec" type="number" min="15" max="86400" step="1" value="120" required></div>
           </div>
         </div>
-        <div class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
+        <div id="post_opening_row" class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
         <p id="scenario_runtime_help" class="help">Нет сценарной темы, стартового сообщения и цепочки авто-диалога; используются сохранённые настройки поведения аккаунтов.</p>
       </div>
       <div class="field">
@@ -157,16 +157,32 @@ function updateScenarioForm() {
   else if (!supportsHistory) historyCheckbox.checked = false;
   historyCheckbox.disabled = historyDialogue;
   const useHistory = supportsHistory && historyCheckbox.checked;
+  const scenarioTopic = document.getElementById('scenario_topic');
+  const postOpening = document.getElementById('post_opening');
   if (mode === 'reactive') {
-    document.getElementById('scenario_topic').value = '';
-    document.getElementById('post_opening').checked = false;
+    scenarioTopic.value = '';
+    postOpening.checked = false;
+  }
+  if (historyDialogue) {
+    scenarioTopic.value = '';
+    postOpening.checked = false;
   }
   document.getElementById('scenario_fields').hidden = !active;
   document.getElementById('roulette_fields').hidden = !roulette;
   document.getElementById('history_context_fields').hidden = !supportsHistory;
   document.getElementById('history_context_options').hidden = !useHistory;
+  document.getElementById('scenario_topic_field').hidden = historyDialogue;
+  document.getElementById('post_opening_row').hidden = historyDialogue;
+  postOpening.disabled = historyDialogue;
+  const historySource = document.getElementById('history_source');
+  historySource.required = historyDialogue;
+  historySource.disabled = !useHistory;
   document.getElementById('history_limit_input').required = useHistory;
+  document.getElementById('history_limit_input').disabled = !useHistory;
   document.getElementById('context_reader').required = useHistory;
+  document.getElementById('context_reader').disabled = !useHistory;
+  document.getElementById('history_topic_id').disabled = !useHistory;
+  document.getElementById('auto_join_history').disabled = !useHistory;
   document.getElementById('reactive_options').hidden = !(mode === 'reactive' || combined);
   document.getElementById('qa_probability_field').hidden = mode !== 'reactive';
   document.getElementById('clone_probability_field').hidden = mode !== 'reactive';
@@ -185,7 +201,7 @@ function updateScenarioForm() {
     document.getElementById('scenario_turns').value = historyDialogue ? '8' : (mode === 'discussion' || combined) ? '0' : '20';
   }
   document.getElementById('scenario_mode_help').textContent = historyDialogue
-    ? 'Укажите ID целевого чата и глубину истории; если источник другой, впишите его ID/ссылку отдельно (пустое поле использует цель). Выберите сессию для чтения; администратор не нужен. Панель соберёт обезличенный контекст до запуска цепочки.'
+    ? 'Укажите ID целевого чата, отдельно ID чата-источника истории и глубину сообщений. Если источник совпадает с целью, повторите его ID в поле источника. Выберите сессию для чтения; администратор не нужен. Панель соберёт обезличенный контекст до запуска диалога без общей темы.'
     : combined
       ? 'Аккаунты сами строят цепочку: каждый следующий ход реплаем продолжает предыдущий. Одновременно один случайный аккаунт может ответить реплаем на вопрос участника.'
       : roulette
@@ -194,7 +210,7 @@ function updateScenarioForm() {
           ? 'Аккаунты сами ведут цепочку: следующий участник отвечает на предыдущую реплику и развивает тему.'
           : 'Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; автономная активность — только если отдельно разрешена там. Тему вводить не нужно.';
   document.getElementById('scenario_runtime_help').textContent = historyDialogue
-    ? 'Используются последние сообщения как обезличенный контекст; реальные авторы не копируются. Сессии по очереди развивают одну мысль, а GIF, стикеры, фото и голосовые выбираются по индивидуальным весам.'
+    ? 'Общая тема и стартовая публикация отключены. Используются последние сообщения как обезличенный контекст; каждый аккаунт получает только историю назначенного участника, без копирования реальных авторов и их стиля. Сессии развивают свои синтетические роли.'
     : combined
       ? 'Сообщения в выбранной теме попадают в контекст. Вопросы и просьбы распознаются по смыслу — знак вопроса не обязателен; один случайный аккаунт может ответить реплаем. Обычные сообщения остаются контекстом без автоматического ответа. После лимита диалога ответы продолжаются до ручной остановки.'
       : roulette

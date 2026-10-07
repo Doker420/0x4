@@ -1696,8 +1696,10 @@ async def run_scenario(
         raise RuntimeError("Для сценария нужны минимум два подключённых аккаунта")
 
     topic = str(settings.get("scenario_topic") or "").strip()
-    if not topic:
+    if not topic and mode != "history_dialogue":
         raise RuntimeError("Укажите тему сценария в веб-панели")
+    if mode == "history_dialogue":
+        topic = ""
     numbers = parse_roulette_numbers(settings.get("roulette_numbers", "0-36")) if mode == "roulette" else []
     state.topic = topic
     # Keep the bounded, authorized chat transcript as generation context; only reset
@@ -1705,7 +1707,8 @@ async def run_scenario(
     state.last_outgoing_message_id = None
 
     opening_sent = False
-    if settings.get("post_opening", True):
+    post_opening = bool(settings.get("post_opening", True)) and mode != "history_dialogue"
+    if post_opening:
         opener = accounts[0]
         async with state.outgoing_lock:
             opening_sent = await opener._send_text(topic, reply_to=FARM_CFG.get("topic_id"))
@@ -1935,12 +1938,14 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
             farm_sub[setting] = raw_value
         elif (
             setting == "scenario_topic"
-            and os.getenv("FARM_OVERRIDE_SCENARIO_MODE", "").strip().lower() == "reactive"
+            and os.getenv("FARM_OVERRIDE_SCENARIO_MODE", "").strip().lower()
+            in {"reactive", "history_dialogue"}
         ):
-            # An empty scenario prompt is meaningful for behavior-only launches;
-            # do not inherit a stale topic from farm_config.json or the web DB.
+            # These modes are topicless by design; do not inherit stale scenario text.
             farm_sub[setting] = ""
     farm_sub.update(load_farm_settings(farm_sub))
+    if farm_sub.get("scenario_mode") == "history_dialogue":
+        farm_sub.update({"scenario_topic": "", "post_opening": False})
     if farm_sub.get("scenario_mode") == "reactive":
         farm_sub.update({
             "scenario_topic": "",
@@ -2153,6 +2158,17 @@ async def run_farm() -> None:
             raise SystemExit("Ни один аккаунт не запустился; проверьте сессии и доступ к чату")
         if scenario_mode != "reactive" and len(accounts) < 2:
             raise SystemExit("Для сценария с диалогом нужно минимум два успешно подключённых аккаунта")
+        if scenario_mode == "history_dialogue":
+            assigned_participants = {
+                state.account_participant_ids.get(account.name)
+                for account in accounts
+                if state.account_participant_ids.get(account.name) is not None
+            }
+            if len(assigned_participants) < 2:
+                raise SystemExit(
+                    "Для диалога по истории нужны сообщения как минимум двух разных участников; "
+                    "увеличьте глубину или выберите другой источник"
+                )
         for account in accounts:
             account.farm_accounts = accounts
 
