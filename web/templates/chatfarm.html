@@ -69,7 +69,7 @@
               <div class="field"><label for="history_topic_id">ID темы источника <span class="subtle">(необязательно)</span></label><input id="history_topic_id" name="history_topic_id" type="number" min="0" value="{{ history_topic_prefill or '0' }}"><span class="help">0 — использовать ID темы из ссылки, либо всю историю.</span></div>
               <label class="check-row" style="align-items:flex-start"><input id="auto_join_history" type="checkbox" name="auto_join_history"><span><strong>Автоматически вступить аккаунтами диалога в источник, если их там нет</strong><small>Только по username или invite-ссылке. Числовой ID и ссылка <code>t.me/c/…</code> не дают способа вступить; invite-запросы с одобрением могут не завершиться сразу.</small></span></label>
             </div>
-            <p class="help">Все выбранные аккаунты проверяются на членство в источнике; если авто-вступление не включено, они должны уже быть участниками. Права администратора не требуются. Аккаунты сопоставляются строго 1:1 сверху вниз: бот 1 получает только сообщения обезличенного участника 1, бот 2 — участника 2 и т. д.; номера идут по первому появлению в истории. Для режима «Диалог по истории чата» нужен отдельный участник на каждый аккаунт: 30 аккаунтов — минимум 30 разных участников в выбранной глубине. Используются синтетические роли, без копирования имён и стиля. Для запуска без сбора оставьте флажок выше выключенным.</p>
+            <p class="help">Все выбранные аккаунты проверяются на членство в источнике; если авто-вступление не включено, они должны уже быть участниками. Права администратора для чтения не требуются. Авто-вступление выполняется только по явному выбору и только по username или invite-ссылке. Аккаунты сопоставляются строго 1:1 без повторов: бот 1 получает только сообщения обезличенного участника 1 (тексты, медиа и голосовые), бот 2 — участника 2 и т. д.; номера идут по первому появлению в истории. Для режима «Диалог по истории чата» нужен отдельный участник на каждый аккаунт: 30 аккаунтов — минимум 30 разных участников в выбранной глубине. Используются синтетические роли, без копирования имён и стиля реальных авторов. Автоматизацию запускайте только с разрешения и уведомлением участников. Для запуска без сбора оставьте флажок выше выключенным.</p>
           </div>
         </div>
         <div id="roulette_fields" class="field" hidden>
@@ -79,9 +79,9 @@
         </div>
         <div class="grid-2">
           <div class="field"><label id="scenario_turn_label" for="scenario_turns">Ходов диалога</label><input id="scenario_turns" name="scenario_turns" type="number" min="0" max="500" step="1" value="20" required><span id="scenario_turn_help" class="help">0 — работать до ручной остановки.</span></div>
-          <div class="field"><label for="joke_every">Анекдот каждые N ходов</label><input id="joke_every" name="joke_every" type="number" min="0" max="1000" step="1" value="5" required><span class="help">0 — выключить; в рулетке не используется.</span></div>
-          <div class="field"><label for="rest_every">Отдыхать после N ходов</label><input id="rest_every" name="rest_every" type="number" min="0" max="1000" step="1" value="6" required><span class="help">0 — без длинных перерывов.</span></div>
-          <div class="grid-2">
+          <div class="field" id="joke_every_field"><label for="joke_every">Анекдот каждые N ходов</label><input id="joke_every" name="joke_every" type="number" min="0" max="1000" step="1" value="5" required><span class="help">0 — выключить; в рулетке не используется.</span></div>
+          <div class="field" id="rest_every_field"><label for="rest_every">Отдыхать после N ходов</label><input id="rest_every" name="rest_every" type="number" min="0" max="1000" step="1" value="6" required><span class="help">0 — без длинных перерывов.</span></div>
+          <div class="grid-2" id="rest_duration_fields">
             <div class="field"><label for="rest_min_sec">Отдых от, сек</label><input id="rest_min_sec" name="rest_min_sec" type="number" min="15" max="86400" step="1" value="60" required></div>
             <div class="field"><label for="rest_max_sec">До, сек</label><input id="rest_max_sec" name="rest_max_sec" type="number" min="15" max="86400" step="1" value="120" required></div>
           </div>
@@ -174,6 +174,12 @@ function updateScenarioForm() {
   document.getElementById('scenario_topic_field').hidden = historyDialogue;
   document.getElementById('post_opening_row').hidden = historyDialogue;
   postOpening.disabled = historyDialogue;
+  for (const id of ['joke_every_field', 'rest_every_field', 'rest_duration_fields']) {
+    document.getElementById(id).hidden = historyDialogue;
+  }
+  for (const id of ['joke_every', 'rest_every', 'rest_min_sec', 'rest_max_sec']) {
+    document.getElementById(id).disabled = historyDialogue;
+  }
   const historySource = document.getElementById('history_source');
   historySource.required = historyDialogue;
   historySource.disabled = !useHistory;
@@ -201,7 +207,7 @@ function updateScenarioForm() {
     document.getElementById('scenario_turns').value = historyDialogue ? '8' : (mode === 'discussion' || combined) ? '0' : '20';
   }
   document.getElementById('scenario_mode_help').textContent = historyDialogue
-    ? 'Укажите ID целевого чата, отдельно ID чата-источника истории и глубину сообщений. Если источник совпадает с целью, повторите его ID в поле источника. Выберите сессию для чтения; администратор не нужен. Панель соберёт обезличенный контекст до запуска диалога без общей темы.'
+    ? 'Нужны только целевой чат, источник истории и глубина сбора. Источник укажите отдельно, даже если это тот же чат. Контекст собирается заранее; общая тема и настройки анекдотов/пауз не требуются. Администратор для чтения не нужен.'
     : combined
       ? 'Аккаунты сами строят цепочку: каждый следующий ход реплаем продолжает предыдущий. Одновременно один случайный аккаунт может ответить реплаем на вопрос участника.'
       : roulette
@@ -210,7 +216,7 @@ function updateScenarioForm() {
           ? 'Аккаунты сами ведут цепочку: следующий участник отвечает на предыдущую реплику и развивает тему.'
           : 'Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; автономная активность — только если отдельно разрешена там. Тему вводить не нужно.';
   document.getElementById('scenario_runtime_help').textContent = historyDialogue
-    ? 'Общая тема и стартовая публикация отключены. Используются последние сообщения как обезличенный контекст; каждый аккаунт получает только историю назначенного участника, без копирования реальных авторов и их стиля. Сессии развивают свои синтетические роли.'
+    ? 'Общая тема и стартовая публикация отключены; анекдоты и длинные сценарные паузы тоже. Тексты, скачанные медиа и голосовые собираются до запуска; каждому аккаунту назначена история одного уникального обезличенного участника. Ответы на вопросы/просьбы и реакции остаются активны; роли синтетические, стиль реальных авторов не копируется.'
     : combined
       ? 'Сообщения в выбранной теме попадают в контекст. Вопросы и просьбы распознаются по смыслу — знак вопроса не обязателен; один случайный аккаунт может ответить реплаем. Обычные сообщения остаются контекстом без автоматического ответа. После лимита диалога ответы продолжаются до ручной остановки.'
       : roulette

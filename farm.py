@@ -770,6 +770,28 @@ DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплик�
 {extra_instruction}
 Только текст реплики:"""
 
+HISTORY_DIALOGUE_TURN_PROMPT = """Ты — автоматизированный аккаунт группового чата с отдельной синтетической ролью. Не изображай реального автора сообщений, не копируй его стиль и не выдумывай личный опыт.
+
+Для этого режима НЕТ общей темы и нет заданного извне предмета разговора. Не пытайся придумать пустую или новую тему.
+
+Синтетическая роль этого аккаунта: {persona}
+Указания поведения аккаунта: {global_prompt}
+Роль и указания влияют на манеру ответа, но не задают тему. Если они подталкивают к предмету, которого нет в назначенном архиве, не вводи его.
+
+Единственный архивный источник содержания для этого аккаунта — сообщения ниже. Он собран заранее и назначен только этому аккаунту; сообщения других авторов источника не используй.
+Выбранная реплика из собственного архива:
+{history_seed}
+Последние сообщения этого же автора из архива:
+{source_context}
+
+Уже опубликованные реплики синтетических аккаунтов в целевом чате — только для связи между ходами:
+{conversation_context}
+Последняя реплика в цепочке:
+{previous_turn}
+
+Создай одну короткую естественную реплику в соответствии со своей синтетической ролью. Начни разговор с конкретной мысли, вопроса или детали, которая действительно есть в назначенном архиве; затем развивай только этот материал. Не добавляй общую тему, внешние факты, придуманный сюжет, шутки или пустые рассуждения. Не цитируй исходную формулировку дословно и не подражай автору. Если в архиве только медиа без подписи, не выдумывай его содержимое и верни ровно [NO_TEXT] — тогда будет отправлено только архивное медиа. Если из архивных текстов нечего безопасно сказать, тоже верни ровно [NO_TEXT].
+Не начинай с общих фраз вроде «Давайте обсудим», «Интересная тема» или «Согласен». До 200 символов. Верни только готовую реплику либо [NO_TEXT]."""
+
 CLEAN_JOKES = (
     "— Почему книга по математике грустила? — У неё было слишком много задач.",
     "— Что сказал ноль восьмёрке? — Отличный ремень!",
@@ -806,21 +828,148 @@ def _is_circular_dialogue_reply(text: str) -> bool:
     return bool(_CIRCULAR_DIALOGUE_RE.search(str(text or "")))
 
 
+def _history_source_text(item: dict[str, Any]) -> str:
+    """Get source-authored text, excluding placeholders inserted for media-only messages."""
+    value = (
+        item.get("source_text") if "source_text" in item else item.get("text")
+    ) if item.get("direction") == "context" else item.get("text")
+    text = str(value or "").strip()
+    if item.get("direction") == "context" and "source_text" not in item:
+        text = re.sub(r"\s*\[media:[^\]]+\]\s*$", "", text, flags=re.IGNORECASE).strip()
+    if re.fullmatch(r"\[(?:gif|photo|sticker|voice|video|file|media)\]", text, re.IGNORECASE):
+        return ""
+    if re.fullmatch(r"\[media:[^\]]+\]", text, re.IGNORECASE):
+        return ""
+    return text
+
+
+def _local_history_media_path(item: dict[str, Any]) -> Path | None:
+    media = item.get("media") if isinstance(item.get("media"), dict) else {}
+    relative = str(media.get("local_file") or item.get("media_file") or "").strip()
+    if not relative:
+        return None
+    root = ROOT.resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path if path.is_file() else None
+
+
+def _has_usable_assigned_history(history: list[dict[str, Any]]) -> bool:
+    return any(_history_source_text(item) or _local_history_media_path(item) for item in history)
+
+
 def _human_message_for_turn(history: list[dict[str, Any]], turn_number: int) -> str:
     """Select a human seed newest-first without copying an unbounded archive."""
     phase = (max(1, turn_number) - 1) // len(DIALOGUE_PROGRESS_STEPS)
     for item in reversed(history):
         if item.get("direction") == "outgoing":
             continue
-        text = str(item.get("text") or "").strip()
-        if not text or re.fullmatch(r"\[(?:gif|photo|sticker|voice|video|file|media)\]", text, re.IGNORECASE):
-            continue
+        text = _history_source_text(item)
         if len(text) < 6:
             continue
         if phase == 0:
             return text
         phase -= 1
     return ""
+
+
+def _assigned_history_item(history: list[dict[str, Any]], turn_number: int) -> dict[str, Any] | None:
+    """Rotate through every usable message in this account's one assigned source archive."""
+    messages = [
+        item for item in reversed(history)
+        if len(_history_source_text(item)) >= 6 or _local_history_media_path(item)
+    ]
+    if not messages:
+        return None
+    return messages[(max(1, int(turn_number)) - 1) % len(messages)]
+
+
+def _assigned_history_seed(history: list[dict[str, Any]], turn_number: int) -> str:
+    item = _assigned_history_item(history, turn_number)
+    return _history_source_text(item) if item else ""
+
+
+def _history_anchor_terms(text: str) -> set[str]:
+    stopwords = {
+        "когда", "который", "которая", "которые", "почему", "потому", "чтобы", "здесь", "тогда",
+        "этого", "этими", "такой", "такие", "можно", "нужно", "будет", "очень", "просто", "вообще",
+        "кажется", "важно", "тема", "темы", "тему", "вопрос", "ответ", "сейчас", "говорит", "сказал",
+        "сказала", "может", "думаю", "согласен", "интересно", "посмотреть", "другой", "стороны",
+        "котором", "самый", "самая", "самое", "своей", "своего", "своими", "если", "именно",
+        "участник", "участника", "участнику", "участником", "участнице", "чата", "сообщение",
+        "сообщения", "сообщений", "архиве", "истории", "реплика", "реплики",
+    }
+    return {
+        word[:5]
+        for word in re.findall(r"[a-zа-яё]{5,}", str(text or "").casefold())
+        if word not in stopwords
+    }
+
+
+def _history_reply_is_anchored(reply: str, source_context: str) -> bool:
+    source_terms = _history_anchor_terms(source_context)
+    if not source_terms:
+        return bool(reply.strip())
+    reply_terms = _history_anchor_terms(reply)
+    return bool(source_terms & reply_terms)
+
+
+def _history_offline_terms(text: str) -> str:
+    stopwords = {
+        "когда", "который", "которая", "которые", "почему", "потому", "чтобы", "здесь", "тогда",
+        "этого", "этими", "такой", "такие", "можно", "нужно", "будет", "очень", "просто", "вообще",
+        "кажется", "важно", "тема", "темы", "тему", "вопрос", "ответ", "сейчас", "говорит", "сказал",
+        "сказала", "может", "думаю", "согласен", "интересно", "посмотреть", "другой", "стороны",
+        "котором", "самый", "самая", "самое", "своей", "своего", "своими", "если", "именно",
+        "между", "среди", "сегодня", "вчера", "завтра", "этот", "эта", "эти", "это", "того", "тем",
+        "есть", "был", "была", "были", "было", "нет", "там", "тут", "пока", "потом", "тоже", "всегда",
+        "меня", "него", "нас", "они", "мне", "тебя", "кому", "куда", "где", "или", "уже", "лишь",
+        "только", "через", "около", "очень", "может", "ваши", "свои", "который", "которые",
+    }
+    terms: list[str] = []
+    for word in re.findall(r"[a-zа-яё]{4,}", str(text or "").casefold()):
+        if word not in stopwords and word not in terms:
+            terms.append(word)
+        if len(terms) == 3:
+            break
+    return ", ".join(terms)
+
+
+def _history_offline_turn(source_text: str, persona: str, history: list[dict[str, Any]]) -> str:
+    """Ground an offline line in words from the assigned archive, never in a blank topic."""
+    terms = _history_offline_terms(source_text)
+    if not source_text.strip() or not terms:
+        return ""
+    role = persona.casefold()
+    if "аналит" in role or "факт" in role:
+        candidates = (
+            f"В деталях «{terms}» я бы отделил наблюдение от предположения.",
+            f"Если опираться на «{terms}», полезно проверить одну конкретную деталь.",
+        )
+    elif "практич" in role or "шаг" in role:
+        candidates = (
+            f"Если опираться на детали «{terms}», я бы проверил одну из них на конкретном примере.",
+            f"Детали «{terms}» подсказывают практичный первый шаг — проверить один критерий.",
+        )
+    elif "любозн" in role or "уточня" in role:
+        candidates = (
+            f"Зацепили детали «{terms}». Какая из них здесь важнее всего?",
+            f"В истории отмечены «{terms}»; интересно, какая деталь сильнее влияет на ситуацию.",
+        )
+    elif "лаконич" in role or "кратко" in role:
+        candidates = (
+            f"Важные детали из архива — «{terms}»; остальное пока не додумываю.",
+            f"Зафиксирую «{terms}» как опору; для вывода данных пока мало.",
+        )
+    else:
+        candidates = (
+            f"Зацепили детали «{terms}». Я бы продолжил разговор с одной из них.",
+            f"Из истории выделяются «{terms}» — можно развить именно эту мысль.",
+        )
+    return _choose_natural_reply(candidates, history)
 
 
 def _context_participant_id(item: dict[str, Any]) -> int | None:
@@ -1234,6 +1383,84 @@ async def generate_dialogue_turn(
     return _progressive_offline_turn(topic, source_text, turn_number, history)
 
 
+async def generate_history_dialogue_turn(
+    bridge: Any,
+    state: FarmState,
+    persona: str,
+    turn_number: int,
+    *,
+    account_name: str,
+    global_prompt: str = "",
+) -> str:
+    """Generate a topicless turn anchored strictly to this account's assigned archive."""
+    async with state.lock:
+        donor_history, live_history = _state_history_parts(state, account_name)
+        history = [*donor_history[-8:], *live_history[-60:]]
+        source_text = _assigned_history_seed(donor_history, turn_number)
+        source_context = build_context(deque(donor_history[-12:]), limit=12)
+        synthetic_turns = [item for item in live_history if item.get("direction") == "outgoing"][-8:]
+        conversation_context = build_context(deque(synthetic_turns), limit=8)
+    if not source_text:
+        return ""
+
+    previous_turn = (
+        _short_context_line(str(synthetic_turns[-1].get("text") or ""), 240)
+        if synthetic_turns else "(пока нет реплик)"
+    )
+    if bridge and getattr(bridge, "is_ready", False):
+        prompt = HISTORY_DIALOGUE_TURN_PROMPT.format(
+            persona=persona[:500],
+            global_prompt=global_prompt[:2000] or "соблюдай синтетическую роль и пиши естественно",
+            history_seed=_short_context_line(source_text, 360),
+            source_context=source_context,
+            conversation_context=conversation_context,
+            previous_turn=previous_turn,
+        )
+        try:
+            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
+                return ""
+            rejected = bool(text) and (
+                _is_canned_reply(text)
+                or _is_circular_dialogue_reply(text)
+                or is_dialogue_echo(text, history)
+                or not _history_reply_is_anchored(text, source_context)
+            )
+            if rejected:
+                log.warning("[%s] history turn was generic or ungrounded; retrying once", persona[:32])
+                retry_prompt = (
+                    prompt
+                    + "\n\nПредыдущая реплика не опиралась на твой назначенный архив. Перепиши её, "
+                    "используя конкретный факт или слово из собственного исторического контекста. "
+                    "Не вводи новую тему и не копируй исходную формулировку."
+                )
+                text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
+                    return ""
+                if text and (
+                    _is_canned_reply(text)
+                    or _is_circular_dialogue_reply(text)
+                    or is_dialogue_echo(text, history)
+                    or not _history_reply_is_anchored(text, source_context)
+                ):
+                    text = ""
+            if text:
+                return text
+        except Exception:
+            log.exception("[%s] history dialogue generation failed", persona[:32])
+
+    return _history_offline_turn(source_text, persona, history)
+
+
+async def next_history_turn_item(
+    state: FarmState, account_name: str, turn_number: int
+) -> dict[str, Any] | None:
+    """Return the assigned archive message this turn is based on (text and/or media)."""
+    async with state.lock:
+        donor_history, _live_history = _state_history_parts(state, account_name)
+    return _assigned_history_item(donor_history, turn_number)
+
+
 async def generate_reaction(bridge: Any, text: str) -> str:
     allowed = ["👍", "❤️", "🔥", "😁", "🤔", "👏", "🎉", "😢", "🤯"]
     if bridge and getattr(bridge, "is_ready", False):
@@ -1369,9 +1596,8 @@ class FarmAccount:
         farm_cfg = FARM_CFG.get("farm", {})
         scenario_mode = farm_cfg.get("scenario_mode", "reactive")
         self._running = True
-        if scenario_mode in {"reactive", "combined"}:
-            # Combined mode keeps the normal reply handler active while a single
-            # scenario scheduler adds sequential account-to-account turns.
+        if scenario_mode in {"reactive", "combined", "history_dialogue"}:
+            # Combined and history modes keep replies active while the scenario scheduler runs.
             self.client.add_handler(
                 MessageHandler(
                     self._on_incoming,
@@ -1411,7 +1637,7 @@ class FarmAccount:
     async def _on_incoming(self, client: Client, message: TGMessage) -> None:
         del client
         scenario_mode = FARM_CFG.get("farm", {}).get("scenario_mode", "reactive")
-        if scenario_mode not in {"reactive", "combined"}:
+        if scenario_mode not in {"reactive", "combined", "history_dialogue"}:
             return
         if not message or getattr(message, "empty", False) or getattr(message, "service", None):
             return
@@ -1441,7 +1667,7 @@ class FarmAccount:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
 
-        if scenario_mode == "combined" and not is_question:
+        if scenario_mode in {"combined", "history_dialogue"} and not is_question:
             log.info("[%s] входящее сообщение %s сохранено как контекст; вопрос не распознан", self.name, message.id)
             return
 
@@ -1606,7 +1832,7 @@ class FarmAccount:
             return _offline_conversational_reply(
                 fallback_input,
                 history,
-                topic if scenario_mode != "reactive" else "",
+                topic if scenario_mode not in {"reactive", "history_dialogue"} else "",
             )
 
         try:
@@ -1620,7 +1846,7 @@ class FarmAccount:
                 self.donor,
                 persona,
                 incoming_text,
-                include_scenario_topic=scenario_mode != "reactive",
+                include_scenario_topic=scenario_mode not in {"reactive", "history_dialogue"},
                 account_name=self.name,
             )
         except Exception:
@@ -1632,6 +1858,12 @@ class FarmAccount:
         if _is_canned_reply(text):
             log.warning("[%s] blocked canned reply at send boundary", self.name)
             text = await local_fallback()
+
+        if scenario_mode == "history_dialogue":
+            media_item = self._pick_history_media(force=not bool(text))
+            return await self._send_history_dialogue_content(
+                text, reply_to=reply_to, media_item=media_item
+            )
 
         kind = self._pick_kind()
         try:
@@ -1688,6 +1920,129 @@ class FarmAccount:
         async with self.state.lock:
             self.state.last_outgoing_message_id = text_message_id
         return True
+
+    def _history_media_items(self) -> list[dict[str, Any]]:
+        """Return only downloaded media from this account's uniquely assigned archive."""
+        account_contexts = getattr(self.state, "account_contexts", {})
+        rows = account_contexts.get(self.name, []) if isinstance(account_contexts, dict) else []
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            media = row.get("media") if isinstance(row.get("media"), dict) else {}
+            kind = str(media.get("kind") or row.get("kind") or "").lower()
+            path = _local_history_media_path(row)
+            if path is not None and kind in {"gif", "sticker", "photo", "video", "voice", "audio", "document"}:
+                items.append({**row, "media": dict(media), "_local_path": path})
+        return items
+
+    def _pick_history_media(
+        self, *, force: bool = False, source_message_id: int | None = None
+    ) -> dict[str, Any] | None:
+        items = self._history_media_items()
+        if source_message_id is not None:
+            items = [
+                item for item in items
+                if str(item.get("message_id") or "") == str(source_message_id)
+            ]
+        if not items:
+            return None
+        by_kind: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            kind = str(item.get("media", {}).get("kind") or "")
+            by_kind.setdefault(kind, []).append(item)
+        if force:
+            available = [item for group in by_kind.values() for item in group]
+            return random.choice(available) if available else None
+
+        media_bias = getattr(self, "media_bias", {})
+        weight_key = {"audio": "voice", "video": "gif", "document": "photo"}
+        available_kinds = [
+            kind for kind in by_kind
+            if kind in {"gif", "sticker", "photo", "video", "voice", "audio", "document"}
+            and float(media_bias.get(weight_key.get(kind, kind), 0.0)) > 0
+        ]
+        choices = ["text", *available_kinds]
+        weights = [float(media_bias.get("text", 0.0))]
+        weights.extend(float(media_bias.get(weight_key.get(kind, kind), 0.0)) for kind in available_kinds)
+        if sum(weights) <= 0:
+            return None
+        selected = random.choices(choices, weights=weights, k=1)[0]
+        if selected == "text":
+            return None
+        if selected == "audio":
+            selected = "audio"
+        return random.choice(by_kind[selected])
+
+    async def _send_history_media(
+        self,
+        item: dict[str, Any],
+        *,
+        reply_to: TGMessage | int | None,
+        caption: str = "",
+    ) -> bool:
+        media = item.get("media") if isinstance(item.get("media"), dict) else {}
+        kind = str(media.get("kind") or item.get("kind") or "")
+        path = item.get("_local_path")
+        if not isinstance(path, Path) or not path.is_file():
+            return False
+        kwargs = self._send_kwargs(reply_to)
+        if caption and kind in {"gif", "photo", "video"}:
+            kwargs["caption"] = caption[:1000]
+        methods = {
+            "gif": ("send_animation", "animation"),
+            "sticker": ("send_sticker", "sticker"),
+            "photo": ("send_photo", "photo"),
+            "video": ("send_video", "video"),
+            "voice": ("send_voice", "voice"),
+            "audio": ("send_audio", "audio"),
+            "document": ("send_document", "document"),
+        }
+        method_info = methods.get(kind)
+        if method_info is None:
+            return False
+        method_name, argument_name = method_info
+        sender = getattr(self.client, method_name, None)
+        if sender is None:
+            return False
+        try:
+            if kind == "voice":
+                await self._typing(1.5)
+            message = await sender(**{argument_name: str(path)}, **kwargs)
+            await self._record(message, caption if kind in {"gif", "photo", "video"} else "", kind)
+            log.info("[%s] archive media sent: %s", self.name, kind)
+            return True
+        except Exception:
+            log.exception("[%s] sending assigned archive media failed: %s", self.name, kind)
+            return False
+
+    async def _send_history_dialogue_content(
+        self,
+        text: str,
+        *,
+        reply_to: TGMessage | int | None,
+        media_item: dict[str, Any] | None,
+    ) -> bool:
+        """Send generated text and, when selected, only media from this account's archive."""
+        text = str(text or "").strip()
+        if not text and media_item is None:
+            return False
+        media = media_item.get("media", {}) if media_item else {}
+        kind = str(media.get("kind") or "")
+        if media_item and text and kind in {"gif", "photo", "video"}:
+            if await self._send_history_media(media_item, reply_to=reply_to, caption=text):
+                return True
+        if text:
+            sent_text = await self._send_text(text, reply_to=reply_to)
+            if not sent_text:
+                return False
+            if media_item:
+                async with self.state.lock:
+                    text_message_id = self.state.last_outgoing_message_id
+                if text_message_id:
+                    await self._send_history_media(media_item, reply_to=text_message_id)
+                    async with self.state.lock:
+                        self.state.last_outgoing_message_id = text_message_id
+            return True
+        return await self._send_history_media(media_item, reply_to=reply_to)
 
     def _pick_kind(self) -> str:
         kinds = list(self.media_bias)
@@ -1930,17 +2285,25 @@ async def run_scenario(
 
     min_delay = max(5.0, float(FARM_CFG.get("farm", {}).get("min_delay_sec", 20)))
     max_delay = max(min_delay, float(FARM_CFG.get("farm", {}).get("max_delay_sec", 45)))
-    rest_every = max(0, int(settings.get("rest_every", 6)))
+    rest_every = 0 if mode == "history_dialogue" else max(0, int(settings.get("rest_every", 6)))
     rest_min = max(15.0, float(settings.get("rest_min_sec", 60)))
     rest_max = max(rest_min, float(settings.get("rest_max_sec", 120)))
-    joke_every = max(0, int(settings.get("joke_every", 5)))
+    joke_every = 0 if mode == "history_dialogue" else max(0, int(settings.get("joke_every", 5)))
     turn_limit = max(0, int(settings.get("scenario_turns", 20)))
     turn_index = 0
+    account_turn_counts = {account.name: 0 for account in accounts}
 
-    log.info(
-        "Сценарий %s начат: %d аккаунта(ов), ходов=%s, тема=%r",
-        mode, len(accounts), turn_limit or "до ручной остановки", topic[:120],
-    )
+    if mode == "history_dialogue":
+        log.info(
+            "Диалог по истории начат: %d аккаунтов, ходов=%s, без общей темы и анекдотов; "
+            "каждый аккаунт использует только назначенный ему архив",
+            len(accounts), turn_limit or "до ручной остановки",
+        )
+    else:
+        log.info(
+            "Сценарий %s начат: %d аккаунта(ов), ходов=%s, тема=%r",
+            mode, len(accounts), turn_limit or "до ручной остановки", topic[:120],
+        )
     while not stop_event.is_set() and (turn_limit == 0 or turn_index < turn_limit):
         if turn_index and rest_every and turn_index % rest_every == 0:
             rest = random.uniform(rest_min, rest_max)
@@ -1966,6 +2329,41 @@ async def run_scenario(
                     reply_to = FARM_CFG.get("topic_id")
                 sent = await account._send_text(text, reply_to=reply_to)
             action = f"выбрал число {text}"
+        elif mode == "history_dialogue":
+            account_turn_counts[account.name] += 1
+            turn_number = account_turn_counts[account.name]
+            source_item = await next_history_turn_item(state, account.name, turn_number)
+            text = await generate_history_dialogue_turn(
+                account.bridge,
+                state,
+                account.persona,
+                turn_number,
+                account_name=account.name,
+                global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
+            )
+            # With no safe text, fall back to the media from that same archive message.
+            media_item = account._pick_history_media(
+                force=not bool(text),
+                source_message_id=None if text else (
+                    source_item.get("message_id") if source_item else None
+                ),
+            )
+            async with state.outgoing_lock:
+                async with state.lock:
+                    reply_to = state.last_outgoing_message_id
+                if reply_to is None:
+                    reply_to = FARM_CFG.get("topic_id")
+                sent = await account._send_history_dialogue_content(
+                    text, reply_to=reply_to, media_item=media_item
+                )
+            if text and media_item:
+                action = f"продолжил разговор с медиа из назначенной истории ({media_item['media'].get('kind')})"
+            elif text:
+                action = "продолжил разговор по назначенной истории"
+            elif media_item:
+                action = f"отправил архивное медиа ({media_item['media'].get('kind')})"
+            else:
+                action = "пропустил ход: нет доступного текста или медиа в назначенном архиве"
         else:
             tell_joke = bool(joke_every and (turn_index + 1) % joke_every == 0)
             text = await generate_dialogue_turn(
@@ -1995,8 +2393,8 @@ async def run_scenario(
 
     if turn_limit and turn_index >= turn_limit:
         log.info("Сценарий завершён: отправлено ходов=%d", turn_index)
-        if mode == "combined":
-            log.info("Объединённый режим: ответы на входящие сообщения остаются активными до ручной остановки")
+        if mode in {"combined", "history_dialogue"}:
+            log.info("Ответы на вопросы и реакции остаются активны до ручной остановки")
         else:
             stop_event.set()
 
@@ -2190,6 +2588,8 @@ async def run_farm() -> None:
         )
     elif scenario_mode == "combined":
         log.info("Режим: объединённый — диалог по теме и ответы участникам")
+    elif scenario_mode == "history_dialogue":
+        log.info("Режим: диалог по истории — без общей темы, каждый аккаунт по назначенному участнику")
     else:
         log.info("Режим сценария: %s; автоматические реплики будут чередоваться по очереди", scenario_mode)
 
@@ -2219,6 +2619,10 @@ async def run_farm() -> None:
             "Режим без сценария: сброшены тема, исходящие сценарные реплики и архивный контекст; сохранены только последние входящие сообщения (%d)",
             len(state.chat_history),
         )
+    elif scenario_mode == "history_dialogue":
+        state.reset_for_behavior_only()
+        state.topic = ""
+        log.info("Режим истории: очищены прежняя тема и цепочка; оставлены последние входящие сообщения целевого чата")
     elif os.getenv("FARM_OVERRIDE_CONTEXT_REFRESH", "").strip().lower() in {"1", "true", "yes"}:
         # A freshly collected source replaces prior archived context in this target's state.
         state.chat_history = deque(
@@ -2230,7 +2634,6 @@ async def run_farm() -> None:
         for item in state.chat_history:
             if item.get("chat_id") is not None and item.get("message_id") is not None:
                 state.remember_message(int(item["chat_id"]), int(item["message_id"]))
-
     raw_context_chat_id = os.getenv("FARM_OVERRIDE_CONTEXT_CHAT_ID", "").strip()
     try:
         context_chat_id = int(raw_context_chat_id) if raw_context_chat_id else chat_id
@@ -2278,7 +2681,8 @@ async def run_farm() -> None:
                 continue
             key = (context_chat_id, message_id)
             kind = str(item.get("kind") or "text")
-            text = str(item.get("text") or "")
+            source_text = str(item.get("text") or "")
+            text = source_text
             media = item.get("media") if isinstance(item.get("media"), dict) else None
             if media:
                 emoji = str(media.get("emoji") or "")
@@ -2294,7 +2698,9 @@ async def run_farm() -> None:
                 "message_id": message_id,
                 "chat_id": context_chat_id,
                 "text": text[:2000],
+                "source_text": source_text[:2000],
                 "kind": kind,
+                "media": dict(media) if media else None,
                 "direction": "context",
                 "is_question": False,
                 "ts": str(item.get("date") or ""),
@@ -2388,7 +2794,7 @@ async def run_farm() -> None:
             assigned_accounts = [
                 account.name for account in accounts
                 if participant_mapping.get(account.name) is not None
-                and state.account_contexts.get(account.name)
+                and _has_usable_assigned_history(state.account_contexts.get(account.name, []))
             ]
             assigned_participants = {
                 participant_mapping.get(account_name)
@@ -2396,8 +2802,8 @@ async def run_farm() -> None:
             }
             if len(assigned_accounts) < len(accounts) or len(assigned_participants) < len(accounts):
                 raise SystemExit(
-                    "Для каждого аккаунта диалога по истории нужен отдельный участник с сообщениями в источнике; "
-                    "увеличьте глубину (0 — вся доступная история) или выберите другой источник"
+                    "Для каждого аккаунта диалога по истории нужен отдельный участник с доступным текстом или медиа; "
+                    "увеличьте глубину (0 — вся доступная история), включите сбор медиа или выберите другой источник"
                 )
         for account in accounts:
             account.farm_accounts = accounts

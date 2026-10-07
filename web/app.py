@@ -990,8 +990,8 @@ async def api_chatfarm_start(
         "history_topic_id": effective_history_topic,
         "history_auto_join": auto_join_history_enabled,
         "scenario_turns": 20 if behavior_only else scenario_turns,
-        "joke_every": 0 if behavior_only else joke_every,
-        "rest_every": 0 if behavior_only else rest_every,
+        "joke_every": 0 if behavior_only or topicless_history_dialogue else joke_every,
+        "rest_every": 0 if behavior_only or topicless_history_dialogue else rest_every,
         "rest_min_sec": 60 if behavior_only else rest_min_sec,
         "rest_max_sec": 120 if behavior_only else rest_max_sec,
         "roulette_numbers": "0-36" if behavior_only else roulette_numbers.strip(),
@@ -1074,7 +1074,8 @@ async def _h_start_chatfarm(payload: dict) -> dict:
                 if payload.get("history_topic_id") is not None
                 else payload.get("topic_id") or 0
             ),
-            "download_media": False,
+            "download_media": bool(payload.get("download_media", False))
+            or payload.get("scenario_mode") == "history_dialogue",
             "auto_join": bool(payload.get("history_auto_join", False)),
         })
         if payload.get("scenario_mode") == "history_dialogue":

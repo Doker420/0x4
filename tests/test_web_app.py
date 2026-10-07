@@ -635,6 +635,61 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         collect.assert_awaited_once()
         spawn.assert_not_awaited()
 
+    async def test_history_dialogue_collects_media_before_launching_the_farm(self):
+        process = SimpleNamespace(
+            pid=456, returncode=None, stdout=None, wait=AsyncMock(return_value=0),
+        )
+        payload = {
+            "collect_history": True,
+            "target_id": -1001234567890,
+            "topic_id": 0,
+            "context_reader": "alpha",
+            "accounts": ["alpha", "beta"],
+            "history_limit": 0,
+            "history_reference": {
+                "chat_ref": "donor_room", "invite_hash": None, "topic_id": None, "source": "username",
+            },
+            "history_topic_id": 0,
+            "history_auto_join": False,
+            "scenario_mode": "history_dialogue",
+            "scenario_topic": "",
+            "scenario_turns": 8,
+            "post_opening": False,
+            "min_delay": 5,
+            "max_delay": 15,
+            "qa_probability": 0.25,
+            "clone_probability": 0.25,
+            "reaction_probability": 0.35,
+        }
+        with tempfile.TemporaryDirectory() as tempdir:
+            with (
+                patch.object(web_app, "FARM_PROCESS", None),
+                patch.object(web_app, "FARM_LOG_TASK", None),
+                patch.object(web_app, "FARM_LOG_FILE", Path(tempdir) / "farm.log"),
+                patch.object(web_app.manager.manager, "farm_sessions_busy", return_value=False),
+                patch.object(web_app.manager.manager, "prepare_for_farm", new=AsyncMock()),
+                patch.object(
+                    web_app.chat_context,
+                    "collect_chat_context",
+                    new=AsyncMock(return_value={
+                        "chat_id": -1001234567899,
+                        "message_count": 20,
+                        "account_participant_ids": {"alpha": 1, "beta": 2},
+                    }),
+                ) as collect,
+                patch.object(web_app.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn,
+            ):
+                result = await web_app._h_start_chatfarm(payload)
+                log_task = web_app.FARM_LOG_TASK
+                if log_task:
+                    await log_task
+
+        self.assertEqual(result["pid"], 456)
+        self.assertTrue(collect.await_args.args[0]["download_media"])
+        self.assertEqual(collect.await_args.args[0]["history_limit"], 0)
+        self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_SCENARIO_TOPIC"], "")
+        self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_POST_OPENING"], "0")
+
     async def test_chatfarm_scenario_requires_multiple_accounts_and_valid_numbers(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(

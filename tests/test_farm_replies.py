@@ -176,6 +176,21 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(account._running)
         self.assertEqual(len(account.client.handlers), 1)
 
+    async def test_history_dialogue_registers_the_incoming_message_handler(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "history_dialogue"
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.client = FakeTelegramClient()
+        account.user_id = None
+        account.farm_accounts = [account]
+        account._running = False
+        account._task = None
+
+        await account.start()
+
+        self.assertTrue(account._running)
+        self.assertEqual(len(account.client.handlers), 1)
+
     async def test_incoming_message_handler_stays_enabled_in_combined_mode(self):
         farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
         state = farm.FarmState()
@@ -222,6 +237,68 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(state.chat_history[-1]["direction"], "incoming")
         self.assertTrue(state.chat_history[-1]["is_question"])
+
+    async def test_history_mode_answers_unpunctuated_requests_but_keeps_other_messages_as_context(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "history_dialogue"
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        messages = [
+            types.SimpleNamespace(
+                id=785, empty=False, service=None,
+                chat=types.SimpleNamespace(id=-1001234567890),
+                from_user=types.SimpleNamespace(id=205, is_bot=False, username="tester", first_name="Test"),
+                text="Сегодня на улице солнечно.",
+            ),
+            types.SimpleNamespace(
+                id=786, empty=False, service=None,
+                chat=types.SimpleNamespace(id=-1001234567890),
+                from_user=types.SimpleNamespace(id=206, is_bot=False, username="tester", first_name="Test"),
+                text="Ребят, подскажите как отправить фото",
+            ),
+        ]
+
+        with patch.object(farm.random, "random", return_value=0):
+            await account._on_incoming(None, messages[0])
+            self.assertFalse(account._background_tasks)
+            await account._on_incoming(None, messages[1])
+            await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_awaited_once_with(messages[1], "Ребят, подскажите как отправить фото")
+        self.assertFalse(state.chat_history[-2]["is_question"])
+        self.assertTrue(state.chat_history[-1]["is_question"])
+        self.assertEqual(len(state.chat_history), 2)
+
+    async def test_history_dialogue_can_react_to_participant_messages(self):
+        farm.FARM_CFG["farm"]["scenario_mode"] = "history_dialogue"
+        farm.FARM_CFG["farm"]["reaction_probability"] = 1.0
+        state = farm.FarmState()
+        state.chat_history.append({
+            "author": "участник", "text": "Сегодня у моря тихо.",
+            "message_id": 812, "chat_id": -1001234567890,
+            "direction": "incoming", "kind": "text",
+        })
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.bridge = None
+        account.state = state
+        account.client = types.SimpleNamespace(send_reaction=AsyncMock())
+        with patch.object(farm.random, "random", return_value=0), patch.object(
+            farm, "generate_reaction", new=AsyncMock(return_value="🌿")
+        ) as generate:
+            await account._send_reaction_to_last()
+
+        generate.assert_awaited_once_with(None, "Сегодня у моря тихо.")
+        account.client.send_reaction.assert_awaited_once_with(
+            chat_id=-1001234567890, message_id=812, emoji="🌿"
+        )
 
     async def test_zero_reply_probability_never_schedules_an_answer(self):
         farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
@@ -450,6 +527,44 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Что думаете?", prompt)
         self.assertIn("Общие указания: отвечай кратко", prompt)
         self.assertIn("спокойный участник", prompt)
+
+    async def test_history_mode_reply_uses_no_common_topic_or_foreign_archive(self):
+        state = farm.FarmState()
+        state.topic = "STALE_REPLY_TOPIC"
+        state.account_contexts = {"alpha": [{
+            "author": "участник 1", "participant_id": 1,
+            "text": "UNIQUE_ALPHA_ARCHIVE", "source_text": "UNIQUE_ALPHA_ARCHIVE",
+            "direction": "context", "kind": "text",
+        }]}
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "alpha"
+        account.persona = "синтетическая роль"
+        account.bridge = object()
+        account.donor = object()
+        account.state = state
+        account._pick_history_media = lambda *, force=False: None
+        account._send_history_dialogue_content = AsyncMock(return_value=True)
+        old_cfg = farm.FARM_CFG
+        farm.FARM_CFG = {"farm": {"scenario_mode": "history_dialogue", "agent_prompt": "Не копируй стиль автора."}}
+        try:
+            with patch.object(farm, "generate_reply", new=AsyncMock(return_value="Ответ по истории.")) as generate:
+                sent = await account._send_reply(reply_to=66, incoming_text="Как это сделать")
+        finally:
+            farm.FARM_CFG = old_cfg
+
+        self.assertTrue(sent)
+        generate.assert_awaited_once_with(
+            account.bridge,
+            account.state,
+            account.donor,
+            "синтетическая роль" + chr(10) + "Общие указания: Не копируй стиль автора.",
+            "Как это сделать",
+            include_scenario_topic=False,
+            account_name="alpha",
+        )
+        account._send_history_dialogue_content.assert_awaited_once_with(
+            "Ответ по истории.", reply_to=66, media_item=None
+        )
 
     async def test_reply_prompt_uses_only_the_assigned_historical_participant(self):
         state = farm.FarmState()

@@ -219,6 +219,33 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_context._media_extension({"kind": "sticker", "extension": "webm"}), ".webm")
         self.assertEqual(chat_context._media_extension({"kind": "sticker", "mime_type": "image/webp"}), ".webp")
 
+    async def test_message_serialization_downloads_archived_photo_and_records_local_path(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            message = FakeMessage(45, 700, "", datetime(2026, 10, 6, tzinfo=timezone.utc))
+            message.photo = types.SimpleNamespace(file_size=32, mime_type="image/jpeg")
+
+            async def download(*, file_name):
+                destination = Path(file_name)
+                destination.write_bytes(b"photo-bytes")
+                return str(destination)
+
+            message.download = download
+            with patch.object(chat_context.db, "ROOT", root):
+                serialized, count = await chat_context._serialize_message(
+                    message,
+                    {},
+                    media_dir=root / "data" / "media",
+                    download_media=True,
+                    download_count=0,
+                )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(serialized["text"], "[photo]")
+            self.assertEqual(serialized["media"]["kind"], "photo")
+            self.assertEqual(serialized["media"]["local_file"], "data/media/45-photo.jpg")
+            self.assertTrue((root / serialized["media"]["local_file"]).is_file())
+
     async def test_media_download_is_size_and_count_bounded(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

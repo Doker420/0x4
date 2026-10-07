@@ -1,5 +1,7 @@
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import farm
@@ -13,6 +15,7 @@ class FakeScenarioAccount:
         self.state = state
         self.user_id = user_id
         self.sent = []
+        self.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
 
     def _pick_kind(self):
         return "text"
@@ -34,6 +37,14 @@ class FakeScenarioAccount:
     async def _send_dialogue_content(self, text, *, reply_to, kind):
         return await self._send_text(text, reply_to)
 
+    def _pick_history_media(self, *, force=False, source_message_id=None):
+        return None
+
+    async def _send_history_dialogue_content(self, text, *, reply_to, media_item):
+        if not text or media_item is not None:
+            return False
+        return await self._send_text(text, reply_to)
+
 
 class FakeMediaClient:
     def __init__(self):
@@ -44,6 +55,10 @@ class FakeMediaClient:
         return self._message(kwargs, len(self.sent))
 
     async def send_photo(self, **kwargs):
+        self.sent.append(kwargs)
+        return self._message(kwargs, len(self.sent))
+
+    async def send_voice(self, **kwargs):
         self.sent.append(kwargs)
         return self._message(kwargs, len(self.sent))
 
@@ -175,17 +190,195 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         generate = AsyncMock(side_effect=["Развиваю первую историю.", "Развиваю вторую историю."])
 
         with patch.object(farm.random, "uniform", return_value=0), patch.object(
-            farm, "generate_dialogue_turn", new=generate
+            farm, "generate_history_dialogue_turn", new=generate
         ):
             await farm.run_scenario(accounts, state, stop_event, settings)
 
-        self.assertTrue(stop_event.is_set())
+        self.assertFalse(stop_event.is_set())
         self.assertEqual(state.topic, "")
         self.assertEqual([len(account.sent) for account in accounts], [1, 1])
-        self.assertEqual([call.args[2] for call in generate.await_args_list], ["", ""])
+        self.assertEqual([call.args[2] for call in generate.await_args_list], ["persona a", "persona b"])
+        self.assertEqual([call.args[3] for call in generate.await_args_list], [1, 1])
         self.assertEqual([call.kwargs["account_name"] for call in generate.await_args_list], ["a", "b"])
         self.assertEqual(accounts[0].sent[0]["text"], "Развиваю первую историю.")
         self.assertEqual(accounts[1].sent[0]["text"], "Развиваю вторую историю.")
+
+    async def test_history_generator_uses_only_assigned_archive_and_ignores_stale_topic(self):
+        state = farm.FarmState()
+        state.topic = "STALE_COMMON_TOPIC_MUST_NOT_LEAK"
+        state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
+        state.account_contexts = {
+            "bot_one": [{
+                "author": "участник 1", "participant_id": 1,
+                "text": "Между Мандремом и Ашвемом: пальмы, тишина и попугаи.",
+                "source_text": "Между Мандремом и Ашвемом: пальмы, тишина и попугаи.",
+                "direction": "context", "kind": "text",
+            }],
+            "bot_two": [{
+                "author": "участник 2", "participant_id": 2,
+                "text": "UNIQUE_ARCHIVE_FOR_OTHER_BOT_ONLY",
+                "source_text": "UNIQUE_ARCHIVE_FOR_OTHER_BOT_ONLY",
+                "direction": "context", "kind": "text",
+            }],
+        }
+        bridge = types.SimpleNamespace(
+            is_ready=True,
+            ask=AsyncMock(return_value="Пальмы и тишина — важная часть описания этих мест."),
+        )
+
+        answer = await farm.generate_history_dialogue_turn(
+            bridge, state, "синтетическая спокойная роль", 1,
+            account_name="bot_one", global_prompt="Отвечай естественно.",
+        )
+
+        self.assertEqual(answer, "Пальмы и тишина — важная часть описания этих мест.")
+        self.assertEqual(bridge.ask.await_count, 1)
+        prompt = bridge.ask.await_args.args[0]
+        self.assertIn("пальмы, тишина и попугаи", prompt)
+        self.assertIn("нет общей темы", prompt.casefold())
+        self.assertIn("синтетическая спокойная роль", prompt)
+        self.assertIn("Отвечай естественно", prompt)
+        self.assertNotIn("UNIQUE_ARCHIVE_FOR_OTHER_BOT_ONLY", prompt)
+        self.assertNotIn("STALE_COMMON_TOPIC_MUST_NOT_LEAK", prompt)
+
+    async def test_history_generator_retries_when_model_ignores_assigned_archive(self):
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1,
+            "text": "В истории упоминались спутник и орбита.",
+            "source_text": "В истории упоминались спутник и орбита.",
+            "direction": "context", "kind": "text",
+        }]}
+        bridge = types.SimpleNamespace(
+            is_ready=True,
+            ask=AsyncMock(side_effect=[
+                "Давайте поговорим о погоде.",
+                "Орбита спутника меняет угол наблюдения.",
+            ]),
+        )
+
+        answer = await farm.generate_history_dialogue_turn(
+            bridge, state, "наблюдательная роль", 1, account_name="bot"
+        )
+
+        self.assertEqual(answer, "Орбита спутника меняет угол наблюдения.")
+        self.assertEqual(bridge.ask.await_count, 2)
+
+    async def test_media_only_archive_is_not_replaced_with_a_fabricated_text_topic(self):
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1,
+            "text": "[media: voice 🎙️]", "source_text": "[voice]",
+            "direction": "context", "kind": "voice",
+            "media": {"kind": "voice", "local_file": "archive/voice.ogg"},
+        }]}
+        bridge = types.SimpleNamespace(is_ready=True, ask=AsyncMock())
+
+        answer = await farm.generate_history_dialogue_turn(
+            bridge, state, "синтетическая роль", 1, account_name="bot"
+        )
+
+        self.assertEqual(answer, "")
+        bridge.ask.assert_not_awaited()
+        self.assertEqual(farm._history_source_text(state.account_contexts["bot"][0]), "")
+
+    async def test_history_media_delivery_uses_only_the_files_assigned_to_each_account(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "archive").mkdir()
+            own_gif = root / "archive" / "own.gif"
+            other_voice = root / "archive" / "other.ogg"
+            own_gif.write_bytes(b"gif-bytes")
+            other_voice.write_bytes(b"voice-bytes")
+            state = farm.FarmState()
+            state.account_contexts = {
+                "bot_one": [{
+                    "author": "участник 1", "participant_id": 1, "direction": "context",
+                    "text": "Пальмы у моря", "source_text": "Пальмы у моря",
+                    "kind": "gif", "media": {"kind": "gif", "local_file": "archive/own.gif"},
+                }],
+                "bot_two": [{
+                    "author": "участник 2", "participant_id": 2, "direction": "context",
+                    "text": "[media: voice]", "source_text": "[voice]",
+                    "kind": "voice", "media": {"kind": "voice", "local_file": "archive/other.ogg"},
+                }],
+            }
+            account = farm.FarmAccount.__new__(farm.FarmAccount)
+            account.name = "bot_one"
+            account.user_id = 9001
+            account.state = state
+            account.client = FakeMediaClient()
+            account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+            account._typing = AsyncMock()
+
+            with patch.object(farm, "ROOT", root):
+                visible_items = account._history_media_items()
+                selected = account._pick_history_media()
+                sent = await account._send_history_dialogue_content(
+                    "Пальмы и море — детали из истории.",
+                    reply_to=44,
+                    media_item=selected,
+                )
+                other_account = farm.FarmAccount.__new__(farm.FarmAccount)
+                other_account.name = "bot_two"
+                other_account.state = state
+                other_account.client = account.client
+                other_account.user_id = 9002
+                other_account._typing = AsyncMock()
+                own_voice = other_account._pick_history_media(force=True)
+                voice_sent = await other_account._send_history_dialogue_content(
+                    "", reply_to=45, media_item=own_voice
+                )
+
+            self.assertEqual(len(visible_items), 1)
+            self.assertEqual(visible_items[0]["_local_path"], own_gif)
+            self.assertEqual(selected["_local_path"], own_gif)
+            self.assertTrue(sent)
+            self.assertTrue(voice_sent)
+            self.assertEqual(account.client.sent[0]["animation"], str(own_gif))
+            self.assertEqual(account.client.sent[0]["caption"], "Пальмы и море — детали из истории.")
+            self.assertEqual(account.client.sent[0]["reply_to_message_id"], 44)
+            self.assertEqual(account.client.sent[1]["voice"], str(other_voice))
+            self.assertEqual(account.client.sent[1]["reply_to_message_id"], 45)
+
+    async def test_history_turn_without_safe_text_uses_media_from_the_same_archive_message(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "archive").mkdir()
+            (root / "archive" / "voice.ogg").write_bytes(b"voice-bytes")
+            state = farm.FarmState()
+            state.account_contexts = {"a": [{
+                "author": "участник 1", "participant_id": 1, "message_id": 555,
+                "text": "[media: voice]", "source_text": "[voice]",
+                "direction": "context", "kind": "voice",
+                "media": {"kind": "voice", "local_file": "archive/voice.ogg"},
+            }], "b": []}
+            accounts = [FakeScenarioAccount("a", state, 1), FakeScenarioAccount("b", state, 2)]
+            stop_event = farm.asyncio.Event()
+            settings = {
+                "scenario_mode": "history_dialogue",
+                "scenario_topic": "",
+                "scenario_turns": 1,
+                "joke_every": 0,
+                "rest_every": 0,
+                "post_opening": False,
+            }
+            picked = {}
+
+            def fake_pick(*, force=False, source_message_id=None):
+                picked.update({"force": force, "source_message_id": source_message_id})
+                return None
+
+            accounts[0]._pick_history_media = fake_pick
+
+            with patch.object(farm, "ROOT", root), patch.object(
+                farm.random, "uniform", return_value=0
+            ), patch.object(farm, "generate_history_dialogue_turn", new=AsyncMock(return_value="")):
+                await farm.run_scenario(accounts, state, stop_event, settings)
+
+        self.assertTrue(picked["force"])
+        self.assertEqual(picked["source_message_id"], 555)
+        self.assertEqual(accounts[0].sent, [])
 
     async def test_combined_dialogue_finishes_without_stopping_incoming_replies(self):
         state = farm.FarmState()
