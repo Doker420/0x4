@@ -16,8 +16,8 @@ from .manager import manager, validate_session_name
 
 log = logging.getLogger("web.chat_context")
 CONTEXTS_DIR = db.DATA_DIR / "chat_contexts"
-MAX_HISTORY = 300
-MAX_SCAN_MESSAGES = 1800
+DEFAULT_HISTORY_LIMIT = 100
+MAX_HISTORY: int | None = None  # History depth has no application-level upper limit.
 MAX_MEDIA_DOWNLOADS = 10
 MAX_MEDIA_FILE_BYTES = 3 * 1024 * 1024
 MAX_CONTEXT_MEDIA_BYTES = 30 * 1024 * 1024
@@ -299,7 +299,7 @@ async def _serialize_message(
 
 
 async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
-    """Collect a bounded, anonymized transcript after checking or explicitly joining selected accounts."""
+    """Collect the requested anonymized transcript after membership checks or explicit joins."""
     reference = payload.get("reference")
     if not isinstance(reference, dict):
         reference = parse_chat_link(str(payload.get("chat_link") or ""))
@@ -311,10 +311,11 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
     if not account_names or reader_name not in account_names:
         raise ValueError("Выберите аккаунты и включите сессию для чтения истории в список")
     try:
-        history_limit = int(payload.get("history_limit", 100))
+        history_limit = int(payload.get("history_limit", DEFAULT_HISTORY_LIMIT))
     except (TypeError, ValueError):
-        history_limit = 100
-    history_limit = max(1, min(MAX_HISTORY, history_limit))
+        history_limit = DEFAULT_HISTORY_LIMIT
+    if history_limit < 0:
+        raise ValueError("Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     topic_id = _resolve_topic_id(payload.get("topic_id"), reference)
     download_media = bool(payload.get("download_media", False))
 
@@ -361,7 +362,9 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
             membership[name] = await _verify_membership(clients[name], chat_id, name)
 
         media_dir = _context_dir(chat_id) / "media"
-        scan_limit = min(MAX_SCAN_MESSAGES, history_limit * (6 if topic_id else 1))
+        # Pyrogram treats limit=0 as all available history. For a forum topic we
+        # must scan past messages from other topics, so don't impose a fixed scan cap.
+        scan_limit = 0 if topic_id else history_limit
         raw_messages = []
         async for message in clients[reader_name].get_chat_history(chat_id, limit=scan_limit):
             if getattr(message, "empty", False) or getattr(message, "service", None):
@@ -371,7 +374,7 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
                 if int(getattr(message, "id", 0)) != topic_id and message_topic != topic_id:
                     continue
             raw_messages.append(message)
-            if len(raw_messages) >= history_limit:
+            if history_limit and len(raw_messages) >= history_limit:
                 break
 
         author_labels: dict[int, str] = {}

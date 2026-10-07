@@ -105,7 +105,7 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
                 "reference": {"chat_ref": "sample_group", "invite_hash": None, "topic_id": None, "source": "username"},
                 "reader": "reader",
                 "accounts": ["reader", "agent_b"],
-                "history_limit": 20,
+                "history_limit": 5000,
                 "download_media": False,
             }
             with (
@@ -129,6 +129,7 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["messages"][1]["author"], "участник 2")
             self.assertEqual([item["participant_id"] for item in saved["messages"]], [1, 2])
             self.assertEqual(saved["account_participant_ids"], {"reader": 1, "agent_b": 2})
+            self.assertEqual(saved["history_limit"], 5000)
             self.assertEqual(result["account_participant_ids"], {"reader": 1, "agent_b": 2})
             self.assertNotIn("private_500", json.dumps(saved, ensure_ascii=False))
             self.assertNotIn('"user_id"', json.dumps(saved))
@@ -136,6 +137,65 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
                 saved["account_scopes"]["reader"]["session_scope"],
                 saved["account_scopes"]["agent_b"]["session_scope"],
             )
+
+    async def test_unbounded_history_maps_thirty_accounts_to_thirty_distinct_participants(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            account_names = [f"agent_{index:02d}" for index in range(30)]
+            chat = types.SimpleNamespace(
+                id=-1001234567890,
+                title="Large donor",
+                username="large_donor",
+                type=types.SimpleNamespace(name="SUPERGROUP"),
+            )
+            messages = [
+                FakeMessage(
+                    1000 - index,
+                    2000 + index,
+                    f"Distinct donor message {index}",
+                    datetime(2026, 10, 1, tzinfo=timezone.utc),
+                )
+                for index in range(30)
+            ]
+            received_limits = []
+
+            async def get_history(_chat_id, limit):
+                received_limits.append(limit)
+                for message in (messages if limit == 0 else messages[:limit]):
+                    yield message
+
+            clients = {}
+            for index, name in enumerate(account_names):
+                clients[name] = types.SimpleNamespace(
+                    get_chat=AsyncMock(return_value=chat),
+                    get_me=AsyncMock(return_value=types.SimpleNamespace(id=3000 + index)),
+                    get_chat_member=AsyncMock(return_value=types.SimpleNamespace(
+                        status=types.SimpleNamespace(name="MEMBER"), is_member=True,
+                    )),
+                    get_chat_history=get_history,
+                )
+            account_row = {"enabled": 1, "api_id": 123, "api_hash": "secret", "session_status": "authorized"}
+            with (
+                patch.object(chat_context, "CONTEXTS_DIR", root / "chat_contexts"),
+                patch.object(chat_context.db, "ROOT", root),
+                patch.object(chat_context.db, "get_account", new=AsyncMock(return_value=account_row)),
+                patch.object(chat_context.db, "upsert_chat_target", new=AsyncMock()),
+                patch.object(chat_context.manager, "get_client", new=AsyncMock(side_effect=lambda name: clients[name])),
+                patch.object(chat_context.manager, "close", new=AsyncMock()),
+            ):
+                result = await chat_context.collect_chat_context({
+                    "reference": {"chat_ref": "large_donor", "invite_hash": None, "topic_id": None, "source": "username"},
+                    "reader": account_names[0],
+                    "accounts": account_names,
+                    "history_limit": 0,
+                })
+
+            mapping = result["account_participant_ids"]
+            self.assertEqual(received_limits, [0])
+            self.assertEqual(result["participant_count"], 30)
+            self.assertEqual(len(mapping), 30)
+            self.assertEqual(len(set(mapping.values())), 30)
+            self.assertEqual(list(mapping), account_names)
 
     def test_sticker_metadata_marks_animated_and_video_extensions(self):
         base = {"animation": None, "photo": None, "video": None, "voice": None, "audio": None, "document": None}
@@ -204,7 +264,10 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
 
+            history_limits = []
+
             async def empty_history(_chat_id, limit):
+                history_limits.append(limit)
                 if False:
                     yield None
 
@@ -230,9 +293,11 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             ):
                 result = await chat_context.collect_chat_context({
                     "chat_link": "@sample_group", "reader": "reader", "accounts": ["reader"],
+                    "history_limit": 0,
                 })
 
             self.assertEqual(result["message_count"], 0)
+            self.assertEqual(history_limits, [0])
             client.get_chat_member.assert_awaited_once_with(-1001234567890, 1)
             self.assertFalse(hasattr(client, "join_chat"))
 

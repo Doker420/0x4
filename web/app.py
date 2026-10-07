@@ -764,8 +764,8 @@ async def api_collect_chat_context(
             422,
             "Для авто-вступления используйте публичный username или invite-ссылку; одного ID или t.me/c недостаточно.",
         )
-    if not 1 <= history_limit <= chat_context.MAX_HISTORY:
-        raise HTTPException(422, f"Лимит истории должен быть от 1 до {chat_context.MAX_HISTORY}")
+    if history_limit < 0:
+        raise HTTPException(422, "Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     if topic_id < 0:
         raise HTTPException(422, "ID темы должен быть положительным числом")
     try:
@@ -873,8 +873,8 @@ async def api_chatfarm_start(
     )
     if collect_history and scenario_mode not in {"discussion", "combined", "history_dialogue"}:
         raise HTTPException(422, "История чата доступна только для режимов диалога")
-    if collect_history and not 1 <= history_limit <= chat_context.MAX_HISTORY:
-        raise HTTPException(422, f"Глубина истории должна быть от 1 до {chat_context.MAX_HISTORY}")
+    if collect_history and history_limit < 0:
+        raise HTTPException(422, "Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     behavior_only = scenario_mode == "reactive"
     topicless_history_dialogue = scenario_mode == "history_dialogue"
     scenario_topic = "" if behavior_only or topicless_history_dialogue else scenario_topic.strip()
@@ -1064,7 +1064,11 @@ async def _h_start_chatfarm(payload: dict) -> dict:
             "reference": history_reference,
             "reader": payload.get("context_reader"),
             "accounts": payload.get("accounts", []),
-            "history_limit": int(payload.get("history_limit") or 100),
+            "history_limit": int(
+                payload.get("history_limit")
+                if payload.get("history_limit") is not None
+                else chat_context.DEFAULT_HISTORY_LIMIT
+            ),
             "topic_id": int(
                 payload.get("history_topic_id")
                 if payload.get("history_topic_id") is not None
@@ -1074,17 +1078,20 @@ async def _h_start_chatfarm(payload: dict) -> dict:
             "auto_join": bool(payload.get("history_auto_join", False)),
         })
         if payload.get("scenario_mode") == "history_dialogue":
+            account_names = list(dict.fromkeys(payload.get("accounts", [])))
             participant_ids = set()
             for name, participant_id in (history_result.get("account_participant_ids") or {}).items():
-                if name in payload.get("accounts", []):
+                if name in account_names:
                     try:
                         participant_ids.add(int(participant_id))
                     except (TypeError, ValueError):
                         continue
-            if len(participant_ids) < 2:
+            if len(participant_ids) < len(account_names):
                 raise RuntimeError(
-                    "Для диалога по истории нужны сообщения как минимум двух разных участников. "
-                    "Увеличьте глубину или выберите другой источник."
+                    f"Выбрано аккаунтов: {len(account_names)}, но в этой глубине истории найдено "
+                    f"только {len(participant_ids)} разных участников с контекстом. "
+                    "Увеличьте глубину (0 — вся доступная история), выберите другой источник "
+                    "или сократите число аккаунтов. Для 30 аккаунтов нужны 30 разных участников."
                 )
         assignments = ", ".join(
             f"{name} → участник {participant_id}"

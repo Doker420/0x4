@@ -300,6 +300,9 @@ class FarmState:
         self.topic: str = "общее общение"
         self.last_outgoing_message_id: int | None = None
         self.account_participant_ids: dict[str, int] | None = None
+        # Full anonymized donor history grouped by the one participant assigned to each account.
+        # Kept separate from the bounded live-chat buffer and reloaded from chat_contexts on start.
+        self.account_contexts: dict[str, list[dict[str, Any]]] = {}
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
@@ -325,6 +328,7 @@ class FarmState:
 
     def load(self, data: dict[str, Any]) -> None:
         self.chat_history = deque(data.get("chat_history", []), maxlen=60)
+        self.account_contexts = {}
         self.topic = data.get("topic", "общее общение")
         message_id = data.get("last_outgoing_message_id")
         self.last_outgoing_message_id = int(message_id) if message_id else None
@@ -351,6 +355,7 @@ class FarmState:
         self.topic = "общее общение"
         self.last_outgoing_message_id = None
         self.account_participant_ids = None
+        self.account_contexts = {}
         self._seen_order.clear()
         self._seen_ids.clear()
         for item in self.chat_history:
@@ -470,6 +475,7 @@ QUESTION_START_RE = re.compile(
 QUESTION_PHRASE_RE = re.compile(
     r"\b(?:"
     r"кто(?:[-\s]?(?:нибудь|нить))?\s+(?:знает|сталкивался|пробовал|в\s+курсе|подскажет)|"
+    r"в\s+смысле\s+(?:это\s+)?мне|это\s+мне\s+(?:адресовано|сказано)|"
     r"есть\s+(?:ли|идея|идеи|мысли|вариант(?:ы)?|способ|решение|кто|возможность)|"
     r"что\s+(?:думаете|скажете|посоветуете|делать|нужно|значит)|"
     r"как\s+(?:думаете|считаете|быть|сделать|настроить|найти|получить|поставить|запустить)|"
@@ -497,11 +503,12 @@ REPLY_PROMPT = """Ты — автоматизированный аккаунт �
 {context}
 
 Правила:
-- разговорно, живо, можно эмодзи
-- если входящее сообщение задаёт вопрос — сначала дай прямой ответ именно на него
-- опирайся на тему и контекст; если точного ответа нет, не выдумывай факты
-- если уместно — задай короткий уточняющий вопрос
-- отвечай на языке последних сообщений
+- разговорно, живо и по делу; подстраивай длину ответа под длину входящего сообщения
+- если входящее сообщение задаёт вопрос — сначала ответь именно на него, опираясь на доступный контекст
+- опирайся на тему и историю этого аккаунта; если точного ответа нет, честно обозначь конкретную неопределённость, но не выдумывай факты
+- не начинай с «Спасибо за вопрос» и не используй шаблон «Не хочу гадать без контекста — уточните, что для вас важнее всего»
+- не превращай каждую реплику в уточняющий вопрос: на «хз», «ага», «ок» и короткие реакции отвечай коротко и естественно; медиа без подписи не описывай так, будто видел его содержимое
+- отвечай на языке последних сообщений; можно использовать уместные эмодзи
 - не вычитывай реплику до литературной точности: иногда допустимы пропущенная запятая, короткая фраза без точки или разговорное сокращение; не добавляй ошибки в каждое сообщение и сохраняй понятность
 
 Твоя реплика:"""
@@ -631,15 +638,13 @@ async def generate_reply(
     include_scenario_topic: bool = True,
     account_name: str | None = None,
 ) -> str:
+    async with state.lock:
+        donor_history, live_history = _state_history_parts(state, account_name)
+        history = [*donor_history[-8:], *live_history[-60:]]
+        context = build_context(deque(_prompt_history_window(donor_history, live_history), maxlen=60), limit=20)
+        topic = state.topic
     if bridge and getattr(bridge, "is_ready", False):
         try:
-            async with state.lock:
-                raw_history = list(state.chat_history)
-                history = _history_for_account(
-                    raw_history, account_name, state.account_participant_ids
-                )
-                context = build_context(deque(history, maxlen=60))
-                topic = state.topic
             topic_context = f"Текущая тема сценария: {topic}" if include_scenario_topic and topic else ""
             prompt = REPLY_PROMPT.format(
                 persona=persona,
@@ -648,24 +653,27 @@ async def generate_reply(
                 incoming=incoming_text or "(нет текста — ответь на медиа-сообщение)",
             )
             text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
-            if text and is_dialogue_echo(text, history):
-                log.warning("[%s] generated reply echoed a recent farm turn; retrying once", persona[:20])
+            if text and (is_dialogue_echo(text, history) or _is_canned_reply(text)):
+                log.warning("[%s] generated reply was repetitive or canned; retrying once", persona[:20])
                 retry_prompt = (
                     prompt
-                    + "\n\nПредыдущий вариант повторил уже отправленную реплику. "
-                    "Сформулируй новый прямой ответ на входящее сообщение; не цитируй и не пересказывай прошлую реплику."
+                    + "\n\nПредыдущая попытка повторила реплику или звучала как шаблон. "
+                    "Дай короткий живой ответ конкретно на входящее сообщение. Не начинай с благодарности за вопрос, "
+                    "не говори «не хочу гадать без контекста» и не задавай встречный вопрос автоматически."
                 )
                 text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
-                if text and is_dialogue_echo(text, history):
+                if text and (is_dialogue_echo(text, history) or _is_canned_reply(text)):
                     text = ""
             if text:
                 return text
         except Exception as e:
-            log.warning("[%s] DeepSeek error, fallback на нейтральный текст: %s", persona[:20], e)
+            log.warning("[%s] DeepSeek error, using a conversational fallback: %s", persona[:20], e)
 
-    if incoming_text.strip():
-        return "Спасибо за вопрос! Не хочу гадать без контекста — уточните, пожалуйста, что для вас важнее всего."
-    return "Спасибо за сообщение! 🙂"
+    return _offline_conversational_reply(
+        incoming_text,
+        history,
+        topic if include_scenario_topic else "",
+    )
 
 
 async def generate_from_fragment(bridge: Any, state: FarmState, donor: DonorCorpus, persona: str, fragment: Any) -> str:
@@ -799,21 +807,20 @@ def _is_circular_dialogue_reply(text: str) -> bool:
 
 
 def _human_message_for_turn(history: list[dict[str, Any]], turn_number: int) -> str:
-    """Use one anonymized historical message as the seed for each eight-turn phase."""
-    sources: list[str] = []
-    for item in history:
+    """Select a human seed newest-first without copying an unbounded archive."""
+    phase = (max(1, turn_number) - 1) // len(DIALOGUE_PROGRESS_STEPS)
+    for item in reversed(history):
         if item.get("direction") == "outgoing":
             continue
         text = str(item.get("text") or "").strip()
         if not text or re.fullmatch(r"\[(?:gif|photo|sticker|voice|video|file|media)\]", text, re.IGNORECASE):
             continue
-        if len(text) >= 6:
-            sources.append(text)
-    if not sources:
-        return ""
-    phase = (max(1, turn_number) - 1) // len(DIALOGUE_PROGRESS_STEPS)
-    source_index = len(sources) - 1 - phase
-    return sources[source_index] if source_index >= 0 else ""
+        if len(text) < 6:
+            continue
+        if phase == 0:
+            return text
+        phase -= 1
+    return ""
 
 
 def _context_participant_id(item: dict[str, Any]) -> int | None:
@@ -841,6 +848,36 @@ def _history_for_account(
         if item.get("direction") != "context"
         or (participant_id is not None and _context_participant_id(item) == participant_id)
     ]
+
+
+def _state_history_parts(
+    state: FarmState, account_name: str | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return this account's full donor archive separately from the bounded live window."""
+    live_history = list(state.chat_history)
+    account_contexts = getattr(state, "account_contexts", {})
+    if account_name is not None and account_name in account_contexts:
+        donor_history = account_contexts[account_name]
+        live_history = [item for item in live_history if item.get("direction") != "context"]
+        return donor_history, live_history
+    filtered = _history_for_account(live_history, account_name, state.account_participant_ids)
+    return (
+        [item for item in filtered if item.get("direction") == "context"],
+        [item for item in filtered if item.get("direction") != "context"],
+    )
+
+
+def _state_history_for_account(state: FarmState, account_name: str | None) -> list[dict[str, Any]]:
+    """Compatibility helper; generation paths use bounded windows plus the full archive."""
+    donor_history, live_history = _state_history_parts(state, account_name)
+    return [*donor_history, *live_history]
+
+
+def _prompt_history_window(
+    donor_history: list[dict[str, Any]], live_history: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep a representative slice of the assigned archive alongside recent live turns."""
+    return [*donor_history[-8:], *live_history[-12:]]
 
 
 def _dialogue_domain(text: str) -> str:
@@ -949,15 +986,169 @@ def _progressive_offline_turn(
     return _choose_fresh_fallback(lines, history, turn_number, _short_context_line(seed, 64))
 
 
-def _question_context_fallback(topic: str, source_text: str) -> str:
+def _question_context_fallback_candidates(topic: str, source_text: str) -> tuple[str, ...]:
+    """Offer topic-sensitive alternatives for a local fallback when the language model is unavailable."""
     source = f"{topic} {source_text}"
     domain = _dialogue_domain(source)
     if domain == "travel":
-        return "По одной реплике нельзя честно выбрать место; сравните на свои даты время дороги и нужные удобства, а не только общее впечатление."
-    if domain == "rest":
-        return "Чтобы ответить предметно, нужны наблюдения о сне и усталости; без них можно только проверить, помогает ли регулярный отдых."
-    focus = _compact_seed_terms(source_text, topic)
-    return f"По «{focus}» пока нет данных для уверенного ответа. Сначала стоит отделить подтверждённые факты от предположений и проверить один пример."
+        candidates = (
+            "Я бы сначала сравнил дорогу и то, что реально нужно рядом — одних красивых видов мало 🙂",
+            "Тут многое зависит от дат и приоритетов. Я бы проверил время в пути и удобства на месте.",
+            "Если важны тишина и природа, ещё стоит глянуть транспорт и инфраструктуру — это часто решает.",
+        )
+    elif domain == "rest":
+        candidates = (
+            "Я бы начал с самого простого: посмотреть, как сон и нагрузка влияют на самочувствие.",
+            "Тут нет одного режима для всех. Лучше менять что-то по одному и смотреть, что реально помогает.",
+            "Наверное, сначала стоит понять, чего сейчас не хватает — сна, пауз или просто свободного времени.",
+        )
+    elif domain == "food":
+        candidates = (
+            "Я бы сравнил время готовки и список продуктов — обычно сразу видно, какой вариант удобнее.",
+            "Тут всё упирается в то, что уже есть дома и сколько времени хочется потратить 🙂",
+            "Звучит вкусно. Я бы начал с простого варианта и потом уже добавлял остальное.",
+        )
+    elif re.search(r"\b(?:как|настроить|сделать|запустить|исправить)\b", source_text, re.IGNORECASE):
+        candidates = (
+            "Я бы начал с одного простого шага и проверил результат, а не менял всё сразу.",
+            "Попробуй сначала самый очевидный вариант; если не сработает, тогда уже копать глубже.",
+            "Сначала стоит понять, на каком именно шаге стопорится — так будет проще найти причину.",
+        )
+    elif re.search(r"\b(?:почему|зачем|из-за чего)\b", source_text, re.IGNORECASE):
+        candidates = (
+            "Тут может быть несколько причин. Я бы сначала посмотрел, что изменилось прямо перед этим.",
+            "Не стал бы сразу сводить всё к одной причине — сначала полезно проверить пару деталей.",
+            "Похоже, тут стоит разложить ситуацию по шагам, а не угадывать с ходу.",
+        )
+    elif re.search(r"\b(?:думаете|считаете|как тебе|что скажете)\b", source_text, re.IGNORECASE):
+        candidates = (
+            "Мне кажется, лучше сравнить варианты по тому, что для тебя действительно важно.",
+            "Я бы не торопился с выводом — сначала посмотрел бы на плюсы и минусы каждого варианта.",
+            "Хороший вопрос 🙂 А ты сам к какому варианту сейчас склоняешься?",
+        )
+    else:
+        candidates = (
+            "Хороший вопрос. Я бы начал с одного конкретного примера — так быстрее станет понятно, в чём дело.",
+            "Тут многое зависит от деталей. Я бы сначала проверил самый простой вариант.",
+            "Я бы разобрал это по шагам, без поспешного вывода. Что уже пробовали?",
+        )
+    return candidates
+
+
+def _question_context_fallback(topic: str, source_text: str) -> str:
+    return random.choice(_question_context_fallback_candidates(topic, source_text))
+
+
+def _is_canned_reply(text: str) -> bool:
+    normalized = " ".join(re.findall(r"[a-zа-яё]+", str(text or "").casefold()))
+    return (
+        "спасибо за вопрос" in normalized
+        or "не хочу гадать без контекста" in normalized
+        or "что для вас важнее всего" in normalized
+    )
+
+
+def _choose_natural_reply(candidates: tuple[str, ...], history: list[dict[str, Any]]) -> str:
+    recent_outgoing: list[str] = []
+    for item in reversed(history):
+        if item.get("direction") == "outgoing" and item.get("text"):
+            recent_outgoing.append(str(item.get("text") or "").strip().casefold())
+            if len(recent_outgoing) == 12:
+                break
+    fresh = [candidate for candidate in candidates if candidate.strip().casefold() not in recent_outgoing]
+    return random.choice(fresh or candidates)
+
+
+def _recent_human_context(history: list[dict[str, Any]], incoming_text: str) -> str:
+    current = str(incoming_text or "").strip().casefold()
+    for item in reversed(history):
+        if item.get("direction") not in {"incoming", "context"}:
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text or text.casefold() == current:
+            continue
+        if re.fullmatch(r"\[(?:gif|photo|sticker|voice|video|file|media)\]", text, re.IGNORECASE):
+            continue
+        return text
+    return ""
+
+
+def _offline_conversational_reply(
+    incoming_text: str,
+    history: list[dict[str, Any]],
+    topic: str = "",
+) -> str:
+    """Use short, varied reactions instead of the old repeated question placeholder."""
+    raw = str(incoming_text or "").strip()
+    normalized = " ".join(re.sub(r"[^\w\s'-]+", " ", raw.casefold(), flags=re.UNICODE).split())
+    lowered = raw.casefold()
+
+    media_match = re.fullmatch(r"\[(gif|sticker|photo|voice|video|file|media)\]", lowered)
+    media_kind = media_match.group(1) if media_match else ("gif" if normalized == "gif" else None)
+    if media_kind == "gif":
+        context_hint = _recent_human_context(history, raw)
+        if context_hint:
+            candidates = ("Ахах, это прямо в тему разговора 😄", "😂", "Хорошая реакция на это 😄", "Гифка сказала за меня")
+        else:
+            candidates = ("Ахах, гифка в тему 😄", "😂", "Вот это реакция 😄", "Гифка всё сказала за меня")
+    elif media_kind == "sticker":
+        candidates = ("😄", "Стикер говорит сам за себя", "Поймал настроение 🙂", "Вот это стикер")
+    elif media_kind == "photo":
+        candidates = ("Фото пришло 🙂", "О, вижу фото", "Любопытно, что там на снимке?", "Принял 👀")
+    elif media_kind == "voice":
+        candidates = ("Вижу голосовое 🙂", "Голосовое пришло, понял", "Принял, спасибо 🙂")
+    elif media_kind == "video":
+        candidates = ("Видео пришло 🙂", "О, вижу видео", "Принял 👀")
+    elif media_kind or not raw:
+        candidates = ("Медиа пришло 🙂", "Принял", "Вижу, спасибо 🙂")
+    elif re.search(r"\b(?:всм|в\s+смысле)\b.*\bмне\b|\bэто\s+мне\s+(?:адресовано|сказано)\b", normalized):
+        candidates = (
+            "Да, тебе 🙂 Я отвечал на сообщение выше.",
+            "Ага, к тебе обращаюсь — про твою реплику выше 🙂",
+            "Да, тебе. Имел в виду то, что ты написал чуть выше.",
+        )
+    elif re.fullmatch(r"(?:хз+|не знаю|без понятия|не в курсе|сложно сказать|idk)", normalized):
+        context_hint = _recent_human_context(history, raw)
+        domain = _dialogue_domain(f"{topic} {context_hint}")
+        if domain == "travel":
+            candidates = (
+                "Понимаю, с выбором места правда не всегда сразу ясно 🙂",
+                "Тут можно пока сравнить пару вариантов, не обязательно решать с ходу.",
+                "Да, лучше сначала понять, что важнее: дорога, бюджет или сама атмосфера.",
+            )
+        elif domain == "food":
+            candidates = (
+                "Понимаю 🙂 можно сначала посмотреть, что уже есть под рукой.",
+                "Тогда без спешки — иногда проще оттолкнуться от того, сколько есть времени.",
+                "Да, с выбором еды бывает непросто. Можно начать с самого простого варианта.",
+            )
+        else:
+            candidates = (
+                "Понимаю 😄 бывает, что пока не складывается.",
+                "Ну тогда без спешки, можно пока оставить открытым 🙂",
+                "Да нормально, не обязательно сразу знать ответ.",
+                "Бывает 🙂 может, позже станет понятнее.",
+            )
+    elif re.fullmatch(r"(?:привет|здравствуй|здравствуйте|хай|hello|hi)", normalized):
+        candidates = ("Привет 🙂", "О, привет!", "Хай 😄")
+    elif re.fullmatch(r"(?:хаха+|ахах+|лол|кек|😂+|😄+|😅+)", lowered):
+        candidates = ("😄", "Ахах, да", "Вот именно 😄", "🙂")
+    elif re.fullmatch(r"(?:ага|угу|да|нет|ок|окей|ладно|ясно|понятно|спасибо|пасиб|круто)", normalized):
+        if normalized in {"спасибо", "пасиб"}:
+            candidates = ("Пожалуйста 🙂", "Рад, что пригодилось", "Да не за что 😄")
+        elif normalized == "круто":
+            candidates = ("Ага, здорово 🙂", "Да, звучит классно", "😎")
+        else:
+            candidates = ("Угу 🙂", "Ага, понял", "Окей, принято", "Понял тебя")
+    elif FarmAccount._looks_like_question(raw):
+        context_hint = _recent_human_context(history, raw)
+        candidates = _question_context_fallback_candidates(f"{topic} {context_hint}", raw)
+    elif len(normalized.split()) <= 4:
+        candidates = ("Угу 🙂", "Понял тебя", "Хм, да, есть такое", "Да, бывает 😄", "Ага, мысль ясна")
+    else:
+        candidates = ("Понял тебя 🙂", "Хм, интересная мысль", "Да, в этом есть смысл", "Ага, тут есть о чём подумать")
+
+    return _choose_natural_reply(candidates, history)
 
 
 async def generate_dialogue_turn(
@@ -973,15 +1164,13 @@ async def generate_dialogue_turn(
 ) -> str:
     """Generate a turn using only this bot's mapped anonymized donor participant."""
     async with state.lock:
-        raw_history = list(state.chat_history)
-        history = _history_for_account(
-            raw_history, account_name, state.account_participant_ids
-        )
-        context = build_context(deque(history, maxlen=60), limit=10)
-    latest_event = history[-1] if history else {}
+        donor_history, live_history = _state_history_parts(state, account_name)
+        history = [*donor_history[-8:], *live_history[-60:]]
+        context = build_context(deque(_prompt_history_window(donor_history, live_history), maxlen=60), limit=20)
+    latest_event = live_history[-1] if live_history else (donor_history[-1] if donor_history else {})
     latest_text = str(latest_event.get("text") or "").strip()
     latest_event_is_human = bool(latest_event and latest_event.get("direction") != "outgoing")
-    source_text = _human_message_for_turn(history, turn_number)
+    source_text = _human_message_for_turn(donor_history, turn_number) or _human_message_for_turn(live_history, turn_number)
     history_seed = _short_context_line(source_text, 360) or "(история ещё не собрана)"
     step_index = (max(1, turn_number) - 1) % len(DIALOGUE_PROGRESS_STEPS)
     progression_step = DIALOGUE_PROGRESS_STEPS[step_index]
@@ -1317,8 +1506,9 @@ class FarmAccount:
             return False
         if "?" in candidate or "？" in candidate:
             return True
-        # Normalize mentions and punctuation so missing commas, extra symbols,
-        # and casual spelling don't hide common questions or help requests.
+        # Normalize mentions and casual shorthand so missing punctuation does not
+        # hide ordinary questions such as "всм это мне".
+        candidate = re.sub(r"\bвсм\b", "в смысле", candidate)
         candidate = re.sub(r"(?<!\w)@[A-Za-z0-9_]+", " ", candidate)
         candidate = re.sub(r"[^\w\s'-]+", " ", candidate, flags=re.UNICODE)
         candidate = " ".join(candidate.split())
@@ -2059,14 +2249,13 @@ async def run_farm() -> None:
             else:
                 unkeyed.append(dict(item))
         added = 0
+        context_by_participant: dict[int, list[dict[str, Any]]] = {}
         for item in context_rows:
             try:
                 message_id = int(item["message_id"])
             except (KeyError, TypeError, ValueError):
                 continue
             key = (context_chat_id, message_id)
-            if key in merged:
-                continue
             kind = str(item.get("kind") or "text")
             text = str(item.get("text") or "")
             media = item.get("media") if isinstance(item.get("media"), dict) else None
@@ -2077,7 +2266,7 @@ async def run_farm() -> None:
                     text = media_hint
                 else:
                     text = f"{text} {media_hint}"
-            merged[key] = {
+            context_event = {
                 "author": str(item.get("author") or "участник"),
                 "participant_id": _context_participant_id(item),
                 "user_id": 0,
@@ -2089,7 +2278,18 @@ async def run_farm() -> None:
                 "is_question": False,
                 "ts": str(item.get("date") or ""),
             }
+            participant_id = context_event["participant_id"]
+            if participant_id is not None:
+                context_by_participant.setdefault(participant_id, []).append(context_event)
+            if key in merged:
+                continue
+            merged[key] = context_event
             added += 1
+        if isinstance(state.account_participant_ids, dict):
+            state.account_contexts = {
+                account_name: context_by_participant.get(participant_id, [])
+                for account_name, participant_id in state.account_participant_ids.items()
+            }
         ordered = sorted(
             [*merged.values(), *unkeyed],
             key=lambda item: str(item.get("ts") or ""),
@@ -2159,15 +2359,24 @@ async def run_farm() -> None:
         if scenario_mode != "reactive" and len(accounts) < 2:
             raise SystemExit("Для сценария с диалогом нужно минимум два успешно подключённых аккаунта")
         if scenario_mode == "history_dialogue":
+            participant_mapping = (
+                state.account_participant_ids
+                if isinstance(state.account_participant_ids, dict)
+                else {}
+            )
+            assigned_accounts = [
+                account.name for account in accounts
+                if participant_mapping.get(account.name) is not None
+                and state.account_contexts.get(account.name)
+            ]
             assigned_participants = {
-                state.account_participant_ids.get(account.name)
-                for account in accounts
-                if state.account_participant_ids.get(account.name) is not None
+                participant_mapping.get(account_name)
+                for account_name in assigned_accounts
             }
-            if len(assigned_participants) < 2:
+            if len(assigned_accounts) < len(accounts) or len(assigned_participants) < len(accounts):
                 raise SystemExit(
-                    "Для диалога по истории нужны сообщения как минимум двух разных участников; "
-                    "увеличьте глубину или выберите другой источник"
+                    "Для каждого аккаунта диалога по истории нужен отдельный участник с сообщениями в источнике; "
+                    "увеличьте глубину (0 — вся доступная история) или выберите другой источник"
                 )
         for account in accounts:
             account.farm_accounts = accounts

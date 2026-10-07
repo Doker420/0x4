@@ -202,6 +202,13 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(account._background_tasks)
         self.assertFalse(state.chat_history[-1]["is_question"])
 
+        for message_id, text in ((780, "хз"), (781, "[gif]")):
+            message.id = message_id
+            message.text = text
+            await account._on_incoming(None, message)
+            self.assertFalse(account._background_tasks)
+            self.assertFalse(state.chat_history[-1]["is_question"])
+
         message.id = 79
         message.text = "Ребят кто нибудь знает как ответить на вопрос во время тематического диалога"
         with self.assertLogs("farm", level="INFO") as captured:
@@ -318,18 +325,60 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
             "чё делать если приложение не открывается",
             "anyone know how to fix this",
             "@helper можешь подсказать как настроить",
+            "всм это мне",
         ):
             with self.subTest(text=text):
                 self.assertTrue(farm.FarmAccount._looks_like_question(text))
         self.assertTrue(farm.FarmAccount._looks_like_question("Готово, спасибо?"))
         self.assertFalse(farm.FarmAccount._looks_like_question("Спасибо, всё понятно."))
         self.assertFalse(farm.FarmAccount._looks_like_question("Завтра встречаемся в шесть"))
+        self.assertFalse(farm.FarmAccount._looks_like_question("хз"))
 
-    async def test_offline_reply_uses_safe_fallback_instead_of_copying_donor_text(self):
+    async def test_offline_replies_are_contextual_for_gif_confusion_and_short_reactions(self):
         donor = types.SimpleNamespace(sample_texts=lambda _count: ["Чужое сообщение из донора"])
-        answer = await farm.generate_reply(None, farm.FarmState(), donor, "синтетическая роль", "Как это работает?")
-        self.assertNotEqual(answer, "Чужое сообщение из донора")
-        self.assertIn("Не хочу гадать", answer)
+        state = farm.FarmState()
+        with patch.object(farm.random, "choice", side_effect=lambda values: values[0]):
+            gif_reply = await farm.generate_reply(None, state, donor, "синтетическая роль", "[gif]")
+            confusion_reply = await farm.generate_reply(None, state, donor, "синтетическая роль", "всм это мне:")
+            idk_reply = await farm.generate_reply(None, state, donor, "синтетическая роль", "хз")
+            question_reply = await farm.generate_reply(None, state, donor, "синтетическая роль", "Как это настроить?")
+            state.chat_history.append({"direction": "outgoing", "text": question_reply})
+            repeated_question_reply = await farm.generate_reply(
+                None, state, donor, "синтетическая роль", "Как это настроить?"
+            )
+            travel_state = farm.FarmState()
+            travel_state.chat_history.append({"direction": "incoming", "text": "Куда поехать в отпуск?"})
+            travel_state.chat_history.append({"direction": "incoming", "text": "хз"})
+            contextual_idk_reply = await farm.generate_reply(
+                None, travel_state, donor, "синтетическая роль", "хз"
+            )
+
+        for answer in (gif_reply, confusion_reply, idk_reply, question_reply, repeated_question_reply):
+            self.assertNotIn("Спасибо за вопрос", answer)
+            self.assertNotIn("Не хочу гадать", answer)
+            self.assertNotEqual(answer, "Чужое сообщение из донора")
+        self.assertIn("гифка", gif_reply.lower())
+        self.assertIn("тебе", confusion_reply.lower())
+        self.assertNotIn("?", idk_reply)
+        self.assertNotEqual(repeated_question_reply, question_reply)
+        self.assertIn("мест", contextual_idk_reply.lower())
+
+    async def test_llm_canned_reply_is_retried_then_replaced_with_a_natural_fallback(self):
+        canned = "Спасибо за вопрос! Не хочу гадать без контекста — уточните, пожалуйста, что для вас важнее всего."
+        bridge = types.SimpleNamespace(is_ready=True, ask=AsyncMock(side_effect=[canned, canned]))
+        answer = await farm.generate_reply(
+            bridge,
+            farm.FarmState(),
+            types.SimpleNamespace(sample_texts=lambda _count: []),
+            "синтетическая роль",
+            "Как это работает?",
+        )
+
+        self.assertEqual(bridge.ask.await_count, 2)
+        self.assertNotIn("Спасибо за вопрос", answer)
+        self.assertNotIn("Не хочу гадать", answer)
+        self.assertTrue(answer)
+
 
     async def test_question_text_is_included_in_the_generated_reply_prompt(self):
         state = farm.FarmState()
@@ -347,9 +396,10 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         prompt = ask.await_args.args[0]
         self.assertIn("Как начать бегать по утрам?", prompt)
         self.assertIn("Обсуждаем полезные привычки", prompt)
-        self.assertIn("дай прямой ответ именно на него", prompt)
+        self.assertIn("если входящее сообщение задаёт вопрос — сначала ответь именно на него", prompt)
         self.assertIn("автоматизированный аккаунт", prompt)
-        self.assertIn("не выдумывай личный опыт", prompt)
+        self.assertIn("не выдумывай факты", prompt)
+        self.assertIn("не начинай с «Спасибо за вопрос»", prompt)
         self.assertIn("не вычитывай реплику до литературной точности", prompt)
 
     async def test_behavior_only_reply_omits_stale_scenario_topic(self):
@@ -406,6 +456,39 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("UNIQUE_REPLY_CONTEXT_ONE", prompt)
         self.assertNotIn("UNIQUE_REPLY_CONTEXT_TWO", prompt)
         self.assertIn("Что проверить первым?", prompt)
+
+    async def test_full_assigned_archive_is_kept_per_account_beyond_live_buffer(self):
+        state = farm.FarmState()
+        state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
+        state.account_contexts = {
+            "bot_one": [{
+                "author": "участник 1", "participant_id": 1,
+                "text": "UNIQUE_OLD_CONTEXT_FOR_BOT_ONE", "direction": "context", "kind": "text",
+            }],
+            "bot_two": [{
+                "author": "участник 2", "participant_id": 2,
+                "text": "UNIQUE_OLD_CONTEXT_FOR_BOT_TWO", "direction": "context", "kind": "text",
+            }],
+        }
+        state.chat_history.extend({
+            "author": "другой участник", "text": f"LIVE_MESSAGE_{index}",
+            "direction": "incoming", "kind": "text",
+        } for index in range(80))
+        bridge = types.SimpleNamespace(is_ready=True, ask=AsyncMock(return_value="Понял, продолжим."))
+
+        await farm.generate_reply(
+            bridge,
+            state,
+            types.SimpleNamespace(sample_texts=lambda _count: []),
+            "синтетическая роль",
+            "Как продолжим?",
+            account_name="bot_one",
+        )
+
+        prompt = bridge.ask.await_args.args[0]
+        self.assertIn("UNIQUE_OLD_CONTEXT_FOR_BOT_ONE", prompt)
+        self.assertNotIn("UNIQUE_OLD_CONTEXT_FOR_BOT_TWO", prompt)
+        self.assertIn("LIVE_MESSAGE_79", prompt)
 
     async def test_reactive_send_reply_uses_saved_instructions_without_scenario_topic(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)

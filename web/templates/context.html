@@ -50,7 +50,7 @@
         <span><strong>Автоматически вступить выбранными аккаунтами, если их ещё нет в чате</strong><small>Только по публичному username или invite-ссылке. Для числового ID и ссылок <code>t.me/c/…</code> Telegram не даёт способа вступить; при необходимости используйте invite-ссылку. Вступление может потребовать одобрения администратором.</small></span>
       </label>
       <div class="grid-2">
-        <div class="field"><label for="history_limit">Сообщений контекста</label><input id="history_limit" name="history_limit" type="number" min="1" max="300" value="100" required><span class="help">Максимум 300 последних сообщений.</span></div>
+        <div class="field"><label for="history_limit">Сообщений контекста</label><input id="history_limit" name="history_limit" type="number" min="0" step="1" value="100" required><span class="help">Верхнего программного лимита нет; 0 — вся доступная история чата.</span></div>
         <div class="field"><label>Медиа</label><label class="check-row"><input id="download_media" type="checkbox" name="download_media"><span>Сохранить локально до 10 небольших GIF/стикеров/файлов</span></label><span class="help">До 3 МБ на файл и 30 МБ на чат; медиа не перепубликуются автоматически.</span></div>
       </div>
       <div class="notice warning" style="margin:8px 0 14px">Используйте только чаты, которыми вы управляете или на сбор и вступление в которые получено разрешение. Уведомите участников; история локальна, авторы в сохранённом контексте обезличены.</div>
