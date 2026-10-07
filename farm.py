@@ -1,0 +1,2240 @@
+# farm.py — версия 5.1
+# ФИКС: bridge работает в главном процессе (как в bot.py),
+# multiprocessing убран — он ломал Playwright/cookies.
+#
+# Что делает:
+#  - Инициализирует DeepSeek bridge так же, как bot.py
+#  - Грузит донор (data/donor/messages.json + медиа)
+#  - Запускает N юзерботов (Pyrogram)
+#  - Генерирует реплики по персоне + примерам из донора
+#  - Клонирует фрагменты диалогов донора
+#  - Раз в N сообщений играет Q→A связку
+#  - Переиспользует медиа донора (стикеры/гиф/фото)
+#  - Голосовые отправляет как НАСТОЯЩИЕ voice (send_voice, .ogg Opus)
+#  - Ставит реакции
+#  - Watchdog: пингует bridge раз в 5 мин и пересоздаёт клиент при смерти
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import atexit
+import hashlib
+from difflib import SequenceMatcher
+import json
+import logging
+import os
+import random
+import re
+import signal
+import socket
+import sys
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from web.config import normalize_media_bias, parse_roulette_numbers
+
+import aiofiles
+from dotenv import load_dotenv
+
+try:
+    from pyrogram import Client, filters, raw
+    from pyrogram.enums import ChatAction
+    from pyrogram.errors import RPCError
+    from pyrogram.handlers import MessageHandler
+    from pyrogram.types import Message as TGMessage
+except ImportError as exc:
+    raise SystemExit("Установите: pip install pyrogram tgcrypto") from exc
+
+ROOT = Path(__file__).resolve().parent
+BRIDGE_DIR = ROOT / "vendor" / "Deepseek-API"
+if BRIDGE_DIR.exists():
+    sys.path.insert(0, str(BRIDGE_DIR))
+
+try:
+    from deepseek import DeepSeekClient
+except ImportError:
+    # The private bridge is not distributed with the public project. The farm
+    # still runs with its local donor fallback and will surface this in the log.
+    DeepSeekClient = None
+
+load_dotenv(ROOT / ".env")
+
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR = ROOT / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
+DONOR_DIR = DATA_DIR / "donor"
+DONOR_MESSAGES = DONOR_DIR / "messages.json"
+
+STATS_FILE = DATA_DIR / "farm_stats.json"
+LOCK_FILE = DATA_DIR / "farm.lock"
+
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "default")
+DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "false").lower() == "true"
+DEEPSEEK_SEARCH = os.getenv("DEEPSEEK_SEARCH", "false").lower() == "true"
+
+log = logging.getLogger("farm")
+
+
+# ═══════════════════════════════════════════════════════════════
+#                     LOCK FILE
+# ═══════════════════════════════════════════════════════════════
+
+def acquire_lock() -> None:
+    if LOCK_FILE.exists():
+        try:
+            old_pid = int(LOCK_FILE.read_text().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, 0)
+                raise SystemExit(f"Ферма уже запущена (PID {old_pid})")
+        except (ProcessLookupError, ValueError, OSError):
+            LOCK_FILE.unlink(missing_ok=True)
+    LOCK_FILE.write_text(str(os.getpid()))
+
+
+def release_lock() -> None:
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+atexit.register(release_lock)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                TELEGRAM REACHABILITY (не висит)
+# ═══════════════════════════════════════════════════════════════
+
+TG_DC_HOSTS = [
+    ("149.154.167.51", 443),
+    ("149.154.175.53", 443),
+    ("91.108.56.130", 443),
+    ("149.154.171.5", 443),
+    ("api.telegram.org", 443),
+]
+
+
+def _probe_tcp(host: str, port: int, timeout: float) -> tuple[bool, str]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True, "ok"
+    except socket.timeout:
+        return False, f"timeout {timeout}s"
+    except socket.gaierror as e:
+        return False, f"DNS: {e}"
+    except OSError as e:
+        return False, f"OSError: {e}"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+async def check_telegram_reachable(timeout: float = 5.0) -> tuple[bool, str]:
+    lines = []
+    for host, port in TG_DC_HOSTS:
+        ok, msg = await asyncio.to_thread(_probe_tcp, host, port, timeout)
+        lines.append(f"  {'✅' if ok else '❌'} {host}:{port} — {msg}")
+        if ok:
+            return True, "\n".join(lines)
+    return False, "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+#        DEEPSEEK BRIDGE — в ГЛАВНОМ процессе (как в bot.py)
+# ═══════════════════════════════════════════════════════════════
+
+class DeepSeekBridge:
+    """
+    Работает в ГЛАВНОМ процессе, тот же cwd/HOME/sys.path, что у бота.
+    Использует asyncio.to_thread — точно так же, как bot.py.
+    Потокобезопасен через asyncio.Lock.
+    """
+
+    def __init__(self, settings: dict[str, Any] | None = None) -> None:
+        self._client: Any = None
+        self._lock = asyncio.Lock()
+        self._conversation_ids: dict[str, str | None] = {}
+        self._ready = False
+        self._last_ok = 0.0
+        self.settings = settings or {}
+        self.model = str(self.settings.get("deepseek_model") or DEEPSEEK_MODEL)
+        self.thinking = bool(self.settings.get("deepseek_thinking", DEEPSEEK_THINKING))
+        self.search = bool(self.settings.get("deepseek_search", DEEPSEEK_SEARCH))
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready and self._client is not None
+
+    def session(self, session_key: str) -> "DeepSeekSession":
+        return DeepSeekSession(self, session_key)
+
+    async def start(self, verbose: bool = False) -> None:
+        if DeepSeekClient is None:
+            raise RuntimeError("DeepSeek bridge не найден в vendor/Deepseek-API")
+        log.info("Инициализация DeepSeek bridge (главный процесс)...")
+        t = time.time()
+        try:
+            self._client = await asyncio.to_thread(DeepSeekClient, None, False)
+        except Exception as e:
+            log.exception("DeepSeek init failed")
+            raise RuntimeError(f"DeepSeek init failed: {e}") from e
+        log.info("✅ DeepSeek bridge готов за %.1fs", time.time() - t)
+        self._ready = True
+        self._last_ok = time.time()
+
+    async def stop(self) -> None:
+        if self._client is not None:
+            try:
+                await asyncio.to_thread(self._client.close)
+            except Exception:
+                log.exception("DeepSeek close err")
+            self._client = None
+            self._ready = False
+            self._conversation_ids.clear()
+
+    async def _recreate(self) -> None:
+        if DeepSeekClient is None:
+            raise RuntimeError("DeepSeek bridge не установлен")
+        log.warning("Пересоздаю DeepSeek-клиент...")
+        stale = self._client
+        try:
+            self._client = await asyncio.to_thread(DeepSeekClient, None, False)
+            self._conversation_ids.clear()
+            self._last_ok = time.time()
+            log.info("DeepSeek-клиент пересоздан")
+        finally:
+            if stale is not None:
+                try:
+                    await asyncio.to_thread(stale.close)
+                except Exception:
+                    pass
+
+    async def _ask_locked(self, prompt: str, new: bool, session_key: str) -> str:
+        assert self._client is not None
+        conversation_id = self._conversation_ids.get(session_key)
+        if new or not conversation_id:
+            reply = await asyncio.to_thread(
+                self._client.chat,
+                prompt,
+                model=self.model,
+                thinking=self.thinking,
+                search=self.search,
+            )
+        else:
+            reply = await asyncio.to_thread(
+                self._client.chat,
+                prompt,
+                conversation_id=conversation_id,
+                thinking=self.thinking,
+                search=self.search,
+            )
+        self._conversation_ids[session_key] = reply.conversation_id
+        self._last_ok = time.time()
+        return reply.text.strip()
+
+    async def ask(
+        self,
+        prompt: str,
+        new_conversation: bool = False,
+        *,
+        session_key: str = "default",
+    ) -> str:
+        async with self._lock:
+            if self._client is None:
+                await self._recreate()
+            try:
+                return await self._ask_locked(prompt, new_conversation, session_key)
+            except Exception:
+                log.exception("DeepSeek fail → пересоздание клиента")
+                await self._recreate()
+                return await self._ask_locked(prompt, True, session_key)
+
+    async def ping(self) -> bool:
+        """Watchdog-проверка. Возвращает True, если bridge отвечает."""
+        try:
+            await self.ask("ping", new_conversation=False)
+            return True
+        except Exception:
+            log.exception("Watchdog: ping failed")
+            return False
+
+    def seconds_since_last_ok(self) -> float:
+        return time.time() - self._last_ok if self._last_ok else 9999.0
+
+
+class DeepSeekSession:
+    """Lightweight account-specific conversation state over one shared client."""
+
+    def __init__(self, bridge: DeepSeekBridge, session_key: str) -> None:
+        self.bridge = bridge
+        self.session_key = str(session_key)
+
+    @property
+    def is_ready(self) -> bool:
+        return self.bridge.is_ready
+
+    async def ask(self, prompt: str, new_conversation: bool = False) -> str:
+        return await self.bridge.ask(
+            prompt,
+            new_conversation=new_conversation,
+            session_key=self.session_key,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    STATE
+# ═══════════════════════════════════════════════════════════════
+
+class FarmState:
+    def __init__(self) -> None:
+        self.chat_history: deque[dict[str, Any]] = deque(maxlen=60)
+        self.topic: str = "общее общение"
+        self.last_outgoing_message_id: int | None = None
+        self.lock = asyncio.Lock()
+        self.outgoing_lock = asyncio.Lock()
+        self._seen_order: deque[tuple[int, int]] = deque()
+        self._seen_ids: set[tuple[int, int]] = set()
+
+    def remember_message(self, chat_id: int, message_id: int) -> bool:
+        key = (int(chat_id), int(message_id))
+        if key in self._seen_ids:
+            return False
+        self._seen_ids.add(key)
+        self._seen_order.append(key)
+        if len(self._seen_order) > 2048:
+            self._seen_ids.discard(self._seen_order.popleft())
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chat_history": list(self.chat_history),
+            "topic": self.topic,
+            "last_outgoing_message_id": self.last_outgoing_message_id,
+        }
+
+    def load(self, data: dict[str, Any]) -> None:
+        self.chat_history = deque(data.get("chat_history", []), maxlen=60)
+        self.topic = data.get("topic", "общее общение")
+        message_id = data.get("last_outgoing_message_id")
+        self.last_outgoing_message_id = int(message_id) if message_id else None
+        self._seen_order.clear()
+        self._seen_ids.clear()
+        for item in self.chat_history:
+            if item.get("chat_id") is not None and item.get("message_id") is not None:
+                self.remember_message(int(item["chat_id"]), int(item["message_id"]))
+
+    def reset_for_behavior_only(self) -> None:
+        """Drop scenario/archive state but retain recent real incoming chat messages."""
+        incoming = [dict(item) for item in self.chat_history if item.get("direction") == "incoming"]
+        self.chat_history = deque(incoming[-60:], maxlen=60)
+        self.topic = "общее общение"
+        self.last_outgoing_message_id = None
+        self._seen_order.clear()
+        self._seen_ids.clear()
+        for item in self.chat_history:
+            if item.get("chat_id") is not None and item.get("message_id") is not None:
+                self.remember_message(int(item["chat_id"]), int(item["message_id"]))
+
+
+async def load_json(path: Path, default: Any) -> Any:
+    try:
+        async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            return json.loads(await f.read())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+async def save_json(path: Path, value: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(value, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    DONOR CORPUS
+# ═══════════════════════════════════════════════════════════════
+
+class DonorCorpus:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+        self.texts: list[str] = []
+        self.media_by_kind: dict[str, list[dict[str, Any]]] = {
+            "sticker": [], "gif": [], "photo": [], "voice": [],
+        }
+        self.qa_pairs: list[tuple[dict, dict]] = []
+        self.fragments: list[list[dict]] = []
+
+    @classmethod
+    async def load(cls, path: Path) -> "DonorCorpus":
+        inst = cls()
+        if not path.exists():
+            log.warning("Донор %s не найден — работаю без него", path)
+            return inst
+
+        async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            data = json.loads(await f.read())
+
+        inst.messages = data
+
+        for m in data:
+            kind = m.get("kind", "text")
+            text = (m.get("text") or "").strip()
+            if kind == "text" and text:
+                inst.texts.append(text)
+            elif kind in inst.media_by_kind and m.get("media_file"):
+                inst.media_by_kind[kind].append(m)
+
+        for i in range(len(data) - 1):
+            a, b = data[i], data[i + 1]
+            a_txt = (a.get("text") or "").strip()
+            b_txt = (b.get("text") or "").strip()
+            if a_txt.endswith("?") and b_txt:
+                inst.qa_pairs.append((a, b))
+
+        if len(data) >= 3:
+            i = 0
+            while i < len(data):
+                size = random.randint(3, 8)
+                frag = data[i:i + size]
+                if len(frag) >= 3:
+                    inst.fragments.append(frag)
+                i += size
+
+        log.info(
+            "Донор: %d сообщений | текстов: %d | Q→A: %d | фрагментов: %d | медиа: %s",
+            len(inst.messages), len(inst.texts), len(inst.qa_pairs),
+            len(inst.fragments),
+            {k: len(v) for k, v in inst.media_by_kind.items()},
+        )
+        return inst
+
+    def sample_texts(self, n: int = 8) -> list[str]:
+        if not self.texts:
+            return []
+        return random.sample(self.texts, min(n, len(self.texts)))
+
+    def sample_media(self, kind: str) -> dict[str, Any] | None:
+        pool = self.media_by_kind.get(kind) or []
+        return random.choice(pool) if pool else None
+
+    def sample_fragment(self, min_size: int = 3, max_size: int = 8) -> list[dict]:
+        pool = [f for f in self.fragments if min_size <= len(f) <= max_size]
+        return random.choice(pool) if pool else []
+
+    def sample_qa(self) -> tuple[dict, dict] | None:
+        return random.choice(self.qa_pairs) if self.qa_pairs else None
+
+    def pick_topic_seed(self) -> str:
+        if not self.texts:
+            return "общее общение"
+        return random.choice(self.texts)[:120]
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    PROMPTS
+# ═══════════════════════════════════════════════════════════════
+
+QUESTION_START_RE = re.compile(
+    r"^\s*(?:(?:а|ну|слушай|ребят|народ)\s+)?(?:"
+    r"что|кто(?:[-\s]?(?:нибудь|нить))?|где|куда|откуда|когда|почему|зачем|как|"
+    r"чё|че|чо|какой|какая|какое|какие|чей|чья|чье|чьё|чьи|сколько|кому|кого|чего|чем|"
+    r"есть\s+ли|можно\s+ли|нужно\s+ли|будет\s+ли|может\s+ли|стоит\s+ли|"
+    r"подскаж(?:и|ите|ешь|ете)|посоветуй(?:те|шь)?|расскаж(?:и|ите|ешь|ете)|помог(?:и|ите|ешь|ете)|"
+    r"who|what|where|when|why|how|which|whose|can|could|would|do|does|is|are"
+    r")\b",
+    re.IGNORECASE,
+)
+QUESTION_PHRASE_RE = re.compile(
+    r"\b(?:"
+    r"кто(?:[-\s]?(?:нибудь|нить))?\s+(?:знает|сталкивался|пробовал|в\s+курсе|подскажет)|"
+    r"есть\s+(?:ли|идея|идеи|мысли|вариант(?:ы)?|способ|решение|кто|возможность)|"
+    r"что\s+(?:думаете|скажете|посоветуете|делать|нужно|значит)|"
+    r"как\s+(?:думаете|считаете|быть|сделать|настроить|найти|получить|поставить|запустить)|"
+    r"может\s+кто(?:[-\s]?(?:нибудь|нить|то))?|"
+    r"подскаж(?:и|ите)|посоветуй(?:те)?|помог(?:и|ите)|"
+    r"не\s+(?:подскажете|знаете|могли\s+бы)|нужен\s+совет|нужна\s+помощь|"
+    r"anyone\s+(?:know|have|tried)|any\s+(?:idea|ideas|suggestions)|"
+    r"does\s+anyone|can\s+someone|could\s+someone|"
+    r"what\s+(?:do\s+you\s+think|should)|how\s+(?:do|can|should)\s+(?:i|we|you)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+REPLY_PROMPT = """Ты — автоматизированный аккаунт группового чата с отдельной синтетической ролью. Не изображай конкретного реального участника и не выдумывай личный опыт. Если тебя прямо спрашивают, автоматизирован ли аккаунт, ответь честно. Отвечай одной короткой репликой (1–2 предложения, до 200 символов), без кавычек и пояснений.
+
+Твоя синтетическая роль: {persona}
+{topic_context}
+
+Сообщение, на которое нужно ответить:
+{incoming}
+
+Последние сообщения в нашем чате:
+{context}
+
+Правила:
+- разговорно, живо, можно эмодзи
+- если входящее сообщение задаёт вопрос — сначала дай прямой ответ именно на него
+- опирайся на тему и контекст; если точного ответа нет, не выдумывай факты
+- если уместно — задай короткий уточняющий вопрос
+- отвечай на языке последних сообщений
+- не вычитывай реплику до литературной точности: иногда допустимы пропущенная запятая, короткая фраза без точки или разговорное сокращение; не добавляй ошибки в каждое сообщение и сохраняй понятность
+
+Твоя реплика:"""
+
+FRAGMENT_PROMPT = """Ты создаёшь новую реплику для автоматизированного аккаунта с синтетической ролью "{persona}". Оригинал используй только как общий контекст темы: не переписывай сообщение и не копируй лексику, тон или стиль конкретного человека. Не выдумывай личный опыт.
+
+Общий контекст:
+{fragment}
+
+Тема чата: {topic}
+
+Напиши одну самостоятельную реплику до 200 символов. Если тебя прямо спрашивают, автоматизирован ли аккаунт, ответь честно. Только текст:"""
+
+QA_QUESTION_PROMPT = """Ты — автоматизированный аккаунт с синтетической ролью "{persona}". Не имитируй конкретного участника и не выдумывай личный опыт. Задай ОДИН короткий вопрос (до 100 символов) по мотивам:
+
+Оригинал: "{original}"
+
+Если тебя прямо спрашивают, автоматизирован ли аккаунт, ответь честно. Не копируй дословно. Только текст вопроса:"""
+
+QA_ANSWER_PROMPT = """Ты — автоматизированный аккаунт с синтетической ролью "{persona}". Не имитируй конкретного участника и не выдумывай личный опыт. Ответь ОДНОЙ короткой репликой (до 200 символов) на вопрос:
+
+"{question}"
+
+Тема чата: {topic}
+Живо, разговорно, можно эмодзи. Если спрашивают, автоматизирован ли аккаунт, ответь честно. Только текст:"""
+
+TOPIC_PROMPT = """Придумай ОДНУ новую тему для обсуждения (до 10 слов), близкую по духу к таким сообщениям:
+
+{seeds}
+
+Текущая тема: {topic}
+Только текст темы:"""
+
+REACTION_PROMPT = """Выбери ОДНУ реакцию-эмодзи для сообщения: "{text}"
+Ответь только одним эмодзи из: 👍 ❤️ 🔥 😁 🤔 👏 🎉 😢 🤯
+Эмодзи:"""
+
+
+def build_context(history: deque[dict[str, Any]], limit: int = 12) -> str:
+    items = list(history)[-limit:]
+    lines = []
+    for item in items:
+        direction = item.get("direction")
+        if direction == "outgoing":
+            who = "синтетический аккаунт"
+        elif direction in {"incoming", "context"}:
+            who = "участник чата"
+        else:
+            who = "собеседник"
+        text = item.get("text") or f"[{item.get('kind', 'media')}]"
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines) or "(пусто)"
+
+
+def _echo_tokens(text: str) -> list[str]:
+    return re.findall(r"[\w]+", str(text or "").casefold(), flags=re.UNICODE)
+
+
+def is_dialogue_echo(candidate: str, history: list[dict[str, Any]] | deque[dict[str, Any]]) -> bool:
+    """Detect verbatim or near-verbatim copies of recent farm turns, not normal replies."""
+    candidate_tokens = _echo_tokens(candidate)
+    candidate_norm = " ".join(candidate_tokens)
+    if len(candidate_norm) < 18:
+        return False
+
+    outgoing = [item for item in history if item.get("direction") == "outgoing" and item.get("text")]
+    for item in reversed(outgoing[-8:]):
+        previous_tokens = _echo_tokens(str(item.get("text") or ""))
+        previous_norm = " ".join(previous_tokens)
+        if len(previous_norm) < 18:
+            continue
+        # Catches a previous whole line pasted inside a new "thought about …" reply.
+        if previous_norm in candidate_norm or candidate_norm in previous_norm:
+            return True
+        if min(len(candidate_tokens), len(previous_tokens)) < 6:
+            continue
+        matcher = SequenceMatcher(None, previous_tokens, candidate_tokens, autojunk=False)
+        match = matcher.find_longest_match(0, len(previous_tokens), 0, len(candidate_tokens))
+        minimum = min(len(previous_tokens), len(candidate_tokens))
+        if match.size >= max(6, int(minimum * 0.70)) or (
+            minimum >= 8 and matcher.ratio() >= 0.86
+        ):
+            return True
+    return False
+
+
+def _fallback_was_sent(candidate: str, history: list[dict[str, Any]]) -> bool:
+    candidate_norm = " ".join(_echo_tokens(candidate))
+    if not candidate_norm:
+        return False
+    for item in reversed([row for row in history if row.get("direction") == "outgoing" and row.get("text")][-8:]):
+        previous_norm = " ".join(_echo_tokens(str(item.get("text") or "")))
+        if candidate_norm == previous_norm or (
+            len(previous_norm) >= 40 and previous_norm in candidate_norm
+        ):
+            return True
+    return False
+
+
+def _choose_fresh_fallback(
+    candidates: tuple[str, ...], history: list[dict[str, Any]], turn_number: int, topic_line: str
+) -> str:
+    start = (max(1, turn_number) - 1) % len(candidates)
+    for offset in range(len(candidates)):
+        candidate = candidates[(start + offset) % len(candidates)]
+        if not _fallback_was_sent(candidate, history) and not _is_circular_dialogue_reply(candidate):
+            return candidate
+    fresh_options = (
+        f"Следующий предметный шаг по «{topic_line}» — проверить один критерий на конкретном примере.",
+        "Промежуточно отделим то, что уже подтверждено, от предположений; затем проверим одно из них.",
+        "Чтобы сдвинуться дальше, сравним два случая по одному и тому же признаку, а не начнём тему заново.",
+        "Пока вывод предварительный: одного наблюдения мало, поэтому нужен ещё один проверяемый факт.",
+    )
+    for candidate in fresh_options:
+        if not _fallback_was_sent(candidate, history) and not _is_circular_dialogue_reply(candidate):
+            return candidate
+    return fresh_options[start % len(fresh_options)]
+
+
+async def generate_reply(
+    bridge: Any,
+    state: FarmState,
+    donor: DonorCorpus,
+    persona: str,
+    incoming_text: str = "",
+    *,
+    include_scenario_topic: bool = True,
+) -> str:
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            async with state.lock:
+                history = list(state.chat_history)
+                context = build_context(state.chat_history)
+                topic = state.topic
+            topic_context = f"Текущая тема сценария: {topic}" if include_scenario_topic and topic else ""
+            prompt = REPLY_PROMPT.format(
+                persona=persona,
+                topic_context=topic_context,
+                context=context,
+                incoming=incoming_text or "(нет текста — ответь на медиа-сообщение)",
+            )
+            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            if text and is_dialogue_echo(text, history):
+                log.warning("[%s] generated reply echoed a recent farm turn; retrying once", persona[:20])
+                retry_prompt = (
+                    prompt
+                    + "\n\nПредыдущий вариант повторил уже отправленную реплику. "
+                    "Сформулируй новый прямой ответ на входящее сообщение; не цитируй и не пересказывай прошлую реплику."
+                )
+                text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                if text and is_dialogue_echo(text, history):
+                    text = ""
+            if text:
+                return text
+        except Exception as e:
+            log.warning("[%s] DeepSeek error, fallback на нейтральный текст: %s", persona[:20], e)
+
+    if incoming_text.strip():
+        return "Спасибо за вопрос! Не хочу гадать без контекста — уточните, пожалуйста, что для вас важнее всего."
+    return "Спасибо за сообщение! 🙂"
+
+
+async def generate_from_fragment(bridge: Any, state: FarmState, donor: DonorCorpus, persona: str, fragment: Any) -> str:
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            lines = []
+            for m in fragment:
+                txt = (m.get("text") or "").strip() or f"[{m.get('kind')}]"
+                lines.append(f"- {txt[:160]}")
+            async with state.lock:
+                topic = state.topic
+            prompt = FRAGMENT_PROMPT.format(persona=persona, fragment="\n".join(lines), topic=topic)
+            text = await bridge.ask(prompt)
+            if text:
+                return text.strip().strip('"').strip("«»")[:280]
+        except Exception as e:
+            log.warning("[%s] fragment gen error: %s", persona[:20], e)
+
+    return ""
+
+
+async def generate_question(bridge: Any, persona: str, original: str) -> str:
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            prompt = QA_QUESTION_PROMPT.format(persona=persona, original=original[:200])
+            text = await bridge.ask(prompt)
+            if text:
+                return text.strip().strip('"').strip("«»")[:200]
+        except Exception as e:
+            log.warning("Q gen error: %s", e)
+    return original[:200] if original else "А что думаете по этому поводу?"
+
+
+async def generate_answer(bridge: Any, state: FarmState, persona: str, question: str) -> str:
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            async with state.lock:
+                topic = state.topic
+            prompt = QA_ANSWER_PROMPT.format(persona=persona, question=question, topic=topic)
+            text = await bridge.ask(prompt)
+            if text:
+                return text.strip().strip('"').strip("«»")[:280]
+        except Exception as e:
+            log.warning("A gen error: %s", e)
+    return "Думаю, в этом определённо есть смысл."
+
+
+async def generate_new_topic(bridge: Any, state: FarmState, donor: DonorCorpus) -> str:
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            async with state.lock:
+                old = state.topic
+            seeds = donor.sample_texts(10)
+            seed_block = "\n".join(f"— {s}" for s in seeds) or "— (нет)"
+            t = await bridge.ask(TOPIC_PROMPT.format(seeds=seed_block, topic=old))
+            if t:
+                return t.strip().strip('"').strip("«»")[:80] or "общее общение"
+        except Exception:
+            pass
+    return "новости и обсуждения"
+
+
+DIALOGUE_PROGRESS_STEPS = (
+    "первый ход этапа: возьми одну конкретную деталь из обезличенной истории и предложи первый предметный угол обсуждения",
+    "продолжи именно предыдущую реплику бота: уточни названный там критерий новым конкретным под-критерием",
+    "развивай предыдущий критерий: назови практический компромисс или ограничение, которое из него следует",
+    "проверь компромисс из предыдущей реплики одним измеримым действием или сравнением",
+    "сделай вывод из предложенной проверки, отметив, чего пока не знаем; не возвращайся к исходной теме как к вопросу",
+    "добавь к этому выводу одно новое условие, способное изменить решение",
+    "сформулируй практическое правило выбора на основе уже пройденных шагов",
+    "собери в двух словах, как развилась именно эта цепочка, и закончи её либо задай один конкретный следующий вопрос",
+)
+
+
+DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплики для автоматизированного, явно сценарного диалога в групповом чате. Не имитируй конкретного реального участника и не заявляй о личном опыте; если тебя прямо спрашивают, автоматизирован ли аккаунт, ответь честно.
+Тема/цель сценария — только границы разговора, а не вопрос, на который каждый аккаунт должен отвечать заново:
+{topic}
+
+Одна обезличенная историческая реплика — исходная точка только для первого хода этапа:
+{history_seed}
+
+Последняя реплика предыдущего аккаунта — продолжай её, а не начинай новый ответ на общую тему:
+{previous_turn}
+
+Роль этого синтетического аккаунта: {persona}
+Общие указания: {global_prompt}
+Ход №: {turn_number}
+Шаг развития этой цепочки: {progression_step}
+Последние реплики (имена авторов обезличены):
+{context}
+
+Строго соблюдай последовательность: только первый ход этапа может непосредственно отозваться на историческую реплику; каждый следующий ход сначала развивает конкретный тезис предыдущего аккаунта, затем добавляет ровно один новый критерий, последствие или проверяемое действие. Не отвечай снова на стартовую тему, не раздавай отдельный ответ каждому участнику и не задавай каждому аккаунту один и тот же вопрос. Если данных не хватает, прямо обозначь пробел вместо догадки. Не цитируй историю целиком и не приписывай автору личность или стиль. Не выдумывай факты, личный опыт или актуальные сведения. Не начинай с «Мысль про…», «Согласен, здесь важно не торопиться с выводами», «Что для вас главное?» или «А если посмотреть с другой стороны?». Не перефразируй предыдущую реплику без нового содержательного шага. Вопрос — только конкретный и не в каждом ходе. 1–2 предложения, максимум 240 символов; разговорный, слегка неформальный стиль.
+{extra_instruction}
+Только текст реплики:"""
+
+CLEAN_JOKES = (
+    "— Почему книга по математике грустила? — У неё было слишком много задач.",
+    "— Что сказал ноль восьмёрке? — Отличный ремень!",
+    "— Почему компьютер пошёл к врачу? — Подхватил вирус, а перезагрузиться не помогло.",
+    "— Как называется медведь без зубов? — Мармеладный.",
+    "— Почему чай не спорит? — Он предпочитает заваривать отношения.",
+)
+
+
+def _short_context_line(text: str, limit: int = 90) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit - 1].rstrip() + "…"
+
+
+_CIRCULAR_DIALOGUE_RE = re.compile(
+    r"(?:\bмысль\s+про\b|\bчто\s+для\s+вас\s+главн\w*|"
+    r"\bа\s+если\s+посмотреть.{0,80}\bс\s+другой\s+сторон\w*|"
+    r"\bне\s+торопиться\s+с\s+вывод\w*|\bчто\s+бы\s+вы\s+добавил\w*|"
+    r"\bчто\s+кажется\s+самым\s+важным\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRAVEL_CONTEXT_RE = re.compile(
+    r"мандрем|ашвем|пляж|пальм|попуга|море|курорт|отпуск|отел|трансфер|"
+    r"путешеств|поездк|аэропорт|остров|тишин|шум|спокойн",
+    re.IGNORECASE,
+)
+_REST_CONTEXT_RE = re.compile(r"отдых|здоров|сон|устал|перерыв|восстанов|стресс", re.IGNORECASE)
+_FOOD_CONTEXT_RE = re.compile(r"рецепт|готов|блюд|еда|вкус|ресторан|продукт", re.IGNORECASE)
+
+
+def _is_circular_dialogue_reply(text: str) -> bool:
+    return bool(_CIRCULAR_DIALOGUE_RE.search(str(text or "")))
+
+
+def _human_message_for_turn(history: list[dict[str, Any]], turn_number: int) -> str:
+    """Use one anonymized historical message as the seed for each eight-turn phase."""
+    sources: list[str] = []
+    for item in history:
+        if item.get("direction") == "outgoing":
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text or re.fullmatch(r"\[(?:gif|photo|sticker|voice|video|file|media)\]", text, re.IGNORECASE):
+            continue
+        if len(text) >= 6:
+            sources.append(text)
+    if not sources:
+        return ""
+    phase = (max(1, turn_number) - 1) // len(DIALOGUE_PROGRESS_STEPS)
+    source_index = len(sources) - 1 - phase
+    return sources[source_index] if source_index >= 0 else ""
+
+
+def _dialogue_domain(text: str) -> str:
+    if _TRAVEL_CONTEXT_RE.search(text):
+        return "travel"
+    if _REST_CONTEXT_RE.search(text):
+        return "rest"
+    if _FOOD_CONTEXT_RE.search(text):
+        return "food"
+    return "general"
+
+
+def _compact_seed_terms(text: str, topic: str) -> str:
+    source = text or topic
+    words = re.findall(r"[a-zа-яё]{4,}", str(source).casefold())
+    stopwords = {
+        "когда", "который", "которая", "которые", "почему", "потому", "чтобы", "здесь", "тогда",
+        "этого", "этими", "такой", "такие", "можно", "нужно", "будет", "очень", "просто", "вообще",
+        "кажется", "важно", "тема", "темы", "тему", "вопрос", "ответ", "сейчас", "говорит", "сказал",
+        "сказала", "может", "думаю", "согласен", "интересно", "посмотреть", "другой", "стороны",
+        "котором", "самый", "самая", "самое", "своей", "своего", "своими", "чтобы", "если",
+    }
+    terms: list[str] = []
+    for word in words:
+        if word in stopwords or word in terms:
+            continue
+        terms.append(word)
+        if len(terms) == 4:
+            break
+    return ", ".join(terms) or _short_context_line(topic, 56) or "заданная тема"
+
+
+def _travel_focus(text: str) -> str:
+    focus: list[str] = []
+    if re.search(r"тишин|тихо|нет\s+шума|без\s+шума|спокойн|шум", text, re.IGNORECASE):
+        focus.append("тишина")
+    if re.search(r"пальм|попуга|зел|дерев|природ", text, re.IGNORECASE):
+        focus.append("природное окружение")
+    if re.search(r"мор|пляж|берег", text, re.IGNORECASE):
+        focus.append("море и пляж")
+    if re.search(r"цен|бюджет|дорог|дешев|стоим", text, re.IGNORECASE):
+        focus.append("бюджет")
+    if re.search(r"дорог|ехать|транспорт|трансфер|аэропорт|рядом", text, re.IGNORECASE):
+        focus.append("удобство дороги")
+    return " и ".join(dict.fromkeys(focus)) or "описанная атмосфера"
+
+
+def _progressive_offline_turn(
+    topic: str,
+    source_text: str,
+    turn_number: int,
+    history: list[dict[str, Any]],
+) -> str:
+    """Advance from the anonymized source through distinct, concrete discussion steps."""
+    seed = source_text or topic
+    domain = _dialogue_domain(f"{topic} {seed}")
+    if domain == "travel":
+        focus = _travel_focus(seed)
+        comparison = bool(re.search(r"между|сравн|выбрат|вариант|или", seed, re.IGNORECASE))
+        places = "эти два места" if comparison else "это место"
+        lines = (
+            f"В описании {places} уже есть конкретные плюсы — {focus}. Я бы начал не с общего выбора, а с одного нового критерия: времени дороги и базовых удобств рядом.",
+            "Продолжая критерий из прошлого хода, разделю дорогу на время трансфера и повседневные поездки. Так сравнение станет точнее, а не вернётся к исходному вопросу.",
+            f"Из этого уточнения виден компромисс: {focus} могут сочетаться с менее удобной логистикой. Пока это только гипотеза — данных по маршруту нет.",
+            "Этот компромисс можно проверить на конкретных датах: сопоставить длительность трансфера и расстояние до нужных мест, не додумывая за варианты.",
+            f"После такой проверки станет ясно, перевешивает ли {focus} неудобство дороги; сейчас из истории подтверждена только атмосфера.",
+            "Даже при похожем маршруте остаётся условие самой поездки: поздний приезд, бюджет или необходимость транспорта. Оно может поменять вывод.",
+            "Тогда правило решения такое: сначала выбрать приоритет поездки, затем проверить связанный с ним критерий — атмосферу или логистику.",
+            "Цепочка прошла от описания атмосферы к логистике, компромиссу и способу проверки. Без результатов проверки окончательный выбор пока не делаем.",
+        )
+    elif domain == "rest":
+        lines = (
+            "Связь отдыха и здоровья понятна; для начала разделю короткие паузы в течение дня и полноценное время на восстановление — это разные масштабы.",
+            "Из этого разделения следует следующий вопрос по сути: влияет ли регулярность пауз отдельно от продолжительности отдыха.",
+            "Но сами паузы не объясняют усталость полностью: на неё могут влиять сон и нагрузка, поэтому один совет не подойдёт всем.",
+            "Эту разницу можно проверить наблюдением: неделю отмечать сон, нагрузку и усталость до и после пауз — без медицинских выводов.",
+            "По таким заметкам можно будет понять, какой режим помогает в конкретном случае; пока мы не знаем исходные условия.",
+            "К этому выводу добавлю ограничение: свободное время не всегда означает, что человек действительно отключился от дел.",
+            "Практическое правило из цепочки: сочетать короткие паузы с более длинным отдыхом и оценивать результат по самочувствию.",
+            "Мы перешли от общего тезиса об отдыхе к разным режимам и проверке их эффекта. Для более точного вывода нужны реальные наблюдения.",
+        )
+    elif domain == "food":
+        focus = _compact_seed_terms(seed, topic)
+        lines = (
+            f"В истории уже есть основа — {focus}. Чтобы развить её, введу практический критерий: время приготовления и нужные ингредиенты.",
+            "Продолжая этот критерий, разделю его на стоимость продуктов и затраченное время: вариант может выигрывать по одному и уступать по другому.",
+            "Из этого сравнения появляется проверка: сопоставить два блюда на одинаковое число порций, иначе цена будет несопоставима.",
+            "Для такой проверки достаточно выбрать два рецепта и записать стоимость, время и возможные замены ингредиентов.",
+            "После этого уже можно решить, какой вариант удобнее; пока у нас есть критерии, но нет данных для победителя.",
+            "К сравнению стоит добавить доступность продуктов: редкий ингредиент может перечеркнуть небольшую экономию.",
+            "Правило выбора теперь практичное: сначала задать бюджет и лимит времени, затем подобрать рецепт под оба условия.",
+            "Цепочка продвинулась от исходной идеи к критериям, сравнению и правилу выбора — без повторного ответа на стартовую тему.",
+        )
+    else:
+        focus = _compact_seed_terms(seed, topic)
+        lines = (
+            f"В обезличенной истории уже есть конкретная опора — {focus}. Начну с одного критерия, по которому эту мысль можно проверить.",
+            f"Продолжая этот критерий, полезно разделить причины и последствия вокруг «{focus}»: что наблюдалось, а что пока только объяснение.",
+            "У такого объяснения может быть ограничение: тот же результат иногда зависит от другого условия, которого мы ещё не проверили.",
+            "Это ограничение проверяется сравнением двух похожих случаев по одному и тому же признаку.",
+            f"После сравнения можно сделать промежуточный вывод о «{focus}»; пока данных для окончательного ответа не хватает.",
+            "К этому выводу добавлю альтернативу: возможно, результат объясняется не главным фактором, а сопутствующим условием.",
+            "Практическое правило из обсуждения: сначала проверить главный критерий и альтернативу, и только потом выбирать действие.",
+            "Итог цепочки: мы перешли от исходной мысли к критерию, ограничению и проверке. Это развитие темы, а не повтор стартового вопроса.",
+        )
+    return _choose_fresh_fallback(lines, history, turn_number, _short_context_line(seed, 64))
+
+
+def _question_context_fallback(topic: str, source_text: str) -> str:
+    source = f"{topic} {source_text}"
+    domain = _dialogue_domain(source)
+    if domain == "travel":
+        return "По одной реплике нельзя честно выбрать место; сравните на свои даты время дороги и нужные удобства, а не только общее впечатление."
+    if domain == "rest":
+        return "Чтобы ответить предметно, нужны наблюдения о сне и усталости; без них можно только проверить, помогает ли регулярный отдых."
+    focus = _compact_seed_terms(source_text, topic)
+    return f"По «{focus}» пока нет данных для уверенного ответа. Сначала стоит отделить подтверждённые факты от предположений и проверить один пример."
+
+
+async def generate_dialogue_turn(
+    bridge: Any,
+    state: FarmState,
+    topic: str,
+    persona: str,
+    turn_number: int,
+    *,
+    tell_joke: bool = False,
+    global_prompt: str = "",
+) -> str:
+    """Generate a progressive turn, anchored in anonymized chat history."""
+    async with state.lock:
+        history = list(state.chat_history)
+        context = build_context(deque(history, maxlen=60), limit=10)
+    latest_event = history[-1] if history else {}
+    latest_text = str(latest_event.get("text") or "").strip()
+    latest_event_is_human = bool(latest_event and latest_event.get("direction") != "outgoing")
+    source_text = _human_message_for_turn(history, turn_number)
+    history_seed = _short_context_line(source_text, 360) or "(история ещё не собрана)"
+    step_index = (max(1, turn_number) - 1) % len(DIALOGUE_PROGRESS_STEPS)
+    progression_step = DIALOGUE_PROGRESS_STEPS[step_index]
+    previous_turn = "(первый ход этапа)"
+    if step_index:
+        previous_turn = next(
+            (
+                _short_context_line(str(item.get("text") or ""), 280)
+                for item in reversed(history)
+                if item.get("direction") == "outgoing" and item.get("text")
+            ),
+            "(предыдущей реплики нет)",
+        )
+    joke_instruction = (
+        "В этот ход добавь короткий добрый анекдот, но привяжи его к предыдущей содержательной мысли. "
+        "После шутки не перезапускай тему и не пересказывай контекст."
+        if tell_joke else ""
+    )
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            prompt = DISCUSSION_TURN_PROMPT.format(
+                topic=topic[:2000],
+                history_seed=history_seed,
+                previous_turn=previous_turn,
+                persona=persona[:500],
+                global_prompt=global_prompt[:2000] or "естественно, по теме и с развитием мысли",
+                turn_number=turn_number,
+                progression_step=progression_step,
+                context=context,
+                extra_instruction=joke_instruction,
+            )
+            # The transcript gives continuity; the separate seed keeps the model
+            # anchored to human-provided content instead of looping on bot questions.
+            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            rejected = bool(text) and (
+                is_dialogue_echo(text, history) or _is_circular_dialogue_reply(text)
+            )
+            if rejected:
+                log.warning("[%s] scenario line echoed or stalled; retrying once", persona[:32])
+                retry_prompt = (
+                    prompt
+                    + "\n\nПредыдущая попытка повторила реплику или вернулась к общему вопросу. "
+                    "Сделай следующий содержательный шаг: добавь новый критерий, компромисс или проверяемое действие; "
+                    "не цитируй историю и не используй круговые фразы."
+                )
+                text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                if text and (
+                    is_dialogue_echo(text, history) or _is_circular_dialogue_reply(text)
+                ):
+                    log.warning("[%s] retry still repeated or stalled; using progressive local fallback", persona[:32])
+                    text = ""
+            if text:
+                return text
+        except Exception:
+            log.exception("[%s] scenario dialogue generation failed", persona[:32])
+
+    if tell_joke:
+        return _choose_fresh_fallback(CLEAN_JOKES, history, turn_number, "эту тему")
+    if latest_event_is_human and FarmAccount._looks_like_question(latest_text):
+        return _question_context_fallback(topic, source_text or latest_text)
+    return _progressive_offline_turn(topic, source_text, turn_number, history)
+
+
+async def generate_reaction(bridge: Any, text: str) -> str:
+    allowed = ["👍", "❤️", "🔥", "😁", "🤔", "👏", "🎉", "😢", "🤯"]
+    if bridge and getattr(bridge, "is_ready", False):
+        try:
+            emoji = (await bridge.ask(REACTION_PROMPT.format(text=text[:200]))).strip()
+            for a in allowed:
+                if a in emoji:
+                    return a
+        except Exception:
+            pass
+    return random.choice(["👍", "🔥", "❤️", "👏", "😁"])
+    return random.choice(allowed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    FARM ACCOUNT
+# ═══════════════════════════════════════════════════════════════
+
+DEFAULT_SYNTHETIC_ROLES = (
+    "дружелюбный собеседник, который поддерживает тему и задаёт открытые вопросы",
+    "практичный собеседник, который предлагает конкретные и осторожные шаги",
+    "аналитичный собеседник, который рассматривает детали и альтернативы",
+    "любознательный собеседник, который уточняет контекст и кратко подводит итог",
+    "лаконичный собеседник, который формулирует выводы простыми словами",
+    "внимательный собеседник, который отделяет факты от предположений",
+    "творческий собеседник, который предлагает безопасные примеры и аналогии",
+    "тактичный модератор, который помогает услышать разные точки зрения",
+)
+DEFAULT_SYNTHETIC_FOCI = (
+    "приводит один нейтральный пример, не выдавая его за личный опыт",
+    "подмечает ограничения и практические нюансы",
+    "сравнивает варианты и выделяет их различия",
+    "предпочитает спокойные уточняющие вопросы",
+    "коротко суммирует уже сказанное",
+    "отмечает, где остаётся неопределённость",
+    "предлагает следующий небольшой шаг",
+    "поддерживает баланс разных мнений",
+)
+DEFAULT_SYNTHETIC_STYLES = (
+    "отвечает кратко и без жаргона",
+    "сначала формулирует тезис, затем одно основание",
+    "задаёт не более одного вопроса за реплику",
+    "не повторяет формулировки предыдущих сообщений",
+    "сохраняет доброжелательный нейтральный тон",
+    "использует примеры только когда они уместны",
+    "явно помечает предположения",
+    "подводит итог одним предложением",
+)
+
+
+class FarmAccount:
+    def __init__(self, cfg, bridge, state, donor, farm_accounts_ref):
+        self.cfg = cfg
+        self.name: str = str(cfg["name"])
+        configured_persona = str(cfg.get("persona") or "").strip()
+        role_digest = hashlib.sha256(self.name.casefold().encode("utf-8")).hexdigest()
+        role_index = int(role_digest[0:8], 16) % len(DEFAULT_SYNTHETIC_ROLES)
+        focus_index = int(role_digest[8:16], 16) % len(DEFAULT_SYNTHETIC_FOCI)
+        style_index = int(role_digest[16:24], 16) % len(DEFAULT_SYNTHETIC_STYLES)
+        default_role = (
+            f"{DEFAULT_SYNTHETIC_ROLES[role_index]}; "
+            f"индивидуальный акцент — {DEFAULT_SYNTHETIC_FOCI[focus_index]}; "
+            f"стиль — {DEFAULT_SYNTHETIC_STYLES[style_index]}"
+        )
+        self.persona: str = configured_persona or f"Синтетическая роль {role_digest[:8]}: {default_role}"
+        try:
+            self.reply_probability = max(0.0, min(1.0, float(cfg.get("reply_probability", 0.85))))
+        except (TypeError, ValueError):
+            self.reply_probability = 0.85
+        self.media_bias = normalize_media_bias(cfg.get("media_bias"))
+        session_factory = getattr(bridge, "session", None)
+        if callable(session_factory):
+            chat_scope = f"{FARM_CFG.get('target_chat_id', 'default')}:{FARM_CFG.get('topic_id') or 0}"
+            self.bridge = session_factory(f"farm:{chat_scope}:account:{self.name}")
+        else:
+            self.bridge = bridge
+        self.state = state
+        self.donor = donor
+        self.farm_accounts = farm_accounts_ref
+        self.user_id: int | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+
+        session_string = os.getenv(f"SESSION_{self.name.upper()}")
+        client_kwargs: dict[str, Any] = {
+            "name": self.name,
+            "api_id": int(cfg["api_id"]),
+            "api_hash": str(cfg["api_hash"]),
+            "workdir": str(SESSIONS_DIR),
+        }
+        if session_string:
+            client_kwargs["session_string"] = session_string
+        else:
+            client_kwargs["phone_number"] = cfg.get("phone")
+        proxy = cfg.get("proxy") or FARM_CFG.get("proxy")
+        if proxy:
+            if isinstance(proxy, str):
+                from web.manager import parse_proxy
+                client_kwargs["proxy"] = parse_proxy(proxy)
+            elif isinstance(proxy, dict):
+                client_kwargs["proxy"] = proxy
+            else:
+                raise ValueError(f"Неверный прокси для аккаунта {self.name}")
+
+        self.client = Client(**client_kwargs)
+        self._running = False
+        self._task: asyncio.Task | None = None
+
+    async def start(self, timeout: float = 90.0) -> None:
+        log.info("[%s] start()", self.name)
+        try:
+            authorized = await asyncio.wait_for(self.client.connect(), timeout=timeout)
+            if not authorized:
+                raise RuntimeError("Сессия не авторизована — подключите её в веб-панели")
+            await self.client.invoke(raw.functions.updates.GetState())
+            me = await self.client.get_me()
+            self.client.me = me
+            await self.client.initialize()
+        except asyncio.TimeoutError as exc:
+            await self._close_client_connection()
+            raise RuntimeError(f"[{self.name}] start timeout") from exc
+        except Exception:
+            await self._close_client_connection()
+            raise
+        self.user_id = me.id
+        log.info("Аккаунт %s вошёл как @%s (id=%s)", self.name, me.username, me.id)
+
+        target = int(FARM_CFG["target_chat_id"])
+        try:
+            await self.client.get_chat(target)
+        except Exception as exc:
+            log.warning("[%s] peer pre-resolve failed (non-fatal): %s", self.name, exc)
+
+        farm_cfg = FARM_CFG.get("farm", {})
+        scenario_mode = farm_cfg.get("scenario_mode", "reactive")
+        self._running = True
+        if scenario_mode in {"reactive", "combined"}:
+            # Combined mode keeps the normal reply handler active while a single
+            # scenario scheduler adds sequential account-to-account turns.
+            self.client.add_handler(
+                MessageHandler(
+                    self._on_incoming,
+                    filters.chat(target) & filters.incoming,
+                )
+            )
+            if scenario_mode == "reactive" and farm_cfg.get("proactive_enabled", False):
+                self._task = asyncio.create_task(self._loop(), name=f"farm-proactive-{self.name}")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("task stop %s", self.name)
+        tasks = list(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        await self._close_client_connection()
+
+    async def _close_client_connection(self) -> None:
+        try:
+            if getattr(self.client, "is_initialized", False):
+                await asyncio.wait_for(self.client.stop(), timeout=15.0)
+            elif getattr(self.client, "is_connected", False):
+                await asyncio.wait_for(self.client.disconnect(), timeout=15.0)
+        except Exception:
+            log.debug("client cleanup failed for %s", self.name, exc_info=True)
+
+    async def _on_incoming(self, client: Client, message: TGMessage) -> None:
+        del client
+        scenario_mode = FARM_CFG.get("farm", {}).get("scenario_mode", "reactive")
+        if scenario_mode not in {"reactive", "combined"}:
+            return
+        if not message or getattr(message, "empty", False) or getattr(message, "service", None):
+            return
+        sender = getattr(message, "from_user", None)
+        if not sender or getattr(sender, "is_bot", False):
+            return
+        if sender.id in {account.user_id for account in self.farm_accounts if account.user_id}:
+            return
+        if not self._is_in_configured_topic(message):
+            return
+
+        text = self._message_text(message)
+        is_question = self._looks_like_question(text)
+        chat_id = int(message.chat.id)
+        async with self.state.lock:
+            if not self.state.remember_message(chat_id, int(message.id)):
+                return
+            self.state.chat_history.append({
+                "author": getattr(sender, "username", None) or getattr(sender, "first_name", None) or "участник",
+                "user_id": int(sender.id),
+                "message_id": int(message.id),
+                "chat_id": chat_id,
+                "text": text,
+                "kind": self._message_kind(message),
+                "direction": "incoming",
+                "is_question": is_question,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+
+        if scenario_mode == "combined" and not is_question:
+            log.info("[%s] входящее сообщение %s сохранено как контекст; вопрос не распознан", self.name, message.id)
+            return
+
+        candidates = [account for account in self.farm_accounts if account._running]
+        if not candidates:
+            candidates = [self]
+        responder = random.choice(candidates)
+        log.info(
+            "[%s] входящее сообщение %s: %s; шанс ответа %.0f%%",
+            self.name,
+            message.id,
+            "вопрос распознан" if is_question else "обрабатывается в режиме ответов",
+            responder.reply_probability * 100,
+        )
+        if random.random() >= responder.reply_probability:
+            log.info("[%s] ответ на сообщение %s пропущен по настроенной вероятности", responder.name, message.id)
+            return
+        log.info("[%s] ответ на сообщение %s запланирован реплаем", responder.name, message.id)
+        task = asyncio.create_task(
+            responder._answer_incoming(message, text),
+            name=f"reply-{responder.name}-{message.id}",
+        )
+        responder._background_tasks.add(task)
+        task.add_done_callback(responder._background_tasks.discard)
+
+    def _is_in_configured_topic(self, message: TGMessage) -> bool:
+        topic_id = FARM_CFG.get("topic_id")
+        if not topic_id:
+            return True
+        thread_id = getattr(message, "reply_to_top_message_id", None)
+        if thread_id is None:
+            thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is not None:
+            return int(thread_id) == int(topic_id)
+        reply_id = getattr(message, "reply_to_message_id", None)
+        if reply_id is not None:
+            return int(reply_id) == int(topic_id)
+        return int(message.id) == int(topic_id)
+
+    @staticmethod
+    def _message_kind(message: TGMessage) -> str:
+        for attr, kind in (
+            ("photo", "photo"),
+            ("animation", "gif"),
+            ("sticker", "sticker"),
+            ("voice", "voice"),
+            ("video", "video"),
+            ("document", "file"),
+        ):
+            if getattr(message, attr, None):
+                return kind
+        return "text"
+
+    @classmethod
+    def _message_text(cls, message: TGMessage) -> str:
+        return str(getattr(message, "text", None) or getattr(message, "caption", None) or f"[{cls._message_kind(message)}]").strip()
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        candidate = str(text or "").casefold().strip()
+        if not candidate:
+            return False
+        if "?" in candidate or "？" in candidate:
+            return True
+        # Normalize mentions and punctuation so missing commas, extra symbols,
+        # and casual spelling don't hide common questions or help requests.
+        candidate = re.sub(r"(?<!\w)@[A-Za-z0-9_]+", " ", candidate)
+        candidate = re.sub(r"[^\w\s'-]+", " ", candidate, flags=re.UNICODE)
+        candidate = " ".join(candidate.split())
+        if not candidate:
+            return False
+        return bool(QUESTION_START_RE.match(candidate) or QUESTION_PHRASE_RE.search(candidate))
+
+    async def _answer_incoming(self, message: TGMessage, incoming_text: str) -> None:
+        farm_cfg = FARM_CFG.get("farm", {})
+        min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
+        max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
+        delay = random.uniform(min_delay, max_delay)
+        if delay:
+            log.info("[%s] ответ на %s через %.1f сек.", self.name, message.id, delay)
+            await asyncio.sleep(delay)
+        async with self.state.outgoing_lock:
+            sent = await self._send_reply(reply_to=message, incoming_text=incoming_text)
+        if sent:
+            log.info("[%s] реплай на сообщение %s отправлен", self.name, message.id)
+        else:
+            log.warning("[%s] не удалось отправить реплай на сообщение %s", self.name, message.id)
+
+    async def _loop(self) -> None:
+        farm_cfg = FARM_CFG.get("farm", {})
+        min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
+        max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
+        while self._running:
+            try:
+                await asyncio.sleep(random.uniform(min_delay, max_delay))
+                if not self._running or random.random() > self.reply_probability:
+                    continue
+                await self._act()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("proactive loop failed for %s", self.name)
+                await asyncio.sleep(20)
+
+    async def _act(self) -> None:
+        farm_cfg = FARM_CFG.get("farm", {})
+        roll = random.random()
+        if roll < farm_cfg.get("qa_probability", 0.25) and len(self.farm_accounts) >= 2:
+            await self._do_qa()
+            return
+        if roll < farm_cfg.get("qa_probability", 0.25) + farm_cfg.get("clone_probability", 0.25):
+            if await self._send_from_fragment():
+                return
+        await self._send_reply()
+
+    async def _do_qa(self) -> None:
+        qa = self.donor.sample_qa()
+        if not qa:
+            return
+        original_question, _ = qa
+        original_text = (original_question.get("text") or "").strip()
+        if not original_text:
+            return
+        others = [account for account in self.farm_accounts if account is not self]
+        if not others:
+            return
+        other = random.choice(others)
+        question = await generate_question(self.bridge, self.persona, original_text)
+        if not question:
+            return
+        await self._send_text(question)
+        await asyncio.sleep(random.uniform(3, 15))
+        answer = await generate_answer(other.bridge, other.state, other.persona, question)
+        if answer:
+            await other._send_text(answer)
+
+    async def _send_from_fragment(self) -> bool:
+        fragment = self.donor.sample_fragment()
+        if not fragment:
+            return False
+        text = await generate_from_fragment(self.bridge, self.state, self.donor, self.persona, fragment)
+        if not text:
+            return False
+        return await self._send_text(text)
+
+    async def _send_reply(
+        self,
+        reply_to: TGMessage | int | None = None,
+        incoming_text: str = "",
+    ) -> bool:
+        try:
+            persona = self.persona
+            global_prompt = str(FARM_CFG.get("farm", {}).get("agent_prompt", "")).strip()
+            if global_prompt:
+                persona = f"{persona}\nОбщие указания: {global_prompt}"
+            scenario_mode = str(FARM_CFG.get("farm", {}).get("scenario_mode", "reactive"))
+            text = await generate_reply(
+                self.bridge,
+                self.state,
+                self.donor,
+                persona,
+                incoming_text,
+                include_scenario_topic=scenario_mode != "reactive",
+            )
+        except Exception:
+            log.exception("[%s] reply generation failed", self.name)
+            text = "Понял, спасибо что поделился 🙂"
+
+        kind = self._pick_kind()
+        try:
+            if kind == "text":
+                return await self._send_text(text, reply_to=reply_to)
+            if kind == "sticker":
+                sent = await self._send_sticker(reply_to=reply_to)
+            elif kind == "gif":
+                sent = await self._send_gif(reply_to=reply_to, search_text=incoming_text or text)
+            elif kind == "photo":
+                sent = await self._send_photo(reply_to=reply_to)
+            elif kind == "voice":
+                sent = await self._send_voice(reply_to=reply_to)
+            else:
+                sent = False
+            # A missing/invalid media item must not turn a reply into silence.
+            return sent or await self._send_text(text, reply_to=reply_to)
+        except Exception:
+            log.exception("[%s] send %s failed", self.name, kind)
+            return await self._send_text(text, reply_to=reply_to)
+
+    async def _send_dialogue_content(
+        self,
+        text: str,
+        *,
+        reply_to: TGMessage | int | None,
+        kind: str,
+    ) -> bool:
+        """Send one readable dialogue turn and optionally attach/append configured media."""
+        if kind == "text":
+            return await self._send_text(text, reply_to=reply_to)
+        if kind == "gif":
+            sent = await self._send_gif(reply_to=reply_to, search_text=text, caption=text)
+            return sent or await self._send_text(text, reply_to=reply_to)
+        if kind == "photo":
+            sent = await self._send_photo(reply_to=reply_to, caption=text)
+            return sent or await self._send_text(text, reply_to=reply_to)
+
+        # Stickers and voice notes do not support captions. Put the text in the
+        # dialogue first, then attach the media as a reply to that line.
+        sent_text = await self._send_text(text, reply_to=reply_to)
+        if not sent_text:
+            return False
+        async with self.state.lock:
+            text_message_id = self.state.last_outgoing_message_id
+        if not text_message_id:
+            return True
+        if kind == "sticker":
+            await self._send_sticker(reply_to=text_message_id)
+        elif kind == "voice":
+            await self._send_voice(reply_to=text_message_id)
+        # Keep the text turn as the next chain anchor rather than replying to
+        # its captionless sticker/voice attachment.
+        async with self.state.lock:
+            self.state.last_outgoing_message_id = text_message_id
+        return True
+
+    def _pick_kind(self) -> str:
+        kinds = list(self.media_bias)
+        weights = [self.media_bias[kind] for kind in kinds]
+        return random.choices(kinds, weights=weights, k=1)[0]
+
+    def _send_kwargs(self, reply_to: TGMessage | int | None = None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"chat_id": int(FARM_CFG["target_chat_id"])}
+        if isinstance(reply_to, int):
+            reply_id = reply_to
+        elif reply_to is not None:
+            reply_id = getattr(reply_to, "id", None)
+        else:
+            reply_id = FARM_CFG.get("topic_id")
+        if reply_id:
+            kwargs["reply_to_message_id"] = int(reply_id)
+        return kwargs
+
+    async def _typing(self, seconds: float) -> None:
+        farm_cfg = FARM_CFG.get("farm", {})
+        if not farm_cfg.get("typing_simulation", True):
+            return
+        try:
+            await self.client.send_chat_action(int(FARM_CFG["target_chat_id"]), ChatAction.TYPING)
+            if seconds > 0:
+                await asyncio.sleep(seconds)
+        except Exception:
+            log.debug("typing simulation skipped", exc_info=True)
+
+    async def _send_text(self, text: str, reply_to: TGMessage | int | None = None) -> bool:
+        if not text:
+            return False
+        try:
+            await self._typing(min(len(text) / 50, 2))
+            msg = await self.client.send_message(text=text, **self._send_kwargs(reply_to))
+            await self._record(msg, text, "text")
+            log.info("[%s] → %s%s", self.name, text[:80], f" (reply to {getattr(reply_to, 'id', reply_to)})" if reply_to else "")
+            return True
+        except Exception:
+            log.exception("[%s] send_text failed", self.name)
+            return False
+
+    async def _send_sticker(self, reply_to: TGMessage | int | None = None) -> bool:
+        donor_item = self.donor.sample_media("sticker")
+        try:
+            if donor_item and donor_item.get("media_file"):
+                path = ROOT / donor_item["media_file"]
+                if path.is_file():
+                    msg = await self.client.send_sticker(sticker=str(path), **self._send_kwargs(reply_to))
+                    await self._record(msg, "", "sticker")
+                    log.info("[%s] sticker from donor", self.name)
+                    return True
+            stickers = FARM_CFG.get("stickers") or []
+            if stickers:
+                msg = await self.client.send_sticker(sticker=random.choice(stickers), **self._send_kwargs(reply_to))
+                await self._record(msg, "", "sticker")
+                return True
+        except Exception:
+            log.exception("[%s] sticker failed", self.name)
+        return False
+
+    async def _send_gif(
+        self,
+        reply_to: TGMessage | int | None = None,
+        search_text: str = "",
+        caption: str = "",
+    ) -> bool:
+        donor_item = self.donor.sample_media("gif")
+        send_kwargs = self._send_kwargs(reply_to)
+        if caption:
+            send_kwargs["caption"] = caption[:1000]
+        try:
+            if donor_item and donor_item.get("media_file"):
+                path = ROOT / donor_item["media_file"]
+                if path.is_file():
+                    msg = await self.client.send_animation(animation=str(path), **send_kwargs)
+                    await self._record(msg, caption, "gif")
+                    log.info("[%s] GIF from donor", self.name)
+                    return True
+        except Exception:
+            log.exception("[%s] donor GIF failed; trying configured providers", self.name)
+
+        for configured in FARM_CFG.get("gifs") or []:
+            try:
+                msg = await self.client.send_animation(animation=configured, **send_kwargs)
+                await self._record(msg, caption, "gif")
+                log.info("[%s] configured GIF sent", self.name)
+                return True
+            except Exception:
+                log.warning("[%s] configured GIF could not be sent; trying next", self.name, exc_info=True)
+
+        downloaded: Path | None = None
+        try:
+            from web.giphy import download_gif, random_gif
+
+            query = self._gif_query(search_text)
+            url = await random_gif(query)
+            if not url:
+                log.warning("[%s] GIF not sent: configure a GIPHY/Tenor key or add donor GIFs", self.name)
+                return False
+            downloaded = await download_gif(url, DATA_DIR / "gif_cache")
+            msg = await self.client.send_animation(animation=str(downloaded), **send_kwargs)
+            await self._record(msg, caption, "gif")
+            log.info("[%s] GIF sent from provider (%s)", self.name, query)
+            return True
+        except Exception:
+            log.exception("[%s] provider GIF failed", self.name)
+            return False
+        finally:
+            if downloaded:
+                downloaded.unlink(missing_ok=True)
+
+    @staticmethod
+    def _gif_query(text: str) -> str:
+        words = [word.strip(".,!?;:()[]{}\"'«»") for word in (text or "").split()]
+        query = " ".join(word for word in words[:5] if len(word) > 2)
+        return query[:80] or "funny reaction"
+
+    async def _send_photo(self, reply_to: TGMessage | int | None = None, caption: str = "") -> bool:
+        donor_item = self.donor.sample_media("photo")
+        send_kwargs = self._send_kwargs(reply_to)
+        if caption:
+            send_kwargs["caption"] = caption[:1000]
+        try:
+            if donor_item and donor_item.get("media_file"):
+                path = ROOT / donor_item["media_file"]
+                if path.is_file():
+                    msg = await self.client.send_photo(photo=str(path), **send_kwargs)
+                    await self._record(msg, caption, "photo")
+                    log.info("[%s] photo from donor", self.name)
+                    return True
+            photos = FARM_CFG.get("photos") or []
+            if photos:
+                msg = await self.client.send_photo(photo=random.choice(photos), **send_kwargs)
+                await self._record(msg, caption, "photo")
+                return True
+            from web.giphy import random_photo
+
+            photo_url = await random_photo()
+            if photo_url:
+                msg = await self.client.send_photo(photo=photo_url, **send_kwargs)
+                await self._record(msg, caption, "photo")
+                log.info("[%s] photo sent from random image provider", self.name)
+                return True
+        except Exception:
+            log.exception("[%s] photo failed", self.name)
+        return False
+
+    async def _send_voice(self, reply_to: TGMessage | int | None = None) -> bool:
+        donor_item = self.donor.sample_media("voice")
+        if not donor_item or not donor_item.get("media_file"):
+            return False
+        path = ROOT / donor_item["media_file"]
+        if not path.is_file():
+            return False
+        try:
+            await self._typing(1.5)
+            msg = await self.client.send_voice(voice=str(path), **self._send_kwargs(reply_to))
+            await self._record(msg, "", "voice")
+            log.info("[%s] voice from donor (%s)", self.name, path.name)
+            return True
+        except Exception:
+            log.exception("[%s] voice failed", self.name)
+            return False
+
+    async def _send_reaction_to_last(self) -> None:
+        async with self.state.lock:
+            last = next(
+                (item for item in reversed(self.state.chat_history)
+                 if item.get("direction") == "incoming" and item.get("kind") == "text" and item.get("text")),
+                None,
+            )
+        if not last:
+            return
+        if random.random() > FARM_CFG.get("farm", {}).get("reaction_probability", 0.35):
+            return
+        emoji = await generate_reaction(self.bridge, last["text"])
+        try:
+            await self.client.send_reaction(
+                chat_id=int(FARM_CFG["target_chat_id"]),
+                message_id=int(last["message_id"]),
+                emoji=emoji,
+            )
+            log.info("[%s] reaction %s on incoming msg %s", self.name, emoji, last["message_id"])
+        except RPCError as exc:
+            log.warning("[%s] reaction failed: %s", self.name, exc)
+        except Exception:
+            log.exception("[%s] reaction failed", self.name)
+
+    async def _record(self, msg: TGMessage, text: str, kind: str) -> None:
+        user = getattr(msg, "from_user", None)
+        async with self.state.lock:
+            self.state.chat_history.append({
+                "author": self.name,
+                "user_id": getattr(user, "id", self.user_id or 0),
+                "message_id": int(msg.id),
+                "chat_id": int(getattr(getattr(msg, "chat", None), "id", FARM_CFG["target_chat_id"])),
+                "text": text,
+                "kind": kind,
+                "direction": "outgoing",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+            self.state.last_outgoing_message_id = int(msg.id)
+
+
+async def run_scenario(
+    accounts: list[FarmAccount],
+    state: FarmState,
+    stop_event: asyncio.Event,
+    settings: dict[str, Any],
+) -> None:
+    """Run the account dialogue (and, in combined mode, keep incoming replies active)."""
+    mode = str(settings.get("scenario_mode", "reactive"))
+    if mode not in {"discussion", "roulette", "combined", "history_dialogue"}:
+        return
+    if len(accounts) < 2:
+        raise RuntimeError("Для сценария нужны минимум два подключённых аккаунта")
+
+    topic = str(settings.get("scenario_topic") or "").strip()
+    if not topic:
+        raise RuntimeError("Укажите тему сценария в веб-панели")
+    numbers = parse_roulette_numbers(settings.get("roulette_numbers", "0-36")) if mode == "roulette" else []
+    state.topic = topic
+    # Keep the bounded, authorized chat transcript as generation context; only reset
+    # the chain pointer so the new scenario does not reply to an old outgoing turn.
+    state.last_outgoing_message_id = None
+
+    opening_sent = False
+    if settings.get("post_opening", True):
+        opener = accounts[0]
+        async with state.outgoing_lock:
+            opening_sent = await opener._send_text(topic, reply_to=FARM_CFG.get("topic_id"))
+        if opening_sent:
+            log.info("Сценарий: аккаунт %s опубликовал стартовую тему", opener.name)
+        else:
+            log.warning("Не удалось отправить стартовую тему; начинаю без неё")
+
+    min_delay = max(5.0, float(FARM_CFG.get("farm", {}).get("min_delay_sec", 20)))
+    max_delay = max(min_delay, float(FARM_CFG.get("farm", {}).get("max_delay_sec", 45)))
+    rest_every = max(0, int(settings.get("rest_every", 6)))
+    rest_min = max(15.0, float(settings.get("rest_min_sec", 60)))
+    rest_max = max(rest_min, float(settings.get("rest_max_sec", 120)))
+    joke_every = max(0, int(settings.get("joke_every", 5)))
+    turn_limit = max(0, int(settings.get("scenario_turns", 20)))
+    turn_index = 0
+
+    log.info(
+        "Сценарий %s начат: %d аккаунта(ов), ходов=%s, тема=%r",
+        mode, len(accounts), turn_limit or "до ручной остановки", topic[:120],
+    )
+    while not stop_event.is_set() and (turn_limit == 0 or turn_index < turn_limit):
+        if turn_index and rest_every and turn_index % rest_every == 0:
+            rest = random.uniform(rest_min, rest_max)
+            log.info("Сценарий: перерыв %.0f сек после %d ходов", rest, turn_index)
+            await asyncio.sleep(rest)
+            if stop_event.is_set():
+                break
+        delay = random.uniform(min_delay, max_delay)
+        if delay:
+            await asyncio.sleep(delay)
+        if stop_event.is_set():
+            break
+
+        account_offset = 1 if opening_sent else 0
+        account = accounts[(turn_index + account_offset) % len(accounts)]
+
+        if mode == "roulette":
+            text = str(random.choice(numbers))
+            async with state.outgoing_lock:
+                async with state.lock:
+                    reply_to = state.last_outgoing_message_id
+                if reply_to is None:
+                    reply_to = FARM_CFG.get("topic_id")
+                sent = await account._send_text(text, reply_to=reply_to)
+            action = f"выбрал число {text}"
+        else:
+            tell_joke = bool(joke_every and (turn_index + 1) % joke_every == 0)
+            text = await generate_dialogue_turn(
+                account.bridge,
+                state,
+                topic,
+                account.persona,
+                turn_index + 1,
+                tell_joke=tell_joke,
+                global_prompt=str(FARM_CFG.get("farm", {}).get("agent_prompt", "")),
+            )
+            kind = account._pick_kind()
+            async with state.outgoing_lock:
+                async with state.lock:
+                    reply_to = state.last_outgoing_message_id
+                if reply_to is None:
+                    reply_to = FARM_CFG.get("topic_id")
+                sent = await account._send_dialogue_content(text, reply_to=reply_to, kind=kind)
+            action = f"рассказал анекдот" if tell_joke else f"продолжил разговор ({kind})"
+
+        if sent:
+            log.info("Сценарий: %s %s", account.name, action)
+        else:
+            log.warning("Сценарий: %s не смог отправить ход %d", account.name, turn_index + 1)
+        turn_index += 1
+
+    if turn_limit and turn_index >= turn_limit:
+        log.info("Сценарий завершён: отправлено ходов=%d", turn_index)
+        if mode == "combined":
+            log.info("Объединённый режим: ответы на входящие сообщения остаются активными до ручной остановки")
+        else:
+            stop_event.set()
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════
+
+FARM_CFG: dict[str, Any] = {}
+FARM_STATS: dict[str, Any] = {"started_at": None, "sent": 0}
+
+
+async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge a private local config with editable web-panel settings/accounts."""
+    from web import db as web_db
+    from web.config import DEFAULT_FARM_SETTINGS, load_farm_settings
+
+    cfg_path = ROOT / "farm_config.json"
+    if cfg_path.exists():
+        try:
+            local_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if not isinstance(local_cfg, dict):
+                raise ValueError("farm_config.json must contain a JSON object")
+        except Exception as exc:
+            raise RuntimeError(f"Не удалось прочитать farm_config.json: {exc}") from exc
+    else:
+        local_cfg = {}
+
+    await web_db.init_db()
+    account_rows = await web_db.list_accounts()
+    settings_raw = await web_db.get_setting("farm_settings", "")
+    try:
+        web_settings = json.loads(settings_raw) if settings_raw else {}
+    except json.JSONDecodeError:
+        log.warning("farm_settings в базе повреждены — использую значения по умолчанию")
+        web_settings = {}
+    if not isinstance(web_settings, dict):
+        web_settings = {}
+
+    file_farm = local_cfg.get("farm") if isinstance(local_cfg.get("farm"), dict) else {}
+    farm_settings = load_farm_settings({**file_farm, **web_settings})
+    # Preserve optional local-only values such as media lists while ensuring all
+    # documented controls come from validated web settings.
+    local_farm = dict(file_farm)
+    local_farm.update(farm_settings)
+    local_cfg["farm"] = local_farm
+
+    db_by_name: dict[str, dict[str, Any]] = {}
+    for row in account_rows:
+        converted = dict(row)
+        try:
+            converted["media_bias"] = json.loads(converted.get("media_bias") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            converted["media_bias"] = {}
+        if not isinstance(converted["media_bias"], dict):
+            converted["media_bias"] = {}
+        converted["enabled"] = bool(converted.get("enabled", 1))
+        db_by_name[str(converted["name"])] = converted
+
+    legacy_accounts = {
+        str(item.get("name")): dict(item)
+        for item in (local_cfg.get("accounts") or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    requested_names = [
+        name.strip() for name in os.getenv("FARM_OVERRIDE_ACCOUNTS", "").split(",") if name.strip()
+    ]
+    if requested_names:
+        selected_names = requested_names
+    elif db_by_name:
+        selected_names = [name for name, row in db_by_name.items() if row.get("enabled")]
+    else:
+        selected_names = list(legacy_accounts)
+
+    accounts: list[dict[str, Any]] = []
+    missing: list[str] = []
+    needs_auth: list[str] = []
+    for name in selected_names:
+        account = dict(legacy_accounts.get(name, {}))
+        database_account = db_by_name.get(name)
+        if database_account:
+            account.update(database_account)
+            if not database_account.get("enabled"):
+                continue
+            if not database_account.get("behavior_customized"):
+                account["reply_probability"] = farm_settings["default_reply_probability"]
+                account["media_bias"] = farm_settings["default_media_bias"]
+            if database_account.get("session_status") != "authorized":
+                needs_auth.append(name)
+                continue
+        if not account.get("api_id") or not account.get("api_hash"):
+            missing.append(name)
+            continue
+        account["name"] = name
+        account["media_bias"] = normalize_media_bias(
+            account.get("media_bias"), farm_settings.get("default_media_bias")
+        )
+        account.setdefault("persona", "обычный участник чата")
+        account.setdefault("reply_probability", farm_settings["default_reply_probability"])
+        accounts.append(account)
+
+    if missing:
+        raise RuntimeError("Для аккаунтов не заполнены API ID/API Hash: " + ", ".join(missing))
+    if needs_auth:
+        raise RuntimeError("Проверьте авторизацию сессий в разделе «Аккаунты»: " + ", ".join(needs_auth))
+    if not accounts:
+        raise RuntimeError("Нет активных авторизованных аккаунтов. Добавьте сессию в разделе «Аккаунты».")
+
+    local_cfg["accounts"] = accounts
+    target_override = os.getenv("FARM_OVERRIDE_TARGET", "").strip()
+    if target_override and int(target_override) != 0:
+        local_cfg["target_chat_id"] = int(target_override)
+    elif local_cfg.get("target_chat_id"):
+        local_cfg["target_chat_id"] = int(local_cfg["target_chat_id"])
+    else:
+        raise RuntimeError("Укажите целевой Chat ID на странице «Чат-ферма»")
+
+    topic_override = os.getenv("FARM_OVERRIDE_TOPIC", "").strip()
+    if topic_override:
+        local_cfg["topic_id"] = int(topic_override) if topic_override != "0" else None
+    elif local_cfg.get("topic_id") is not None:
+        local_cfg["topic_id"] = int(local_cfg["topic_id"])
+
+    farm_sub = local_cfg["farm"]
+    env_overrides = {
+        "min_delay_sec": "FARM_OVERRIDE_MIN_DELAY",
+        "max_delay_sec": "FARM_OVERRIDE_MAX_DELAY",
+        "qa_probability": "FARM_OVERRIDE_QA_PROBABILITY",
+        "clone_probability": "FARM_OVERRIDE_CLONE_PROBABILITY",
+        "reaction_probability": "FARM_OVERRIDE_REACTION_PROBABILITY",
+    }
+    for setting, env_name in env_overrides.items():
+        raw_value = os.getenv(env_name)
+        if raw_value not in (None, ""):
+            farm_sub[setting] = float(raw_value)
+    scenario_env_overrides = {
+        "scenario_mode": "FARM_OVERRIDE_SCENARIO_MODE",
+        "scenario_topic": "FARM_OVERRIDE_SCENARIO_TOPIC",
+        "scenario_turns": "FARM_OVERRIDE_SCENARIO_TURNS",
+        "joke_every": "FARM_OVERRIDE_JOKE_EVERY",
+        "rest_every": "FARM_OVERRIDE_REST_EVERY",
+        "rest_min_sec": "FARM_OVERRIDE_REST_MIN",
+        "rest_max_sec": "FARM_OVERRIDE_REST_MAX",
+        "roulette_numbers": "FARM_OVERRIDE_ROULETTE_NUMBERS",
+        "post_opening": "FARM_OVERRIDE_POST_OPENING",
+    }
+    for setting, env_name in scenario_env_overrides.items():
+        raw_value = os.getenv(env_name)
+        if raw_value not in (None, ""):
+            farm_sub[setting] = raw_value
+        elif (
+            setting == "scenario_topic"
+            and os.getenv("FARM_OVERRIDE_SCENARIO_MODE", "").strip().lower() == "reactive"
+        ):
+            # An empty scenario prompt is meaningful for behavior-only launches;
+            # do not inherit a stale topic from farm_config.json or the web DB.
+            farm_sub[setting] = ""
+    farm_sub.update(load_farm_settings(farm_sub))
+    if farm_sub.get("scenario_mode") == "reactive":
+        farm_sub.update({
+            "scenario_topic": "",
+            "scenario_turns": 20,
+            "joke_every": 0,
+            "rest_every": 0,
+            "rest_min_sec": 60,
+            "rest_max_sec": 120,
+            "roulette_numbers": "0-36",
+            "post_opening": False,
+        })
+    return local_cfg, farm_settings
+
+
+async def run_farm() -> None:
+    global FARM_CFG
+
+    FARM_CFG, farm_settings = await _load_runtime_config()
+    if not FARM_CFG.get("target_chat_id"):
+        raise SystemExit("target_chat_id не задан")
+    if float(FARM_CFG["farm"]["min_delay_sec"]) > float(FARM_CFG["farm"]["max_delay_sec"]):
+        raise SystemExit("Минимальная пауза должна быть не больше максимальной")
+
+    log.info("Подключаю %d аккаунтов к чату %s...", len(FARM_CFG["accounts"]), FARM_CFG["target_chat_id"])
+    farm_settings = FARM_CFG["farm"]
+    scenario_mode = farm_settings.get("scenario_mode", "reactive")
+    if scenario_mode == "reactive":
+        log.info(
+            "Режим без сценария: ответы на сообщения; сценарная цепочка отключена, автономная активность=%s",
+            farm_settings["proactive_enabled"],
+        )
+    elif scenario_mode == "combined":
+        log.info("Режим: объединённый — диалог по теме и ответы участникам")
+    else:
+        log.info("Режим сценария: %s; автоматические реплики будут чередоваться по очереди", scenario_mode)
+
+    # 1) Telegram reachability (a warning only; configured proxies may still work).
+    log.info("→ Проверка TCP-связи с Telegram DC")
+    ok, report = await check_telegram_reachable(timeout=3.0)
+    for line in report.splitlines():
+        log.info(line)
+    if not ok:
+        log.warning("Прямой TCP-пинг Telegram DC не ответил; проверяю подключение аккаунтов дальше")
+
+    # 2) Donor corpus is optional. Replies still work using a short safe fallback.
+    log.info("→ Загрузка донора")
+    donor = await DonorCorpus.load(DONOR_MESSAGES)
+
+    # 3) Per-chat state; scenario modes may also consume the anonymized panel transcript.
+    log.info("→ Загрузка состояния чата %s", FARM_CFG["target_chat_id"])
+    state = FarmState()
+    chat_id = int(FARM_CFG["target_chat_id"])
+    state_file = DATA_DIR / f"farm_state_{chat_id}.json"
+    saved = await load_json(state_file, {})
+    if saved:
+        state.load(saved)
+    if scenario_mode == "reactive":
+        state.reset_for_behavior_only()
+        log.info(
+            "Режим без сценария: сброшены тема, исходящие сценарные реплики и архивный контекст; сохранены только последние входящие сообщения (%d)",
+            len(state.chat_history),
+        )
+
+    context_file = DATA_DIR / "chat_contexts" / str(chat_id) / "context.json"
+    collected = await load_json(context_file, {}) if scenario_mode != "reactive" else {}
+    context_rows = collected.get("messages", []) if isinstance(collected, dict) else []
+    if context_rows:
+        merged: dict[tuple[int, int], dict[str, Any]] = {}
+        unkeyed: list[dict[str, Any]] = []
+        for item in state.chat_history:
+            if item.get("chat_id") is not None and item.get("message_id") is not None:
+                merged[(int(item["chat_id"]), int(item["message_id"]))] = dict(item)
+            else:
+                unkeyed.append(dict(item))
+        added = 0
+        for item in context_rows:
+            try:
+                message_id = int(item["message_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = (chat_id, message_id)
+            if key in merged:
+                continue
+            kind = str(item.get("kind") or "text")
+            text = str(item.get("text") or "")
+            media = item.get("media") if isinstance(item.get("media"), dict) else None
+            if media:
+                emoji = str(media.get("emoji") or "")
+                media_hint = f"[media: {kind}{' ' + emoji if emoji else ''}]"
+                if text == f"[{kind}]" or not text:
+                    text = media_hint
+                else:
+                    text = f"{text} {media_hint}"
+            merged[key] = {
+                "author": str(item.get("author") or "участник"),
+                "user_id": 0,
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "text": text[:2000],
+                "kind": kind,
+                "direction": "context",
+                "is_question": False,
+                "ts": str(item.get("date") or ""),
+            }
+            added += 1
+        ordered = sorted(
+            [*merged.values(), *unkeyed],
+            key=lambda item: str(item.get("ts") or ""),
+        )[-60:]
+        state.chat_history = deque(ordered, maxlen=60)
+        state._seen_order.clear()
+        state._seen_ids.clear()
+        for item in state.chat_history:
+            if item.get("chat_id") is not None and item.get("message_id") is not None:
+                state.remember_message(int(item["chat_id"]), int(item["message_id"]))
+        if state.topic == "общее общение":
+            state.topic = str(collected.get("title") or state.topic)
+        log.info("   добавлено сообщений контекста=%d, всего в истории=%d", added, len(state.chat_history))
+    else:
+        log.info("   тема=%r, история=%d", state.topic, len(state.chat_history))
+
+    # 4) DeepSeek is optional because its bridge is supplied locally by the operator.
+    bridge = None
+    if os.getenv("FARM_NO_LLM", "").lower() not in {"1", "true", "yes"}:
+        log.info("→ Инициализация DeepSeek bridge")
+        candidate = DeepSeekBridge(farm_settings)
+        try:
+            await candidate.start()
+            bridge = candidate
+            log.info("✅ DeepSeek готов (модель %s)", candidate.model)
+        except Exception as exc:
+            log.warning("DeepSeek недоступен (%s); используется локальный ответ/донор", exc)
+    else:
+        log.info("DeepSeek выключен флагом FARM_NO_LLM")
+
+    accounts: list[FarmAccount] = []
+    stop_event = asyncio.Event()
+
+    def _on_signal(*_: Any) -> None:
+        log.info("Сигнал остановки")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(sig, lambda *_: stop_event.set())
+
+    saver: asyncio.Task | None = None
+    watchdog: asyncio.Task | None = None
+    reactor: asyncio.Task | None = None
+    scenario_task: asyncio.Task | None = None
+    try:
+        for account_cfg in FARM_CFG["accounts"]:
+            name = account_cfg.get("name", "?")
+            log.info("→ Запускаю аккаунт %s", name)
+            account = FarmAccount(account_cfg, bridge, state, donor, accounts)
+            try:
+                await account.start(timeout=90.0)
+                accounts.append(account)
+                log.info("   ✅ %s", name)
+            except Exception as exc:
+                log.error("   ❌ %s: %s", name, exc)
+                try:
+                    await account.stop()
+                except Exception:
+                    pass
+
+        if not accounts:
+            raise SystemExit("Ни один аккаунт не запустился; проверьте сессии и доступ к чату")
+        if scenario_mode != "reactive" and len(accounts) < 2:
+            raise SystemExit("Для сценария с диалогом нужно минимум два успешно подключённых аккаунта")
+        for account in accounts:
+            account.farm_accounts = accounts
+
+        FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
+        if scenario_mode == "reactive":
+            log.info("🎉 Ферма запущена: %d аккаунтов; ответы по настройкам поведения без сценария", len(accounts))
+        elif scenario_mode == "combined":
+            log.info("🎉 Объединённый режим запущен: %d аккаунтов; диалог и ответы на сообщения", len(accounts))
+        else:
+            log.info("🎉 Сценарий запущен: %d аккаунтов; сообщения будут чередоваться по очереди", len(accounts))
+
+        async def run_scenario_safely() -> None:
+            try:
+                await run_scenario(accounts, state, stop_event, farm_settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Сценарий завершился с ошибкой")
+                stop_event.set()
+
+        if scenario_mode in {"discussion", "roulette", "combined", "history_dialogue"}:
+            scenario_task = asyncio.create_task(run_scenario_safely(), name="farm-scenario")
+
+        async def autosave() -> None:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await save_json(state_file, state.to_dict())
+                    await save_json(STATS_FILE, FARM_STATS)
+                except Exception:
+                    log.exception("autosave failed")
+
+        async def bridge_watchdog() -> None:
+            while True:
+                await asyncio.sleep(300)
+                try:
+                    if bridge and bridge.seconds_since_last_ok() > 600:
+                        log.warning("Bridge молчит >10 мин → ping")
+                        if not await bridge.ping():
+                            await bridge._recreate()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("watchdog err")
+
+        async def reaction_worker() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(random.uniform(60, 120))
+                    if accounts:
+                        await random.choice(accounts)._send_reaction_to_last()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("reaction_worker err")
+
+        saver = asyncio.create_task(autosave(), name="farm-autosave")
+        if bridge:
+            watchdog = asyncio.create_task(bridge_watchdog(), name="farm-watchdog")
+        reactor = asyncio.create_task(reaction_worker(), name="farm-reactor")
+        await stop_event.wait()
+
+    finally:
+        active_tasks = [task for task in (saver, watchdog, reactor, scenario_task) if task is not None]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        log.info("Останавливаю ферму...")
+        for account in accounts:
+            try:
+                await account.stop()
+            except Exception:
+                log.exception("stop err %s", account.name)
+        if bridge:
+            try:
+                await bridge.stop()
+            except Exception:
+                log.exception("DeepSeek stop failed")
+        await save_json(state_file, state.to_dict())
+        await save_json(STATS_FILE, FARM_STATS)
+        log.info("Ферма остановлена.")
+
+
+# ═══════════════════════════════════════════════════════════════
+#                    ENTRYPOINT
+# ═══════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Telegram userbot farm v5.1")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--check-only", action="store_true")
+    p.add_argument("--test-bridge", action="store_true",
+                   help="Проверить только DeepSeek bridge и выйти")
+    p.add_argument("--donor-info", action="store_true",
+                   help="Показать статистику донора и выйти")
+    p.add_argument("--no-llm", action="store_true",
+                   help="Работать без DeepSeek — репост текстов/медиа из донора")
+    return p.parse_args()
+
+
+async def _check_only() -> None:
+    ok, report = await check_telegram_reachable(timeout=5.0)
+    print(report)
+    print("\nИТОГ:", "✅ OK" if ok else "❌ FAIL")
+
+
+async def _test_bridge() -> None:
+    log.info("Проверка DeepSeek bridge (главный процесс)...")
+    bridge = DeepSeekBridge()
+    try:
+        await bridge.start()
+        log.info("→ Отправляю тестовый промпт...")
+        t = time.time()
+        text = await bridge.ask("Ответь одним словом: ok", new_conversation=True)
+        log.info("✅ Ответ за %.1fs: %r", time.time() - t, text[:200])
+    finally:
+        await bridge.stop()
+
+
+async def _donor_info() -> None:
+    donor = await DonorCorpus.load(DONOR_MESSAGES)
+    print(f"messages: {len(donor.messages)}")
+    print(f"texts: {len(donor.texts)}")
+    print(f"qa_pairs: {len(donor.qa_pairs)}")
+    print(f"fragments: {len(donor.fragments)}")
+    for k, v in donor.media_by_kind.items():
+        print(f"  {k}: {len(v)}")
+    print("\nПримеры текстов:")
+    for t in donor.sample_texts(5):
+        print(" —", t[:100])
+
+
+def main() -> int:
+    args = parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s",
+        stream=sys.stdout,
+    )
+    if args.debug:
+        logging.getLogger("pyrogram").setLevel(logging.DEBUG)
+    else:
+        logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+    if args.check_only:
+        asyncio.run(_check_only()); return 0
+    if args.test_bridge:
+        asyncio.run(_test_bridge()); return 0
+    if args.donor_info:
+        asyncio.run(_donor_info()); return 0
+
+    if args.no_llm:
+        os.environ["FARM_NO_LLM"] = "1"
+
+    acquire_lock()
+    try:
+        asyncio.run(run_farm())
+    except KeyboardInterrupt:
+        log.info("Прервано")
+    finally:
+        release_lock()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

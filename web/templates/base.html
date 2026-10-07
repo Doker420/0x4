@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111722">
+  <title>{% block title %}0x4 · Панель{% endblock %}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1018;
+      --panel: #121a25;
+      --panel-soft: #172130;
+      --border: #263446;
+      --muted: #9aabc0;
+      --text: #ecf3fb;
+      --accent: #5bd6c2;
+      --accent-strong: #21bfa8;
+      --blue: #79aaff;
+      --danger: #ff7784;
+      --success: #62d7a5;
+      --warning: #f2c66d;
+      --radius: 18px;
+      --shadow: 0 18px 50px rgba(0,0,0,.22);
+    }
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--bg); }
+    body {
+      margin: 0;
+      color: var(--text);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(900px 520px at 90% -10%, rgba(52,120,150,.18), transparent 62%),
+                  radial-gradient(760px 480px at -10% 15%, rgba(49,166,145,.11), transparent 60%), var(--bg);
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { color: #a5c5ff; }
+    header {
+      position: sticky; top: 0; z-index: 50;
+      display: flex; align-items: center; gap: 22px;
+      min-height: 72px; padding: 10px clamp(16px, 4vw, 54px);
+      border-bottom: 1px solid rgba(112,141,176,.16);
+      background: rgba(12,18,27,.88); backdrop-filter: blur(18px);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 800; letter-spacing: -.03em; white-space: nowrap; }
+    .brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 12px; color: #071512; background: linear-gradient(135deg, #74f0d2, #75baff); box-shadow: 0 5px 18px rgba(66,214,186,.2); }
+    .brand-copy { display: grid; line-height: 1.12; }
+    .brand-copy small { margin-top: 4px; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; }
+    .nav { display: flex; align-items: center; gap: 5px; overflow-x: auto; scrollbar-width: none; }
+    .nav::-webkit-scrollbar { display: none; }
+    .nav a { flex: 0 0 auto; padding: 8px 11px; color: #a8b7ca; border-radius: 10px; font-size: 13px; font-weight: 650; transition: .18s ease; }
+    .nav a:hover { color: white; background: rgba(145,174,210,.09); }
+    .nav a.active { color: #baf9e9; background: rgba(72,206,177,.12); }
+    .logout { margin-left: auto; white-space: nowrap; color: var(--muted); font-size: 13px; }
+    main { width: min(1360px, 100%); margin: 0 auto; padding: 32px clamp(16px, 4vw, 52px) 64px; }
+    .page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin: 4px 0 24px; }
+    .eyebrow { margin: 0 0 5px; color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(25px, 4vw, 34px); line-height: 1.16; letter-spacing: -.04em; }
+    h2 { margin: 0 0 12px; font-size: 19px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: -.01em; }
+    p { margin: 8px 0 12px; }
+    .subtle, small, .help { color: var(--muted); }
+    .subtle { max-width: 760px; margin: 8px 0 0; font-size: 14px; }
+    .help { display: block; margin-top: 5px; font-size: 12px; }
+    .card { min-width: 0; margin-bottom: 18px; padding: 22px; border: 1px solid var(--border); border-radius: var(--radius); background: linear-gradient(155deg, rgba(24,35,49,.97), rgba(16,24,35,.98)); box-shadow: var(--shadow); }
+    .card.compact { padding: 16px; }
+    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 18px; align-items: start; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .stat-card { padding: 19px 20px; border: 1px solid var(--border); border-radius: 16px; background: rgba(20,30,43,.9); }
+    .stat-label { color: var(--muted); font-size: 12px; font-weight: 650; }
+    .stat-value { margin-top: 4px; font-size: 29px; font-weight: 800; letter-spacing: -.04em; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .field { min-width: 0; margin-bottom: 13px; }
+    label { display: block; margin-bottom: 6px; color: #c9d5e3; font-size: 12px; font-weight: 700; }
+    input, select, textarea, button { font: inherit; }
+    input, select, textarea {
+      display: block; width: 100%; min-width: 0; padding: 10px 12px;
+      border: 1px solid #324257; border-radius: 10px; outline: none;
+      background: #0e1621; color: var(--text); transition: border .15s, box-shadow .15s;
+    }
+    input::placeholder, textarea::placeholder { color: #73849a; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent-strong); box-shadow: 0 0 0 3px rgba(56,199,171,.12); }
+    input[type=checkbox] { width: 17px; height: 17px; margin: 0; accent-color: var(--accent-strong); }
+    .check-row { display: flex; align-items: center; gap: 9px; margin: 10px 0; color: #cbd6e2; }
+    .check-row label { margin: 0; font-size: 13px; font-weight: 550; }
+    textarea { min-height: 108px; resize: vertical; }
+    button, .button {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      min-height: 39px; padding: 9px 14px; border: 1px solid var(--accent-strong); border-radius: 10px;
+      background: linear-gradient(135deg, #56d5b9, #3abda7); color: #061613; font-size: 13px; font-weight: 800;
+      cursor: pointer; transition: transform .16s, filter .16s, opacity .16s; text-decoration: none;
+    }
+    button:hover, .button:hover { filter: brightness(1.08); transform: translateY(-1px); color: #061613; }
+    button:disabled { cursor: wait; opacity: .55; transform: none; }
+    button.secondary, .button.secondary { border-color: #34475c; background: #1d2a3b; color: #d5e1ee; }
+    button.ghost { border-color: transparent; background: transparent; color: #adc0d5; }
+    button.danger, .button.danger { border-color: #713642; background: #542b36; color: #ffd8de; }
+    button.small { min-height: 31px; padding: 6px 9px; border-radius: 8px; font-size: 11px; }
+    .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+    .badge, .pill { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 4px 9px; border: 1px solid transparent; border-radius: 999px; font-size: 11px; font-weight: 800; white-space: nowrap; }
+    .badge-ok { border-color: rgba(91,215,165,.22); background: rgba(39,128,94,.2); color: #82e9b8; }
+    .badge-running { border-color: rgba(244,199,103,.25); background: rgba(153,112,36,.19); color: #f5d486; }
+    .badge-failed { border-color: rgba(255,119,132,.25); background: rgba(137,43,57,.22); color: #ff9ca5; }
+    .badge-pending { border-color: rgba(143,162,185,.22); background: rgba(89,107,132,.18); color: #b8c6d7; }
+    .badge-unknown { border-color: rgba(143,162,185,.22); background: rgba(89,107,132,.14); color: #aab9cb; }
+    .badge-authorized { border-color: rgba(91,215,165,.22); background: rgba(39,128,94,.2); color: #82e9b8; }
+    .badge-unauthorized { border-color: rgba(255,119,132,.25); background: rgba(137,43,57,.22); color: #ff9ca5; }
+    .table-wrap { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 690px; }
+    th, td { padding: 12px 11px; border-bottom: 1px solid rgba(112,141,176,.15); text-align: left; vertical-align: top; }
+    th { color: #8fa2b9; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    td { color: #d9e3ef; font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    pre { max-width: 100%; margin: 12px 0 0; padding: 14px; overflow: auto; border: 1px solid rgba(112,141,176,.18); border-radius: 12px; background: #09111a; color: #b8d1df; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    code { padding: 2px 5px; border-radius: 5px; background: rgba(120,152,190,.13); color: #a8cdf5; font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .notice { padding: 12px 14px; border: 1px solid rgba(111,159,205,.22); border-radius: 12px; background: rgba(53,95,136,.12); color: #c1d9ef; font-size: 13px; }
+    .notice.success { border-color: rgba(91,215,165,.25); background: rgba(39,128,94,.13); color: #b2f3d2; }
+    .notice.warning { border-color: rgba(244,199,103,.25); background: rgba(153,112,36,.14); color: #f3dfa9; }
+    .notice.error { border-color: rgba(255,119,132,.25); background: rgba(137,43,57,.15); color: #ffc1c7; }
+    .empty { padding: 26px 16px; color: var(--muted); text-align: center; border: 1px dashed #334459; border-radius: 14px; }
+    .divider { height: 1px; margin: 19px 0; background: rgba(112,141,176,.16); }
+    .modal { position: fixed; inset: 0; z-index: 100; display: none; align-items: center; justify-content: center; padding: 20px; background: rgba(4,8,12,.76); backdrop-filter: blur(6px); }
+    .modal.open { display: flex; }
+    .modal-box { width: min(680px, 100%); max-height: 90vh; overflow-y: auto; padding: 24px; border: 1px solid #35475b; border-radius: 20px; background: #121b27; box-shadow: 0 25px 80px rgba(0,0,0,.5); }
+    .media-preview { display: grid; grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); gap: 10px; margin-top: 14px; }
+    .media-preview img { display: block; width: 100%; aspect-ratio: 1.3; object-fit: cover; border: 1px solid var(--border); border-radius: 11px; background: #0b1119; }
+    .nowrap { white-space: nowrap; }
+    @media (max-width: 940px) {
+      header { gap: 10px; flex-wrap: wrap; }
+      .nav { order: 3; width: 100%; }
+      .logout { margin-left: auto; }
+      main { padding-top: 24px; }
+    }
+    @media (max-width: 620px) {
+      header { padding: 10px 16px; }
+      .nav a { padding: 7px 9px; }
+      .form-grid, .grid-2 { grid-template-columns: 1fr; }
+      .page-head { align-items: flex-start; flex-direction: column; }
+      .card { padding: 17px; }
+    }
+  </style>
+</head>
+<body>
+  {% if request.url.path not in ['/login', '/register'] %}
+  <header>
+    <a class="brand" href="/dashboard" aria-label="0x4 панель">
+      <span class="brand-mark">✳</span>
+      <span class="brand-copy">0x4 <small>Control room</small></span>
+    </a>
+    <nav class="nav" aria-label="Основная навигация">
+      {% set current = request.url.path %}
+      <a href="/dashboard" class="{{ 'active' if current == '/dashboard' else '' }}">Обзор</a>
+      <a href="/accounts" class="{{ 'active' if current.startswith('/accounts') else '' }}">Аккаунты</a>
+      <a href="/chatfarm" class="{{ 'active' if current.startswith('/chatfarm') else '' }}">Чат</a>
+      <a href="/context" class="{{ 'active' if current.startswith('/context') else '' }}">Контекст</a>
+      <a href="/settings" class="{{ 'active' if current.startswith('/settings') else '' }}">Поведение</a>
+      <a href="/comments" class="{{ 'active' if current.startswith('/comments') else '' }}">Комментарии</a>
+      <a href="/mass" class="{{ 'active' if current.startswith('/mass') else '' }}">Действия</a>
+      <a href="/parser" class="{{ 'active' if current.startswith('/parser') else '' }}">Парсер</a>
+      <a href="/tasks" class="{{ 'active' if current.startswith('/tasks') else '' }}">Задачи</a>
+    </nav>
+    <a class="logout" href="/logout">Выйти ↗</a>
+  </header>
+  {% endif %}
+  <main>{% block content %}{% endblock %}</main>
+  <script>
+    async function postForm(url, form) {
+      const response = await fetch(url, { method: 'POST', body: new FormData(form) });
+      let data;
+      try { data = await response.json(); }
+      catch (_) { data = { error: await response.text() }; }
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.detail || data.error || `Ошибка запроса (${response.status})`);
+      }
+      return data;
+    }
+    function showMessage(element, message, kind = '') {
+      element.textContent = message;
+      element.className = `notice ${kind}`.trim();
+      element.hidden = false;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "target_chat_id": 0,
+  "topic_id": null,
+  "donor_chat_id": null,
+  "donor_topic_id": null,
+  "donor_depth": 1000,
+  "farm": {
+    "min_delay_sec": 2,
+    "max_delay_sec": 8,
+    "default_reply_probability": 0.85,
+    "reaction_probability": 0.35,
+    "qa_probability": 0.25,
+    "clone_probability": 0.25,
+    "proactive_enabled": false,
+    "typing_simulation": true,
+    "scenario_mode": "reactive",
+    "scenario_topic": "",
+    "scenario_turns": 20,
+    "joke_every": 5,
+    "rest_every": 6,
+    "rest_min_sec": 60,
+    "rest_max_sec": 120,
+    "roulette_numbers": "0-36",
+    "post_opening": false,
+    "agent_prompt": "Отвечай естественно, по теме сообщения и коротко. Не выдавай себя за другого человека."
+  },
+  "accounts": []
+}

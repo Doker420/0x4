@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Действия · 0x4{% endblock %}
+{% block content %}
+<section class="page-head"><div><p class="eyebrow">Операции аккаунтов</p><h1>Массовые действия</h1><p class="subtle">Действия выполняются последовательно, результаты отображаются в очереди задач.</p></div></section>
+<div class="grid">
+  <section class="card"><h2>Вступление в чат</h2><form onsubmit="runAction('/api/mass/join',event)">
+    <div class="field"><label>Аккаунты через запятую</label><input name="accounts" value="{% for a in accounts %}{{ a.name }}{% if not loop.last %}, {% endif %}{% endfor %}" required></div>
+    <div class="field"><label>Username или инвайт-ссылка</label><input name="target" placeholder="@chat_name или https://t.me/+…" required></div>
+    <div class="grid-2"><div class="field"><label>Пауза от, сек</label><input name="min_delay" type="number" value="5" min="0"></div><div class="field"><label>Пауза до, сек</label><input name="max_delay" type="number" value="20" min="0"></div></div>
+    <button type="submit">Поставить в очередь</button>
+  </form></section>
+  <section class="card"><h2>Изменить bio</h2><form onsubmit="runAction('/api/mass/bio',event)">
+    <div class="field"><label>Аккаунты через запятую</label><input name="accounts" value="{% for a in accounts %}{{ a.name }}{% if not loop.last %}, {% endif %}{% endfor %}" required></div>
+    <div class="field"><label>Текст bio</label><input name="bio" placeholder="Можно использовать {name}" required></div>
+    <button type="submit" class="secondary">Обновить bio</button>
+  </form></section>
+  <section class="card"><h2>Создать группу</h2><form onsubmit="runAction('/api/mass/create-group',event)">
+    <div class="field"><label>Аккаунт-создатель</label><select name="account" required>{% for a in accounts %}<option value="{{ a.name }}">{{ a.name }}</option>{% endfor %}</select></div>
+    <div class="field"><label>Название группы</label><input name="title" placeholder="Название" required></div>
+    <button type="submit" class="secondary">Создать группу</button>
+  </form></section>
+</div>
+<div id="mass_output" class="notice" hidden></div>
+<script>
+async function runAction(url,event){event.preventDefault();const output=document.getElementById('mass_output');showMessage(output,'Добавляю задачу…');try{const data=await postForm(url,event.target);showMessage(output,`Задача №${data.task_id} добавлена.`, 'success');}catch(error){showMessage(output,error.message,'error');}}
+</script>
+{% endblock %}

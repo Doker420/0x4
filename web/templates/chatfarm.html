@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% block title %}Чат · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">Ответы и активность</p>
+    <h1>Чат-агенты</h1>
+    <p class="subtle">По умолчанию сценарная цепочка выключена: общая тема и стартовое сообщение не нужны; используются сохранённые настройки поведения аккаунтов. Автономные сообщения отправляются только если это отдельно разрешено в разделе «Поведение». Укажите Chat ID и подтвердите разрешение и уведомление участников.</p>
+  </div>
+  <div class="actions">
+    <span id="farm_status_badge" class="badge badge-pending">Проверяю статус…</span>
+    <button id="btn_stop_farm" class="danger" type="button" onclick="stopFarm()" hidden>■ Остановить</button>
+  </div>
+</section>
+
+<div class="grid" style="grid-template-columns:minmax(300px,.9fr) minmax(350px,1.1fr)">
+  <section class="card">
+    <div class="card-head"><div><h2>Параметры запуска</h2><p class="subtle">Используются включённые Telegram-сессии.</p></div><span class="pill badge-ok">reply-to включён</span></div>
+    {% if accounts %}
+    <form id="farm_form" onsubmit="startFarm(event)">
+      <div class="field">
+        <label for="target_id_input">Chat ID</label>
+        <input id="target_id_input" name="target_id" type="number" list="known_chat_targets" value="{{ target_prefill }}" placeholder="Например: -1001234567890" required>
+        <datalist id="known_chat_targets">
+          {% for target in targets %}<option value="{{ target.chat_id }}" label="{{ target.title or target.username or target.chat_id }}"></option>{% endfor %}
+        </datalist>
+        <span class="help">ID группы/супергруппы, например начинается с <code>-100</code>. Сохранённые источники также доступны в подсказке.</span>
+      </div>
+      <div class="field">
+        <label for="topic_id_input">ID темы форума <span class="subtle">(необязательно)</span></label>
+        <input id="topic_id_input" name="topic_id" type="number" value="{{ topic_prefill or '0' }}" placeholder="0 — весь чат">
+        <span class="help">Если это группа с темами — укажите ID темы, иначе оставьте 0.</span>
+      </div>
+      <div class="field">
+        <label for="scenario_mode">Режим работы аккаунтов</label>
+        <select id="scenario_mode" name="scenario_mode" onchange="updateScenarioForm()">
+          <option value="reactive" selected>Без сценария — работать по настройкам поведения</option>
+          <option value="discussion">Диалог аккаунтов по общей теме</option>
+          <option value="combined">Диалог и ответы участникам</option>
+          <option value="history_dialogue">Диалог по истории чата</option>
+          <option value="roulette">Рулетка — случайные числа</option>
+        </select>
+        <span id="scenario_mode_help" class="help">Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; тему вводить не нужно.</span>
+      </div>
+      <div class="notice warning" style="margin:0 0 10px">Автоматизируйте только чат, где у вас есть разрешение, и предупредите участников. Выбранные аккаунты должны уже состоять в чате; автоматического вступления нет.</div>
+      <label class="check-row" style="align-items:flex-start;margin:0 0 16px"><input id="automation_ack" type="checkbox" name="automation_ack" required><span>У меня есть разрешение на автоматизацию этого чата, участники уведомлены, а выбранные аккаунты уже состоят в нём.</span></label>
+      <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
+        <div class="field">
+          <label for="scenario_topic">Общая тема, вопрос или правила игры</label>
+          <textarea id="scenario_topic" name="scenario_topic" rows="4" maxlength="2000" placeholder="Например: Рулетка началась — выберите число от 0 до 36. Участвуют только числа, опубликованные в чате. Или задайте вопрос для обсуждения."></textarea>
+          <span class="help">Дайте тему или стартовый вопрос — дальше аккаунты будут сами строить цепочку: отвечать на предыдущую реплику, добавлять новый взгляд и иногда задавать следующий вопрос. Для новостной дискуссии вставьте заголовок; актуальные факты доступны только при установленном DeepSeek bridge и включённом веб-поиске.</span>
+        </div>
+        <div id="history_context_fields" class="card compact" hidden style="margin:0 0 14px;background:rgba(8,15,23,.48)">
+          <label class="check-row" style="align-items:flex-start;margin-bottom:10px">
+            <input id="collect_context_history" type="checkbox" name="collect_context_history">
+            <span><strong>Перед запуском взять последние сообщения как контекст</strong><small>Сбор начнётся по указанному Chat ID и ID темы; глубину можно выбрать ниже.</small></span>
+          </label>
+          <div id="history_context_options" hidden>
+            <div class="grid-2">
+              <div class="field"><label for="history_limit_input">Глубина истории, сообщений</label><input id="history_limit_input" name="history_limit" type="number" min="1" max="300" step="1" value="100"><span class="help">От 1 до 300 последних сообщений.</span></div>
+              <div class="field"><label for="context_reader">Аккаунт-проверяющий</label><select id="context_reader" name="context_reader">{% for a in accounts if a.enabled and a.session_status == 'authorized' %}<option value="{{ a.name }}">{{ a.name }}{% if a.username %} · @{{ a.username }}{% endif %}</option>{% endfor %}</select><span class="help">Этот аккаунт должен быть администратором/владельцем чата.</span></div>
+            </div>
+            <p class="help">До запуска проверяется членство: проверяющий — администратор, остальные выбранные сессии уже состоят в группе. Автоматического вступления нет. История передаётся только обезличенно как контекст; аккаунты сохраняют синтетические роли и не копируют стиль или личности участников. Для запуска без сбора оставьте флажок выключенным.</p>
+          </div>
+        </div>
+        <div id="roulette_fields" class="field" hidden>
+          <label for="roulette_numbers">Числа для случайного выбора</label>
+          <input id="roulette_numbers" name="roulette_numbers" value="0-36" maxlength="256" placeholder="0-36 или 2, 7, 18">
+          <span class="help">Можно указать диапазон или список; аккаунты публикуют только числа.</span>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label id="scenario_turn_label" for="scenario_turns">Ходов диалога</label><input id="scenario_turns" name="scenario_turns" type="number" min="0" max="500" step="1" value="20" required><span id="scenario_turn_help" class="help">0 — работать до ручной остановки.</span></div>
+          <div class="field"><label for="joke_every">Анекдот каждые N ходов</label><input id="joke_every" name="joke_every" type="number" min="0" max="1000" step="1" value="5" required><span class="help">0 — выключить; в рулетке не используется.</span></div>
+          <div class="field"><label for="rest_every">Отдыхать после N ходов</label><input id="rest_every" name="rest_every" type="number" min="0" max="1000" step="1" value="6" required><span class="help">0 — без длинных перерывов.</span></div>
+          <div class="grid-2">
+            <div class="field"><label for="rest_min_sec">Отдых от, сек</label><input id="rest_min_sec" name="rest_min_sec" type="number" min="15" max="86400" step="1" value="60" required></div>
+            <div class="field"><label for="rest_max_sec">До, сек</label><input id="rest_max_sec" name="rest_max_sec" type="number" min="15" max="86400" step="1" value="120" required></div>
+          </div>
+        </div>
+        <div class="check-row"><input type="checkbox" id="post_opening" name="post_opening" checked><label for="post_opening">Опубликовать заданную тему/правила перед началом</label></div>
+        <p id="scenario_runtime_help" class="help">Нет сценарной темы, стартового сообщения и цепочки авто-диалога; используются сохранённые настройки поведения аккаунтов.</p>
+      </div>
+      <div class="field">
+        <label>Аккаунты</label>
+        <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
+          {% for a in accounts %}
+            <label class="check-row">
+              <input type="checkbox" class="account-choice" value="{{ a.name }}" {% if a.enabled and a.session_status == 'authorized' %}checked{% endif %} {% if not a.enabled or a.session_status != 'authorized' %}disabled{% endif %}>
+              <span><strong>{{ a.name }}</strong> <small>{{ '@' + a.username if a.username else a.phone }} · шанс ответа {{ ((a.reply_probability if a.behavior_customized else settings.default_reply_probability) * 100)|round|int }}%</small></span>
+              <span class="badge {{ 'badge-authorized' if a.session_status == 'authorized' else 'badge-unauthorized' }}" style="margin-left:auto">{{ 'готов' if a.session_status == 'authorized' else 'нужен вход' }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <input type="hidden" name="accounts" id="selected_accounts">
+      </div>
+      <div class="grid-2">
+        <div class="field"><label for="min_delay">Мин. пауза между ходами, сек</label><input id="min_delay" name="min_delay" type="number" min="0" max="86400" step="0.5" value="{{ settings.min_delay_sec }}" required></div>
+        <div class="field"><label for="max_delay">Макс. пауза между ходами, сек</label><input id="max_delay" name="max_delay" type="number" min="0" max="86400" step="0.5" value="{{ settings.max_delay_sec }}" required></div>
+      </div>
+      <span id="delay_help" class="help">В сценарном режиме минимум 5 секунд между сообщениями, чтобы не перегружать чат.</span>
+      <details id="reactive_options" style="margin:8px 0 16px">
+        <summary style="cursor:pointer;color:#b7c8dc;font-weight:700;font-size:13px">Ответы и реакции</summary>
+        <div class="grid-2" style="margin-top:12px">
+          <div class="field" id="qa_probability_field"><label>Q&amp;A, 0–1</label><input name="qa_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.qa_probability }}"></div>
+          <div class="field" id="clone_probability_field"><label>Диалоги, 0–1</label><input name="clone_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.clone_probability }}"></div>
+          <div class="field"><label>Реакции, 0–1</label><input name="reaction_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.reaction_probability }}"></div>
+        </div>
+        <p id="reply_settings_help" class="help">Q&amp;A и диалоги используются только при включённом proactive-режиме в разделе «Поведение».</p>
+      </details>
+      <button id="btn_start_farm" type="submit" style="width:100%;min-height:46px">▶ Запустить без сценария</button>
+    </form>
+    {% else %}
+      <div class="empty">Сначала подключите и проверьте хотя бы одну сессию в разделе «Аккаунты».</div>
+    {% endif %}
+    <div id="farm_output" class="notice" hidden style="margin-top:14px"></div>
+  </section>
+
+  <section class="card" style="display:flex;flex-direction:column;min-height:580px">
+    <div class="card-head">
+      <div><h2>Лог работы</h2><p class="subtle">Сюда попадают подключения, полученные сообщения и результаты отправки.</p></div>
+      <div class="actions"><label class="check-row" style="margin:0"><input type="checkbox" id="autoscroll" checked><span>Автопрокрутка</span></label><button class="secondary small" type="button" onclick="loadLogs()">Обновить</button></div>
+    </div>
+    <pre id="log_viewer" style="flex:1;min-height:390px;max-height:620px;margin:0;color:#b6e4dc">Загружаю лог…</pre>
+  </section>
+</div>
+
+<script>
+let statusTimer;
+let logsTimer;
+let farmStartPending = false;
+let delayTouched = false;
+let turnsTouched = false;
+const reactiveDelayDefaults = {
+  min: {{ settings.min_delay_sec|tojson }},
+  max: {{ settings.max_delay_sec|tojson }},
+};
+function updateScenarioForm() {
+  const selector = document.getElementById('scenario_mode');
+  if (!selector) return;
+  const mode = selector.value;
+  const active = mode !== 'reactive';
+  const combined = mode === 'combined';
+  const historyDialogue = mode === 'history_dialogue';
+  const roulette = mode === 'roulette';
+  const supportsHistory = mode === 'discussion' || combined || historyDialogue;
+  const historyCheckbox = document.getElementById('collect_context_history');
+  if (historyDialogue) historyCheckbox.checked = true;
+  else if (!supportsHistory) historyCheckbox.checked = false;
+  historyCheckbox.disabled = historyDialogue;
+  const useHistory = supportsHistory && historyCheckbox.checked;
+  if (mode === 'reactive') {
+    document.getElementById('scenario_topic').value = '';
+    document.getElementById('post_opening').checked = false;
+  }
+  document.getElementById('scenario_fields').hidden = !active;
+  document.getElementById('roulette_fields').hidden = !roulette;
+  document.getElementById('history_context_fields').hidden = !supportsHistory;
+  document.getElementById('history_context_options').hidden = !useHistory;
+  document.getElementById('history_limit_input').required = useHistory;
+  document.getElementById('context_reader').required = useHistory;
+  document.getElementById('reactive_options').hidden = !(mode === 'reactive' || combined);
+  document.getElementById('qa_probability_field').hidden = mode !== 'reactive';
+  document.getElementById('clone_probability_field').hidden = mode !== 'reactive';
+  document.getElementById('scenario_topic').required = active && !useHistory;
+  document.getElementById('automation_ack').required = true;
+  document.getElementById('roulette_numbers').required = roulette;
+  document.getElementById('scenario_turn_label').textContent = roulette ? 'Ходов рулетки' : 'Ходов цепочки диалога';
+  document.getElementById('scenario_turn_help').textContent = historyDialogue
+    ? 'По умолчанию 8 последовательных шагов развития по истории; 0 — продолжать до ручной остановки. Поставьте положительный лимит, чтобы не гонять один и тот же архивный контекст.'
+    : combined
+      ? 'По умолчанию — бесконечная цепочка; положительное число ограничит диалог, а ответы участникам останутся активны.'
+      : mode === 'discussion'
+        ? 'По умолчанию аккаунты продолжают цепочку до ручной остановки. Укажите число больше 0, чтобы ограничить её.'
+        : '0 — выполнять сценарий до ручной остановки; положительное число ограничивает число ходов.';
+  if (!turnsTouched) {
+    document.getElementById('scenario_turns').value = historyDialogue ? '8' : (mode === 'discussion' || combined) ? '0' : '20';
+  }
+  document.getElementById('scenario_mode_help').textContent = historyDialogue
+    ? 'Укажите Chat ID, глубину и аккаунт-проверяющий. Панель сначала проверит членство и обезличенно соберёт историю, затем запустит цепочку с синтетическими ролями.'
+    : combined
+      ? 'Аккаунты сами строят цепочку: каждый следующий ход реплаем продолжает предыдущий. Одновременно один случайный аккаунт может ответить реплаем на вопрос участника.'
+      : roulette
+        ? 'Аккаунты по очереди публикуют числа из заданного диапазона; ответы участникам отключены.'
+        : mode === 'discussion'
+          ? 'Аккаунты сами ведут цепочку: следующий участник отвечает на предыдущую реплику и развивает тему.'
+          : 'Сценарная цепочка выключена. Ответы используют персональные роли и общие указания из раздела «Поведение»; автономная активность — только если отдельно разрешена там. Тему вводить не нужно.';
+  document.getElementById('scenario_runtime_help').textContent = historyDialogue
+    ? 'Используются последние сообщения как обезличенный контекст; реальные авторы не копируются. Сессии по очереди развивают одну мысль, а GIF, стикеры, фото и голосовые выбираются по индивидуальным весам.'
+    : combined
+      ? 'Сообщения в выбранной теме попадают в контекст. Вопросы и просьбы распознаются по смыслу — знак вопроса не обязателен; один случайный аккаунт может ответить реплаем. Обычные сообщения остаются контекстом без автоматического ответа. После лимита диалога ответы продолжаются до ручной остановки.'
+      : roulette
+        ? 'Рулетка публикует только случайные числа из заданного диапазона или списка.'
+        : 'Нет сценарной темы, стартового сообщения и цепочки авто-диалога. Ответы используют заданную вероятность, задержку, роли и веса медиа; автономные сообщения — только по явной настройке в разделе «Поведение».';
+  document.getElementById('reply_settings_help').textContent = combined
+    ? 'Вероятность ответа задаётся у каждого аккаунта. Проверьте, что она выше 0 в разделе «Аккаунты»; при нуле ответов не будет. Здесь настраивается вероятность реакций. Q&A и случайные диалоги отдельно не запускаются.'
+    : 'Q&A и клонирование диалогов используются только при включённом proactive-режиме в разделе «Поведение».';
+  document.getElementById('min_delay').min = active ? '5' : '0';
+  if (!delayTouched) {
+    const fastDialogue = combined || historyDialogue;
+    document.getElementById('min_delay').value = active ? (fastDialogue ? '5' : '20') : reactiveDelayDefaults.min;
+    document.getElementById('max_delay').value = active ? (fastDialogue ? '15' : '45') : reactiveDelayDefaults.max;
+  }
+  document.getElementById('delay_help').textContent = combined
+    ? 'Пауза между ходами диалога и перед ответом участнику; минимум 5 секунд.'
+    : active
+      ? 'Пауза между ходами сценария; минимум 5 секунд.'
+      : 'Задержка перед ответом на входящее сообщение.';
+  document.getElementById('btn_start_farm').textContent = historyDialogue
+    ? '▶ Собрать историю и запустить диалог'
+    : combined
+      ? '▶ Запустить диалог и ответы'
+      : roulette
+        ? '▶ Запустить рулетку'
+        : mode === 'discussion'
+          ? '▶ Запустить диалог по теме'
+          : '▶ Запустить без сценария';
+}
+document.getElementById('min_delay')?.addEventListener('input', () => { delayTouched = true; });
+document.getElementById('max_delay')?.addEventListener('input', () => { delayTouched = true; });
+document.getElementById('scenario_turns')?.addEventListener('input', () => { turnsTouched = true; });
+document.getElementById('collect_context_history')?.addEventListener('change', updateScenarioForm);
+function updateSelectedAccounts() {
+  const names = [...document.querySelectorAll('.account-choice:checked')].map(item => item.value);
+  const target = document.getElementById('selected_accounts');
+  if (target) target.value = names.join(',');
+  const reader = document.getElementById('context_reader');
+  if (reader) {
+    [...reader.options].forEach(option => { option.hidden = !names.includes(option.value); });
+    if (names.length && !names.includes(reader.value)) reader.value = names[0];
+  }
+}
+document.querySelectorAll('.account-choice').forEach(item => item.addEventListener('change', updateSelectedAccounts));
+updateSelectedAccounts();
+updateScenarioForm();
+
+async function checkStatus() {
+  try {
+    const response = await fetch('/api/chatfarm/status');
+    const data = await response.json();
+    const badge = document.getElementById('farm_status_badge');
+    const stop = document.getElementById('btn_stop_farm');
+    const start = document.getElementById('btn_start_farm');
+    if (data.running) {
+      badge.className = 'badge badge-ok'; badge.textContent = `● Работает · PID ${data.pid}`;
+      stop.hidden = false; if (start) start.disabled = true;
+    } else {
+      badge.className = 'badge badge-pending'; badge.textContent = '○ Остановлено';
+      stop.hidden = true; if (start) start.disabled = farmStartPending;
+    }
+  } catch (error) { console.error('farm status', error); }
+}
+async function loadLogs() {
+  try {
+    const response = await fetch('/api/chatfarm/logs');
+    const data = await response.json();
+    const viewer = document.getElementById('log_viewer');
+    viewer.textContent = (data.logs || []).join('\n');
+    if (document.getElementById('autoscroll').checked) viewer.scrollTop = viewer.scrollHeight;
+  } catch (error) { console.error('farm logs', error); }
+}
+async function waitForHistoryFarmTask(taskId, output) {
+  const deadline = Date.now() + 180000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const response = await fetch('/api/tasks/list');
+    const data = await response.json();
+    const task = (data.tasks || []).find(item => Number(item.id) === Number(taskId));
+    if (!task || task.status === 'pending' || task.status === 'running') {
+      showMessage(output, `Задача №${taskId}: проверяю членство и собираю обезличенную историю перед запуском.`, '');
+      continue;
+    }
+    if (task.status !== 'ok') throw new Error(task.error || 'Не удалось собрать историю и запустить чат-ферму');
+    showMessage(output, 'История собрана; чат-ферма запускается. Подключение появится в логе.', 'success');
+    return true;
+  }
+  showMessage(output, `Задача №${taskId} ещё выполняется. Кнопка запуска останется заблокирована; подробности доступны в разделе «Задачи».`, 'warning');
+  return false;
+}
+async function startFarm(event) {
+  event.preventDefault();
+  updateSelectedAccounts();
+  const output = document.getElementById('farm_output');
+  const button = document.getElementById('btn_start_farm');
+  farmStartPending = true;
+  button.disabled = true; button.textContent = 'Запускаю…';
+  try {
+    const data = await postForm('/api/chatfarm/start', event.target);
+    if (data.collecting_history) {
+      showMessage(output, `Задача №${data.task_id} добавлена: сначала будет собрана обезличенная история.`, 'success');
+      const completed = await waitForHistoryFarmTask(data.task_id, output);
+      if (!completed) return false;
+    } else {
+      showMessage(output, `Задача запуска №${data.task_id} добавлена. Подключение появится в логе.`, 'success');
+    }
+    farmStartPending = false;
+    setTimeout(checkStatus, 1000); setTimeout(loadLogs, 1000);
+  } catch (error) {
+    farmStartPending = false;
+    showMessage(output, error.message, 'error');
+    button.disabled = false; updateScenarioForm();
+    await checkStatus();
+  }
+  return false;
+}
+async function stopFarm() {
+  if (!confirm('Остановить чат-агенты?')) return;
+  const button = document.getElementById('btn_stop_farm'); button.disabled = true; button.textContent = 'Останавливаю…';
+  try {
+    const response = await fetch('/api/chatfarm/stop', {method:'POST'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось остановить');
+    await checkStatus(); await loadLogs();
+  } catch (error) { showMessage(document.getElementById('farm_output'), error.message, 'error'); }
+  finally { button.disabled = false; button.textContent = '■ Остановить'; }
+}
+checkStatus(); loadLogs();
+statusTimer = setInterval(checkStatus, 3000);
+logsTimer = setInterval(loadLogs, 2500);
+window.addEventListener('beforeunload', () => { clearInterval(statusTimer); clearInterval(logsTimer); });
+</script>
+{% endblock %}

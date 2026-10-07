@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Вход · 0x4{% endblock %}
+{% block content %}
+<div class="card" style="max-width:440px;margin:clamp(40px,10vh,100px) auto;padding:clamp(24px,5vw,38px)">
+  <p class="eyebrow">0x4 · Control room</p>
+  <h1 style="font-size:28px">Вход в панель</h1>
+  <p class="subtle" style="margin-bottom:24px">Управление Telegram-сессиями, настройками агентов и чат-ответами.</p>
+  <form method="post" action="/login">
+    <div class="field"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required></div>
+    <div class="field"><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required></div>
+    <button type="submit" style="width:100%;margin-top:6px">Войти в панель</button>
+  </form>
+  {% if not has_owner %}<div class="divider"></div><p class="subtle" style="text-align:center"><a href="/register">Создать профиль владельца →</a></p>{% endif %}
+</div>
+{% endblock %}
