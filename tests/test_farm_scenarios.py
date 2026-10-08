@@ -258,6 +258,53 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.last_outgoing_message_id)
         self.assertEqual(list(state.chat_history), [incoming])
 
+    async def test_proactive_activity_uses_one_farm_wide_cooldown(self):
+        state = farm.FarmState()
+        claims = await asyncio.gather(*[
+            state.claim_proactive_slot(300, now=100.0) for _ in range(12)
+        ])
+        self.assertEqual(sum(claims), 1)
+        self.assertFalse(await state.claim_proactive_slot(300, now=399.9))
+        self.assertTrue(await state.claim_proactive_slot(300, now=400.0))
+
+    async def test_questions_get_one_answer_but_ordinary_messages_use_the_lower_probability(self):
+        farm.FARM_CFG["farm"].update({"scenario_mode": "reactive"})
+
+        def account(name, probability):
+            item = farm.FarmAccount.__new__(farm.FarmAccount)
+            item.name = name
+            item.user_id = 7000 + len(name)
+            item.reply_probability = probability
+            item._running = True
+            item.state = farm.FarmState()
+            item._background_tasks = set()
+            item.farm_accounts = [item]
+            item._answer_with_followups = AsyncMock()
+            return item
+
+        def incoming(message_id, text):
+            return type("Incoming", (), {
+                "id": message_id,
+                "text": text,
+                "chat": type("Chat", (), {"id": -1001234567890})(),
+                "from_user": type("User", (), {
+                    "id": message_id + 9000, "is_bot": False,
+                    "username": "member", "first_name": "Member",
+                })(),
+            })()
+
+        question_account = account("question", 0.0)
+        with patch.object(farm.random, "random", return_value=0.999):
+            await question_account._on_incoming(None, incoming(501, "Как это настроить?"))
+        await asyncio.gather(*list(question_account._background_tasks))
+        question_account._answer_with_followups.assert_awaited_once()
+
+        ordinary_account = account("ordinary", 0.25)
+        with patch.object(farm.random, "random", return_value=0.999):
+            await ordinary_account._on_incoming(None, incoming(502, "Сегодня хорошая погода"))
+        self.assertFalse(ordinary_account._background_tasks)
+        ordinary_account._answer_with_followups.assert_not_awaited()
+
     def test_state_round_trip_preserves_account_to_participant_mapping(self):
         state = farm.FarmState()
         state.account_participant_ids = {"bot_one": 1, "bot_two": 2}
@@ -1319,6 +1366,70 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("отдых", reply.lower())
         self.assertTrue(any(token in joke for token in ("Почему", "Что сказал", "Как называется")))
 
+    async def test_empty_agreement_is_rejected_and_never_used_as_an_answer(self):
+        self.assertTrue(farm._is_canned_reply("В этом определённо есть смысл."))
+        self.assertTrue(farm._is_canned_reply("Думаю, в этом определенно есть смысл."))
+        self.assertTrue(farm._is_canned_reply("Да, в этом есть смысл."))
+        self.assertFalse(farm._is_canned_reply("Не хватает данных о датах, чтобы сравнить варианты."))
+
+        state = farm.FarmState()
+        bridge = types.SimpleNamespace(
+            is_ready=True,
+            ask=AsyncMock(side_effect=[
+                "Думаю, в этом определённо есть смысл.",
+                "В этом определенно есть смысл.",
+            ]),
+        )
+        answer = await farm.generate_answer(bridge, state, "синтетическая роль", "Какой вариант выбрать?")
+        self.assertEqual(answer, "")
+        self.assertEqual(bridge.ask.await_count, 2)
+        self.assertEqual(await farm.generate_answer(None, state, "роль", "Почему?"), "")
+
+    async def test_scenario_turn_retries_the_empty_agreement_phrase(self):
+        state = farm.FarmState()
+        state.chat_history.append({
+            "author": "участник", "text": "Этот план не учитывает сроки.", "direction": "context",
+        })
+        bridge = types.SimpleNamespace(
+            is_ready=True,
+            ask=AsyncMock(side_effect=[
+                "В этом определённо есть смысл.",
+                "Сначала стоит сверить сроки с доступными датами; пока их в переписке нет.",
+            ]),
+        )
+
+        line = await farm.generate_dialogue_turn(
+            bridge, state, "Проверим план", "синтетическая роль", 1
+        )
+
+        self.assertIn("сроки", line.casefold())
+        self.assertNotIn("есть смысл", line.casefold())
+        self.assertEqual(bridge.ask.await_count, 2)
+
+    async def test_proactive_qa_does_not_publish_a_question_without_a_real_answer(self):
+        class DonorWithQuestion:
+            @staticmethod
+            def sample_qa():
+                return ({"text": "Какой вариант лучше?"}, {"text": "Второй."})
+
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "questioner"
+        account.persona = "синтетическая роль"
+        account.bridge = None
+        account.donor = DonorWithQuestion()
+        account.state = farm.FarmState()
+        account._send_text = AsyncMock(return_value=True)
+        other = types.SimpleNamespace(
+            bridge=None, state=farm.FarmState(), persona="другая роль", _running=True,
+            _send_text=AsyncMock(return_value=True)
+        )
+        account.farm_accounts = [account, other]
+
+        await account._do_qa()
+
+        account._send_text.assert_not_awaited()
+        other._send_text.assert_not_awaited()
+
     async def test_dialogue_generation_retries_a_reply_that_embeds_the_previous_turn(self):
         state = farm.FarmState()
         previous = "Полезно сначала проверить один конкретный вариант и не делать выводов без фактов."
@@ -1451,6 +1562,12 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("После такой проверки", outputs[4])
         self.assertEqual(len(set(outputs)), len(outputs))
         self.assertFalse(any(farm._is_circular_dialogue_reply(line) for line in outputs))
+
+    def test_offline_fallback_does_not_contain_the_empty_agreement_phrase(self):
+        fallback = farm._offline_conversational_reply(
+            "Это решение вызывает у меня сомнения, потому что условия не совпадают.", [], ""
+        )
+        self.assertEqual(fallback, "")
 
     async def test_a_bot_question_does_not_trigger_another_generic_question(self):
         state = farm.FarmState()

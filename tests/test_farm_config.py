@@ -97,6 +97,18 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["farm"]["scenario_topic"], "")
         self.assertFalse(config["farm"]["post_opening"])
 
+    async def test_runtime_loader_migrates_old_chatty_defaults(self):
+        await db.set_setting("farm_settings", json.dumps({
+            "default_reply_probability": 0.85,
+            "followups_enabled": True,
+            "followups_max": 2,
+        }))
+        config, settings = await farm._load_runtime_config()
+        self.assertEqual(settings["default_reply_probability"], 0.25)
+        self.assertFalse(settings["followups_enabled"])
+        self.assertEqual(settings["followups_max"], 1)
+        self.assertEqual(config["farm"]["proactive_interval_sec"], 300)
+
     async def test_panel_settings_and_account_edits_feed_farm_runtime(self):
         config, settings = await farm._load_runtime_config()
         self.assertEqual(config["target_chat_id"], -1001234567890)
@@ -106,7 +118,7 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(config["accounts"][0]["reply_probability"], 0.75)
         self.assertAlmostEqual(config["accounts"][0]["media_bias"]["gif"], 0.2)
         self.assertEqual(config["accounts"][1]["name"], "global_agent")
-        self.assertEqual(config["accounts"][1]["reply_probability"], 0.85)
+        self.assertEqual(config["accounts"][1]["reply_probability"], 0.25)
         for media_type, weight in settings["default_media_bias"].items():
             self.assertAlmostEqual(config["accounts"][1]["media_bias"][media_type], weight)
         self.assertEqual(config["farm"]["agent_prompt"], "Keep replies concise.")
@@ -114,6 +126,8 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["farm"]["max_delay_sec"], 4)
         self.assertEqual(config["farm"]["scenario_mode"], "discussion")
         self.assertEqual(config["farm"]["scenario_topic"], "A shared topic prompt.")
+        self.assertEqual(config["farm"]["proactive_interval_sec"], 300)
+        self.assertFalse(config["farm"]["followups_enabled"])
         self.assertEqual(config["farm"]["scenario_turns"], 9)
         self.assertEqual(config["farm"]["rest_every"], 3)
         self.assertEqual(config["farm"]["roulette_numbers"], "1, 5, 9")

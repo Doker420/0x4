@@ -111,8 +111,10 @@ class ConfigTests(unittest.TestCase):
     def test_followup_settings_are_validated(self):
         defaults = load_farm_settings({})
         self.assertFalse(defaults["proactive_enabled"])
-        self.assertTrue(defaults["followups_enabled"])
-        self.assertEqual(defaults["followups_max"], 2)
+        self.assertFalse(defaults["followups_enabled"])
+        self.assertEqual(defaults["followups_max"], 1)
+        self.assertEqual(defaults["default_reply_probability"], 0.25)
+        self.assertEqual(defaults["proactive_interval_sec"], 300)
 
         settings = load_farm_settings({
             "proactive_enabled": "on",
@@ -126,6 +128,31 @@ class ConfigTests(unittest.TestCase):
         off = load_farm_settings({"followups_enabled": "off", "followups_max": "-4"})
         self.assertFalse(off["followups_enabled"])
         self.assertEqual(off["followups_max"], 0)
+
+    def test_legacy_chatty_defaults_are_migrated_once_but_explicit_new_values_survive(self):
+        migrated = load_farm_settings({
+            "default_reply_probability": 0.85,
+            "followups_enabled": True,
+            "followups_max": 2,
+        }, migrate_legacy=True)
+        self.assertEqual(migrated["default_reply_probability"], 0.25)
+        self.assertFalse(migrated["followups_enabled"])
+        self.assertEqual(migrated["followups_max"], 1)
+        self.assertEqual(migrated["settings_revision"], 2)
+
+        opted_in = load_farm_settings({
+            "settings_revision": 2,
+            "default_reply_probability": 0.85,
+            "followups_enabled": True,
+            "followups_max": 2,
+        }, migrate_legacy=True)
+        self.assertEqual(opted_in["default_reply_probability"], 0.85)
+        self.assertTrue(opted_in["followups_enabled"])
+        self.assertEqual(opted_in["followups_max"], 2)
+
+    def test_proactive_interval_is_bounded(self):
+        self.assertEqual(load_farm_settings({"proactive_interval_sec": 10})["proactive_interval_sec"], 60)
+        self.assertEqual(load_farm_settings({"proactive_interval_sec": 90000})["proactive_interval_sec"], 86400)
 
     def test_video_dice_and_emoji_settings_are_validated(self):
         defaults = load_farm_settings({})

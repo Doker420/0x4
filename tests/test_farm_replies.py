@@ -118,6 +118,21 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[2]["conversation_id"], "conversation-1")
         self.assertEqual(calls[3]["conversation_id"], "conversation-2")
 
+    async def test_unhelpful_offline_generation_is_skipped_instead_of_posting_filler(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "quiet"
+        account.persona = "лаконичная роль"
+        account.bridge = None
+        account.donor = None
+        account.state = farm.FarmState()
+        account._send_text = AsyncMock(return_value=True)
+        with patch.object(farm, "generate_reply", new=AsyncMock(return_value="")):
+            sent = await account._send_reply(
+                incoming_text="Условия здесь не совпадают, и я не понимаю, какой вариант выбрать."
+            )
+        self.assertFalse(sent)
+        account._send_text.assert_not_awaited()
+
     async def test_send_text_sets_reply_to_message_id(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "unit"
@@ -300,7 +315,7 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
             chat_id=-1001234567890, message_id=812, emoji="🌿"
         )
 
-    async def test_zero_reply_probability_never_schedules_an_answer(self):
+    async def test_zero_reply_probability_does_not_suppress_a_question(self):
         farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "unit"
@@ -311,6 +326,7 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         account.farm_accounts = [account]
         account._background_tasks = set()
         account._answer_incoming = AsyncMock()
+        account._answer_with_followups = AsyncMock()
         message = types.SimpleNamespace(
             id=82,
             empty=False,
@@ -321,7 +337,9 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(farm.random, "random", return_value=0):
             await account._on_incoming(None, message)
-        self.assertFalse(account._background_tasks)
+        self.assertTrue(account._background_tasks)
+        await asyncio.gather(*list(account._background_tasks))
+        account._answer_with_followups.assert_awaited_once()
         account._answer_incoming.assert_not_awaited()
 
     async def test_combined_mode_randomly_assigns_each_question_to_one_account(self):

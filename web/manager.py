@@ -666,7 +666,7 @@ class SessionAuthFlow:
         phone: str,
         proxy: str = "",
         persona: str = "",
-        reply_probability: float = 0.85,
+        reply_probability: float = 0.25,
         media_bias: Any = None,
         behavior_customized: int = 0,
     ) -> Dict[str, Any]:
@@ -782,7 +782,7 @@ class SessionAuthFlow:
             proxy=str(credentials.get("proxy") or ""),
             persona=str(credentials.get("persona") or ""),
             media_bias=json.dumps(normalize_media_bias(credentials.get("media_bias")), ensure_ascii=False),
-            reply_probability=float(credentials.get("reply_probability", 0.85)),
+            reply_probability=float(credentials.get("reply_probability", 0.25)),
             behavior_customized=1 if credentials.get("behavior_customized") else 0,
             enabled=1,
             tg_id=getattr(user, "id", None),

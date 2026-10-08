@@ -67,7 +67,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         chatfarm = await self.client.get("/chatfarm")
         self.assertEqual(chatfarm.status_code, 200)
         self.assertIn("Диалог аккаунтов по общей теме", chatfarm.text)
-        self.assertIn("шанс ответа 85%", chatfarm.text)
+        self.assertIn("шанс ответа 25%", chatfarm.text)
         self.assertIn("Диалог и ответы участникам", chatfarm.text)
         self.assertIn('value="history_dialogue">Диалог по истории чата', chatfarm.text)
         self.assertIn('value="reactive" selected', chatfarm.text)
@@ -827,6 +827,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "min_delay_sec": "1",
             "max_delay_sec": "3",
             "default_reply_probability": "0.9",
+            "proactive_interval_sec": "900",
             "reaction_probability": "0.2",
             "qa_probability": "0.1",
             "clone_probability": "0.2",
@@ -845,6 +846,8 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(settings.json()["giphy_key_set"])
         self.assertNotIn("private-giphy-key", settings.text)
         self.assertEqual(settings.json()["farm"]["agent_prompt"], "Reply briefly.")
+        self.assertEqual(settings.json()["farm"]["proactive_interval_sec"], 900)
+        self.assertEqual(settings.json()["farm"]["settings_revision"], 2)
 
     async def test_night_mode_window_is_saved_and_rejected_when_malformed(self):
         ok = await self.client.post("/api/settings/save", data={
@@ -1030,6 +1033,23 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         farm_settings = (await self.client.get("/api/settings")).json()["farm"]
         self.assertFalse(farm_settings["proactive_enabled"])
 
+    async def test_legacy_chatty_settings_are_migrated_for_the_chat_and_settings_pages(self):
+        await db.set_setting("farm_settings", json.dumps({
+            "default_reply_probability": 0.85,
+            "followups_enabled": True,
+            "followups_max": 2,
+        }))
+
+        response = await self.client.get("/api/settings")
+        settings = response.json()["farm"]
+        self.assertEqual(settings["default_reply_probability"], 0.25)
+        self.assertFalse(settings["followups_enabled"])
+        self.assertEqual(settings["followups_max"], 1)
+
+        page = await self.client.get("/settings")
+        self.assertIn('value="300"', page.text)
+        self.assertIn('value="0.25"', page.text)
+
     async def test_behaviour_page_exposes_autonomous_messages_switch(self):
         await db.upsert_account(
             "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
@@ -1043,6 +1063,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Автономные сообщения", page.text)
         self.assertIn('name="proactive_enabled"', page.text)
         self.assertIn('name="followups_max"', page.text)
+        self.assertIn('name="proactive_interval_sec"', page.text)
 
         saved = await self.client.post("/api/settings/save", data={
             "min_delay_sec": "1",

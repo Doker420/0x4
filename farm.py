@@ -365,6 +365,10 @@ class FarmState:
         self.started_at: datetime = datetime.now(timezone.utc).replace(tzinfo=None)
         self.last_idle_post: datetime | None = None
         self.idle_cursor: int = 0
+        # All per-account proactive loops share one cooldown so enabling the
+        # feature cannot make every account post on its own 2–8 second timer.
+        self.proactive_lock = asyncio.Lock()
+        self.proactive_next_at = 0.0
         # Media keys (donor files, configured links, provider URLs) used recently,
         # shared by every account so two accounts do not open with the same gif.
         self.recent_media: deque[str] = deque(maxlen=200)
@@ -379,6 +383,19 @@ class FarmState:
     def mark_activity(self, moment: datetime | None = None) -> None:
         """Stamp the last human or bot message so idle detection can measure silence."""
         self.last_activity = moment or datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async def claim_proactive_slot(self, interval_sec: float, *, now: float | None = None) -> bool:
+        """Grant at most one account a proactive send slot per farm-wide interval."""
+        try:
+            interval = max(60.0, float(interval_sec))
+        except (TypeError, ValueError, OverflowError):
+            interval = 300.0
+        moment = time.monotonic() if now is None else float(now)
+        async with self.proactive_lock:
+            if moment < self.proactive_next_at:
+                return False
+            self.proactive_next_at = moment + interval
+            return True
 
     def media_seen(self, key: str) -> bool:
         return bool(key) and key in self.recent_media
@@ -618,6 +635,7 @@ REPLY_PROMPT = """Ты — автоматизированный аккаунт �
 - не начинай с «Спасибо за вопрос» и не используй шаблон «Не хочу гадать без контекста — уточните, что для вас важнее всего»
 - не превращай каждую реплику в уточняющий вопрос: на «хз», «ага», «ок» и короткие реакции отвечай коротко и естественно; медиа без подписи не описывай так, будто видел его содержимое
 - отвечай на языке последних сообщений; можно использовать уместные эмодзи
+- не соглашайся автоматически: не используй пустые формулы вроде «в этом определённо есть смысл»; если тезис неясен или спорен, ответь по конкретным данным либо честно обозначь, чего не хватает
 - не вычитывай реплику до литературной точности: иногда допустимы пропущенная запятая, короткая фраза без точки или разговорное сокращение; не добавляй ошибки в каждое сообщение и сохраняй понятность
 
 Твоя реплика:"""
@@ -642,7 +660,7 @@ QA_ANSWER_PROMPT = """Ты — автоматизированный аккаун
 "{question}"
 
 Тема чата: {topic}
-Живо, разговорно, можно эмодзи. Если спрашивают, автоматизирован ли аккаунт, ответь честно. Только текст:"""
+Живо, разговорно и по существу. Не соглашайся автоматически и не пиши пустое «в этом определённо есть смысл»; если для ответа не хватает фактов, назови конкретно, каких именно. Если спрашивают, автоматизирован ли аккаунт, ответь честно. Только текст:"""
 
 TOPIC_PROMPT = """Придумай ОДНУ новую тему для обсуждения (до 10 слов), близкую по духу к таким сообщениям:
 
@@ -878,9 +896,12 @@ async def generate_from_fragment(bridge: Any, state: FarmState, donor: DonorCorp
             async with state.lock:
                 topic = state.topic
             prompt = FRAGMENT_PROMPT.format(persona=persona, fragment="\n".join(lines), topic=topic)
-            text = await bridge.ask(prompt)
-            if text:
-                return text.strip().strip('"').strip("«»")[:280]
+            for attempt in range(2):
+                text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+                if text and not _is_canned_reply(text):
+                    return text
+                if attempt == 0:
+                    prompt += "\n\nНе отвечай пустым согласием вроде «в этом есть смысл»; добавь конкретную мысль по исходному контексту."
         except Exception as e:
             log.warning("[%s] fragment gen error: %s", persona[:20], e)
 
@@ -900,17 +921,26 @@ async def generate_question(bridge: Any, persona: str, original: str) -> str:
 
 
 async def generate_answer(bridge: Any, state: FarmState, persona: str, question: str) -> str:
-    if bridge and getattr(bridge, "is_ready", False):
-        try:
-            async with state.lock:
-                topic = state.topic
-            prompt = QA_ANSWER_PROMPT.format(persona=persona, question=question, topic=topic)
-            text = await bridge.ask(prompt)
-            if text:
-                return text.strip().strip('"').strip("«»")[:280]
-        except Exception as e:
-            log.warning("A gen error: %s", e)
-    return "Думаю, в этом определённо есть смысл."
+    """Generate a substantive proactive answer; abstain rather than invent agreement."""
+    if not bridge or not getattr(bridge, "is_ready", False):
+        return ""
+    try:
+        async with state.lock:
+            topic = state.topic
+        prompt = QA_ANSWER_PROMPT.format(persona=persona, question=question, topic=topic)
+        for attempt in range(2):
+            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            if text and not _is_canned_reply(text):
+                return text
+            if attempt == 0:
+                prompt += (
+                    "\n\nПредыдущий ответ был пустым согласием. Не оценивай тезис общими словами: "
+                    "ответь на вопрос конкретно или укажи, какого факта не хватает."
+                )
+        log.info("Q&A пропущен: модель не дала содержательного ответа")
+    except Exception as e:
+        log.warning("A gen error: %s", e)
+    return ""
 
 
 FOLLOWUP_LINES = (
@@ -1540,10 +1570,17 @@ def _question_context_fallback(topic: str, source_text: str, avoid: Any = ()) ->
 
 def _is_canned_reply(text: str) -> bool:
     normalized = " ".join(re.findall(r"[a-zа-яё]+", str(text or "").casefold()))
+    normalized = normalized.replace("ё", "е")
+    empty_agreement = bool(re.fullmatch(
+        r"(?:(?:да|ну|думаю|кажется|пожалуй|согласен|согласна|действительно|точно)\s+){0,3}"
+        r"(?:в этом|это)\s+(?:(?:определенно|действительно|точно)\s+)?(?:есть|имеет)\s+смысл",
+        normalized,
+    ))
     return (
         "спасибо за вопрос" in normalized
         or "не хочу гадать без контекста" in normalized
         or "что для вас важнее всего" in normalized
+        or empty_agreement
     )
 
 
@@ -1656,7 +1693,8 @@ def _offline_conversational_reply(
     elif len(normalized.split()) <= 4:
         candidates = ("Угу 🙂", "Понял тебя", "Хм, да, есть такое", "Да, бывает 😄", "Ага, мысль ясна")
     else:
-        candidates = ("Понял тебя 🙂", "Хм, интересная мысль", "Да, в этом есть смысл", "Ага, тут есть о чём подумать")
+        # Without a grounded answer, don't post a generic agreement just to fill space.
+        return ""
 
     return _choose_natural_reply(candidates, history, avoid=avoid, extra=DUPLICATE_SAFE_LINES)
 
@@ -1718,6 +1756,7 @@ async def generate_dialogue_turn(
             text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
             rejected = bool(text) and (
                 is_dialogue_echo(text, history)
+                or _is_canned_reply(text)
                 or _is_circular_dialogue_reply(text)
                 or _is_farm_repeat(text, recent_lines)
             )
@@ -1732,6 +1771,7 @@ async def generate_dialogue_turn(
                 text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
                 if text and (
                     is_dialogue_echo(text, history)
+                    or _is_canned_reply(text)
                     or _is_circular_dialogue_reply(text)
                     or _is_farm_repeat(text, recent_lines)
                 ):
@@ -2091,9 +2131,9 @@ class FarmAccount:
         )
         self.persona: str = configured_persona or f"Синтетическая роль {role_digest[:8]}: {default_role}"
         try:
-            self.reply_probability = max(0.0, min(1.0, float(cfg.get("reply_probability", 0.85))))
+            self.reply_probability = max(0.0, min(1.0, float(cfg.get("reply_probability", 0.25))))
         except (TypeError, ValueError):
-            self.reply_probability = 0.85
+            self.reply_probability = 0.25
         self.media_bias = normalize_media_bias(cfg.get("media_bias"))
         session_factory = getattr(bridge, "session", None)
         if callable(session_factory):
@@ -2258,15 +2298,16 @@ class FarmAccount:
         if not candidates:
             candidates = [self]
         responder = random.choice(candidates)
+        response_probability = 1.0 if is_question else responder.reply_probability
         log.info(
             "[%s] входящее сообщение %s: %s; шанс ответа %.0f%%",
             self.name,
             message.id,
-            "вопрос распознан" if is_question else "обрабатывается в режиме ответов",
-            responder.reply_probability * 100,
+            "вопрос распознан — один ответ обязателен" if is_question else "обычная реплика",
+            response_probability * 100,
         )
-        if random.random() >= responder.reply_probability:
-            log.info("[%s] ответ на сообщение %s пропущен по настроенной вероятности", responder.name, message.id)
+        if not is_question and random.random() >= response_probability:
+            log.info("[%s] обычное сообщение %s пропущено по настроенной вероятности", responder.name, message.id)
             return
         log.info("[%s] ответ на сообщение %s запланирован реплаем", responder.name, message.id)
         task = asyncio.create_task(
@@ -2404,6 +2445,7 @@ class FarmAccount:
         farm_cfg = FARM_CFG.get("farm", {})
         min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
         max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
+        proactive_interval = farm_cfg.get("proactive_interval_sec", 300)
         while self._running:
             try:
                 await asyncio.sleep(random.uniform(min_delay, max_delay))
@@ -2412,6 +2454,9 @@ class FarmAccount:
                 if night_mode_active(FARM_CFG.get("farm", {})):
                     log.info("[%s] ночной режим: автономная активность приостановлена", self.name)
                     continue
+                if not await self.state.claim_proactive_slot(proactive_interval):
+                    continue
+                log.info("[%s] получил общий слот автономной активности", self.name)
                 await self._act()
             except asyncio.CancelledError:
                 break
@@ -2445,11 +2490,14 @@ class FarmAccount:
         question = await generate_question(self.bridge, self.persona, original_text)
         if not question:
             return
-        await self._send_text(question)
-        await asyncio.sleep(random.uniform(3, 15))
         answer = await generate_answer(other.bridge, other.state, other.persona, question)
-        if answer:
-            await other._send_text(answer)
+        if not answer:
+            log.info("[%s] Q&A пропущен: нет содержательного ответа, вопрос не публикую", self.name)
+            return
+        if not await self._send_text(question):
+            return
+        await asyncio.sleep(random.uniform(3, 15))
+        await other._send_text(answer)
 
     async def _send_from_fragment(self) -> bool:
         fragment = self.donor.sample_fragment()
@@ -2506,6 +2554,10 @@ class FarmAccount:
         if _is_canned_reply(text):
             log.warning("[%s] blocked canned reply at send boundary", self.name)
             text = await local_fallback()
+
+        if not text and scenario_mode != "history_dialogue":
+            log.info("[%s] содержательного ответа нет — сообщение не отправляю", self.name)
+            return False
 
         emoji_only = self._maybe_emoji_only()
         if emoji_only:
@@ -3308,7 +3360,12 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
         web_settings = {}
 
     file_farm = local_cfg.get("farm") if isinstance(local_cfg.get("farm"), dict) else {}
-    farm_settings = load_farm_settings({**file_farm, **web_settings})
+    merged_farm_settings = {**file_farm, **web_settings}
+    # A revision in a local config must not mask that the database's saved
+    # behavior still comes from an older release.
+    if web_settings and "settings_revision" not in web_settings:
+        merged_farm_settings.pop("settings_revision", None)
+    farm_settings = load_farm_settings(merged_farm_settings, migrate_legacy=True)
     # Preserve optional local-only values such as media lists while ensuring all
     # documented controls come from validated web settings.
     local_farm = dict(file_farm)

@@ -22,6 +22,7 @@ from .config import (
     DICE_EMOJI_NAMES,
     DEFAULT_FARM_SETTINGS,
     DEFAULT_MEDIA_BIAS,
+    FARM_SETTINGS_REVISION,
     chat_reference,
     clock_to_minutes,
     load_farm_settings,
@@ -239,7 +240,9 @@ async def _persist_farm_switches(**values: Any) -> None:
         current = {}
     if not isinstance(current, dict):
         current = {}
+    current = load_farm_settings(current, migrate_legacy=True)
     current.update(values)
+    current["settings_revision"] = FARM_SETTINGS_REVISION
     await db.set_setting("farm_settings", json.dumps(load_farm_settings(current), ensure_ascii=False))
 
 
@@ -353,7 +356,7 @@ async def accounts_page(request: Request, web_auth: Optional[str] = Cookie(defau
     _current_owner(web_auth)
     rows = await db.list_accounts()
     sessions = await db.list_sessions()
-    settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+    settings = load_farm_settings(await db.get_setting("farm_settings", ""), migrate_legacy=True)
     default_api_id, default_api_hash = await manager.manager.default_api_credentials()
     return _render(
         request,
@@ -418,7 +421,7 @@ async def api_auth_start(
 ):
     _current_owner(web_auth)
     _require_farm_stopped_for_session_check()
-    farm_settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+    farm_settings = load_farm_settings(await db.get_setting("farm_settings", ""), migrate_legacy=True)
     try:
         safe_name = validate_session_name(name)
         existing = await db.get_account(safe_name)
@@ -753,7 +756,7 @@ async def api_delete_account(name: str = Form(...), web_auth: Optional[str] = Co
 async def chatfarm_page(request: Request, web_auth: Optional[str] = Cookie(default=None)):
     _current_owner(web_auth)
     accounts = [_account_for_ui(row) for row in await db.list_accounts()]
-    settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+    settings = load_farm_settings(await db.get_setting("farm_settings", ""), migrate_legacy=True)
     targets = await db.list_targets()
     try:
         target_prefill = str(int(request.query_params.get("target_id", "")))
@@ -1312,7 +1315,7 @@ async def _h_start_chatfarm(payload: dict) -> dict:
         "FARM_OVERRIDE_POST_OPENING": "1" if payload.get("post_opening", True) else "0",
         "FARM_OVERRIDE_PROACTIVE": "1" if payload.get("proactive_enabled") else "0",
         "FARM_OVERRIDE_FOLLOWUPS": "1" if payload.get("followups_enabled") else "0",
-        "FARM_OVERRIDE_FOLLOWUPS_MAX": str(int(payload.get("followups_max", 2) or 0)),
+        "FARM_OVERRIDE_FOLLOWUPS_MAX": str(int(payload.get("followups_max", 1) or 0)),
     })
     await manager.manager.prepare_for_farm()
     try:
@@ -1675,7 +1678,7 @@ async def api_photo_random(web_auth: Optional[str] = Cookie(default=None)):
 async def settings_page(request: Request, web_auth: Optional[str] = Cookie(default=None)):
     _current_owner(web_auth)
     raw = await db.get_setting("farm_settings", "")
-    settings = load_farm_settings(raw)
+    settings = load_farm_settings(raw, migrate_legacy=True)
     keys = {
         "giphy_key_set": bool(os.getenv("GIPHY_KEY") or await db.get_setting("giphy_key", "")),
         "tenor_key_set": bool(os.getenv("TENOR_KEY") or await db.get_setting("tenor_key", "")),
@@ -1694,7 +1697,7 @@ async def settings_page(request: Request, web_auth: Optional[str] = Cookie(defau
 @app.get("/api/settings")
 async def api_settings_get(web_auth: Optional[str] = Cookie(default=None)):
     _current_owner(web_auth)
-    settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+    settings = load_farm_settings(await db.get_setting("farm_settings", ""), migrate_legacy=True)
     return {
         "farm": settings,
         "giphy_key_set": bool(os.getenv("GIPHY_KEY") or await db.get_setting("giphy_key", "")),
@@ -1709,11 +1712,12 @@ async def api_settings_save(
     agent_prompt: str = Form(default=DEFAULT_FARM_SETTINGS["agent_prompt"]),
     min_delay_sec: float = Form(default=2),
     max_delay_sec: float = Form(default=8),
-    default_reply_probability: float = Form(default=0.85),
+    default_reply_probability: float = Form(default=DEFAULT_FARM_SETTINGS["default_reply_probability"]),
     reaction_probability: float = Form(default=0.35),
     qa_probability: float = Form(default=0.25),
     clone_probability: float = Form(default=0.25),
     proactive_enabled: Optional[str] = Form(default=None),
+    proactive_interval_sec: float = Form(default=DEFAULT_FARM_SETTINGS["proactive_interval_sec"]),
     followups_enabled: Optional[str] = Form(default=None),
     followups_max: int = Form(default=DEFAULT_FARM_SETTINGS["followups_max"]),
     typing_simulation: Optional[str] = Form(default=None),
@@ -1787,6 +1791,9 @@ async def api_settings_save(
         "qa_probability": _probability(qa_probability, "Вероятность Q&A"),
         "clone_probability": _probability(clone_probability, "Вероятность диалогов"),
         "proactive_enabled": proactive_enabled is not None,
+        "proactive_interval_sec": _seconds_field(
+            proactive_interval_sec, "Интервал автономных сообщений", low=60, high=86400
+        ),
         "followups_enabled": followups_enabled is not None,
         "followups_max": max(0, min(3, int(followups_max))),
         "typing_simulation": typing_simulation is not None,
@@ -1814,6 +1821,7 @@ async def api_settings_save(
         "emoji_only_enabled": emoji_only_enabled is not None,
         "emoji_only_percent": _percent_field(emoji_only_percent, "Доля ответов одним эмодзи"),
         "emoji_set": emoji_set,
+        "settings_revision": FARM_SETTINGS_REVISION,
     })
     await db.set_setting("farm_settings", json.dumps(saved, ensure_ascii=False))
     if clear_giphy_key is not None:

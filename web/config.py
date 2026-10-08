@@ -6,6 +6,7 @@ import re
 from typing import Any, Mapping
 
 MEDIA_KINDS = ("text", "gif", "sticker", "photo", "voice")
+FARM_SETTINGS_REVISION = 2
 DEFAULT_MEDIA_BIAS = {
     "text": 0.60,
     "gif": 0.12,
@@ -49,13 +50,15 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "agent_prompt": "Отвечай естественно, по теме сообщения и коротко. Не выдавай себя за другого человека.",
     "min_delay_sec": 2.0,
     "max_delay_sec": 8.0,
-    "default_reply_probability": 0.85,
+    "default_reply_probability": 0.25,
     "reaction_probability": 0.35,
     "qa_probability": 0.25,
     "clone_probability": 0.25,
     "proactive_enabled": False,
-    "followups_enabled": True,
-    "followups_max": 2,
+    "proactive_interval_sec": 300,
+    "followups_enabled": False,
+    "followups_max": 1,
+    "settings_revision": FARM_SETTINGS_REVISION,
     "typing_simulation": True,
     "deepseek_model": "default",
     "deepseek_thinking": False,
@@ -159,7 +162,11 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
-def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, Any]:
+def load_farm_settings(
+    raw: str | Mapping[str, Any] | None = None,
+    *,
+    migrate_legacy: bool = False,
+) -> dict[str, Any]:
     """Return validated settings, using defaults for missing/invalid values."""
     if isinstance(raw, str):
         try:
@@ -170,6 +177,28 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
         parsed = raw
     if not isinstance(parsed, Mapping):
         parsed = {}
+    parsed = dict(parsed)
+
+    if migrate_legacy:
+        try:
+            revision = int(parsed.get("settings_revision", 0))
+        except (TypeError, ValueError, OverflowError):
+            revision = 0
+        if revision < FARM_SETTINGS_REVISION:
+            # Older releases enabled two extra replies by default and treated
+            # almost every ordinary message as worth answering. These were
+            # defaults, not a clear opt-in; move those legacy defaults to the
+            # new quieter behavior. Explicit per-account custom values survive.
+            try:
+                legacy_probability = float(parsed.get("default_reply_probability"))
+            except (TypeError, ValueError, OverflowError):
+                legacy_probability = None
+            if legacy_probability == 0.85:
+                parsed["default_reply_probability"] = DEFAULT_FARM_SETTINGS["default_reply_probability"]
+            if _as_bool(parsed.get("followups_enabled")):
+                parsed["followups_enabled"] = False
+                parsed["followups_max"] = DEFAULT_FARM_SETTINGS["followups_max"]
+            parsed["settings_revision"] = FARM_SETTINGS_REVISION
 
     settings = DEFAULT_FARM_SETTINGS.copy()
     settings.update({key: value for key, value in parsed.items() if key in settings})
@@ -198,7 +227,11 @@ def load_farm_settings(raw: str | Mapping[str, Any] | None = None) -> dict[str, 
     settings["agent_prompt"] = str(settings.get("agent_prompt") or DEFAULT_FARM_SETTINGS["agent_prompt"]).strip()[:5000]
     settings["proactive_enabled"] = _as_bool(settings.get("proactive_enabled"))
     settings["followups_enabled"] = _as_bool(settings.get("followups_enabled"))
-    settings["followups_max"] = _bounded_int(settings.get("followups_max"), 2, 0, 3)
+    settings["proactive_interval_sec"] = _bounded_int(
+        settings.get("proactive_interval_sec"), 300, 60, 86400
+    )
+    settings["followups_max"] = _bounded_int(settings.get("followups_max"), 1, 0, 3)
+    settings["settings_revision"] = FARM_SETTINGS_REVISION
     settings["typing_simulation"] = _as_bool(settings.get("typing_simulation"))
     settings["deepseek_thinking"] = _as_bool(settings.get("deepseek_thinking"))
     settings["deepseek_search"] = _as_bool(settings.get("deepseek_search"))
