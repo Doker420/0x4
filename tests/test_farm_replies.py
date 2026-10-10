@@ -50,6 +50,12 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         farm.FARM_CFG = self.old_cfg
 
+    def test_pyrogram_peer_type_accepts_large_telegram_channel_ids(self):
+        self.assertEqual(farm.pyrogram_utils.get_peer_type(-1002265888222), "channel")
+        self.assertEqual(farm.pyrogram_utils.get_peer_type(-1001234567890), "channel")
+        self.assertEqual(farm.pyrogram_utils.get_peer_type(-123456789), "chat")
+        self.assertEqual(farm.pyrogram_utils.get_peer_type(8094855378), "user")
+
     def test_accounts_receive_distinct_default_roles_and_llm_scopes(self):
         class SessionBridge:
             def __init__(self):

@@ -49,13 +49,22 @@ import aiofiles
 from dotenv import load_dotenv
 
 try:
-    from pyrogram import Client, filters, raw
+    from pyrogram import Client, filters, raw, utils as pyrogram_utils
     from pyrogram.enums import ChatAction
     from pyrogram.errors import RPCError
     from pyrogram.handlers import MessageHandler
     from pyrogram.types import Message as TGMessage
 except ImportError as exc:
     raise SystemExit("Установите: pip install pyrogram tgcrypto") from exc
+
+# Pyrogram 2.0.106 still rejects channel ids above 2**31 because its lower
+# bound predates newer Telegram supergroups (for example -1002265888222).
+# Extend only that range; keep Pyrogram's normal chat/user classification.
+PYROGRAM_MIN_CHANNEL_ID = -1009999999999
+pyrogram_utils.MIN_CHANNEL_ID = min(
+    int(getattr(pyrogram_utils, "MIN_CHANNEL_ID", PYROGRAM_MIN_CHANNEL_ID)),
+    PYROGRAM_MIN_CHANNEL_ID,
+)
 
 ROOT = Path(__file__).resolve().parent
 BRIDGE_DIR = ROOT / "vendor" / "Deepseek-API"
