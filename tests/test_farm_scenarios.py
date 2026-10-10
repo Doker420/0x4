@@ -107,15 +107,42 @@ class FakeIdleAccount:
 
 
 class FakeMusicAccount:
-    """Account stub that records reposted tracks."""
+    """Account stub that captures files uploaded by its own client."""
 
     def __init__(self):
-        self.name = "music-bot"
+        self.name = "media-bot"
         self.state = farm.FarmState()
-        self.client = types.SimpleNamespace(
-            copy_message=AsyncMock(return_value=types.SimpleNamespace(id=555))
-        )
+        self.uploads = []
         self.recorded = []
+        self.client = types.SimpleNamespace(
+            copy_message=AsyncMock(return_value=types.SimpleNamespace(id=555)),
+            send_audio=AsyncMock(side_effect=self._upload_audio),
+            send_voice=AsyncMock(side_effect=self._upload_voice),
+            send_video=AsyncMock(side_effect=self._upload_video),
+            send_animation=AsyncMock(side_effect=self._upload_animation),
+        )
+
+    async def _upload(self, method, field, **kwargs):
+        media_path = Path(kwargs[field])
+        self.uploads.append({
+            "method": method,
+            "file_exists": media_path.is_file(),
+            "content": media_path.read_bytes(),
+            "kwargs": kwargs,
+        })
+        return types.SimpleNamespace(id=555)
+
+    async def _upload_audio(self, **kwargs):
+        return await self._upload("send_audio", "audio", **kwargs)
+
+    async def _upload_voice(self, **kwargs):
+        return await self._upload("send_voice", "voice", **kwargs)
+
+    async def _upload_video(self, **kwargs):
+        return await self._upload("send_video", "video", **kwargs)
+
+    async def _upload_animation(self, **kwargs):
+        return await self._upload("send_animation", "animation", **kwargs)
 
     def _send_kwargs(self, reply_to=None):
         return {"chat_id": -1001234567890, "reply_to_message_id": reply_to}
@@ -125,7 +152,7 @@ class FakeMusicAccount:
 
 
 class FakeMediaSourceClient:
-    """Source chat history: audio posts, video posts or neither.
+    """Source history and downloader with audio posts, video posts or neither.
 
     ``locked`` models an account that cannot read the source until it joins.
     """
@@ -135,23 +162,29 @@ class FakeMediaSourceClient:
         self.kind = kind
         self.locked = locked
         self.joined = []
+        self.downloads = []
+        suffix = ".mp3" if kind == "audio" else ".mp4"
+        self.messages = {
+            identifier: types.SimpleNamespace(
+                id=identifier,
+                audio=types.SimpleNamespace(file_name=f"source{suffix}", file_size=5) if kind == "audio" else None,
+                voice=None,
+                video=types.SimpleNamespace(file_name=f"source{suffix}", file_size=5) if kind == "video" else None,
+                animation=None,
+                document=None,
+                caption="original source caption",
+            )
+            for identifier in self.ids
+        }
 
     def get_chat_history(self, source, limit=50):
         ids = [] if self.locked else self.ids[:limit]
-        kind = self.kind
 
         async def generator():
             if self.locked:
                 raise RuntimeError("CHAT_FORBIDDEN")
             for identifier in ids:
-                yield types.SimpleNamespace(
-                    id=identifier,
-                    audio=object() if kind == "audio" else None,
-                    voice=None,
-                    video=object() if kind == "video" else None,
-                    animation=None,
-                    document=None,
-                )
+                yield self.messages[identifier]
 
         # Errors must surface on iteration, exactly like Pyrogram does.
         async def guarded():
@@ -159,6 +192,17 @@ class FakeMediaSourceClient:
                 yield item
 
         return guarded()
+
+    async def get_messages(self, source, message_id):
+        if self.locked:
+            raise RuntimeError("CHAT_FORBIDDEN")
+        return self.messages.get(message_id)
+
+    async def download_media(self, message, file_name=None):
+        destination = Path(file_name)
+        destination.write_bytes(f"media-{message.id}".encode())
+        self.downloads.append((message.id, str(destination)))
+        return str(destination)
 
     async def join_chat(self, source):
         self.joined.append(source)
@@ -675,69 +719,103 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account._plan_turn_media(), "text")
 
         farm.FARM_CFG["farm"]["music_share_percent"] = 100
-        # Music reposts stay off until the source is enabled and tracks were found.
+        # Music uploads stay off until the source is enabled and matching files were found.
         self.assertEqual(account._plan_turn_media(), "text")
         farm.FARM_CFG["farm"]["music_enabled"] = True
         account.music = object()
         self.assertEqual(account._plan_turn_media(), "music")
 
-    async def test_music_reposter_cycles_tracks_without_repeats(self):
-        reposter = farm.MediaReposter("@sad_tracky", "music")
-        await reposter.refresh([FakeMediaSourceClient([11, 12, 13], kind="audio")])
-        self.assertEqual(sorted(reposter.message_ids), [11, 12, 13])
+    def test_video_is_not_starved_when_music_and_video_shares_both_reach_100_percent(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.media_bias = {"text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
+        account.music = object()
+        account.video = object()
+        farm.FARM_CFG["farm"].update({
+            "music_enabled": True,
+            "music_share_percent": 100,
+            "video_enabled": True,
+            "video_share_percent": 100,
+            "gif_share_percent": 0,
+        })
 
-        first_pass = [reposter.next_id() for _ in range(3)]
+        # When configured shares total more than 100%, source media shares
+        # turns proportionally instead of music always winning by order.
+        with patch.object(farm.random, "random", return_value=0.75):
+            self.assertEqual(account._plan_turn_media(), "video")
+
+    async def test_music_sender_cycles_files_and_uploads_audio_from_account(self):
+        source_client = FakeMediaSourceClient([11, 12, 13], kind="audio")
+        sender = farm.MediaSender("@sad_tracky", "music")
+        await sender.refresh([source_client])
+        self.assertEqual(sorted(sender.message_ids), [11, 12, 13])
+
+        first_pass = [sender.next_id() for _ in range(3)]
         self.assertEqual(sorted(first_pass), [11, 12, 13])
-        second_pass = [reposter.next_id() for _ in range(3)]
+        second_pass = [sender.next_id() for _ in range(3)]
         self.assertEqual(sorted(second_pass), [11, 12, 13])
 
         account = FakeMusicAccount()
-        self.assertTrue(await reposter.send(account))
-        kwargs = account.client.copy_message.await_args.kwargs
-        self.assertEqual(kwargs["from_chat_id"], "@sad_tracky")
-        self.assertIn(kwargs["message_id"], [11, 12, 13])
-        self.assertEqual(kwargs["reply_to_message_id"], None)
+        sender.message_ids = [11]
+        sender.cursor = 0
+        self.assertTrue(await sender.send(account, reply_to=77))
+        self.assertEqual(source_client.downloads[0][0], 11)
+        upload = account.uploads[0]
+        self.assertEqual(upload["method"], "send_audio")
+        self.assertTrue(upload["file_exists"], "the source file must be downloaded before upload")
+        self.assertEqual(upload["content"], b"media-11")
+        self.assertEqual(upload["kwargs"]["chat_id"], -1001234567890)
+        self.assertEqual(upload["kwargs"]["reply_to_message_id"], 77)
+        self.assertNotIn("caption", upload["kwargs"], "the source post caption must not be copied")
+        self.assertFalse(Path(upload["kwargs"]["audio"]).exists(), "the temporary upload must be cleaned up")
+        account.client.copy_message.assert_not_awaited()
         self.assertEqual(account.recorded, [(555, "", "audio")])
 
-    async def test_video_reposter_takes_videos_from_the_source_channel(self):
-        reposter = farm.MediaReposter("@funny_videos", "video")
-        await reposter.refresh([FakeMediaSourceClient([21, 22, 23], kind="video")])
-        self.assertEqual(sorted(reposter.message_ids), [21, 22, 23])
-        self.assertEqual(reposter.kind, "video")
+    async def test_video_sender_downloads_file_and_uploads_from_account(self):
+        source_client = FakeMediaSourceClient([21, 22, 23], kind="video")
+        sender = farm.MediaSender("@funny_videos", "video")
+        await sender.refresh([source_client])
+        self.assertEqual(sorted(sender.message_ids), [21, 22, 23])
+        self.assertEqual(sender.kind, "video")
 
         account = FakeMusicAccount()
-        self.assertTrue(await reposter.send(account))
+        sender.message_ids = [21]
+        self.assertTrue(await sender.send(account))
+        self.assertEqual(source_client.downloads[0][0], 21)
+        upload = account.uploads[0]
+        self.assertEqual(upload["method"], "send_video")
+        self.assertEqual(upload["content"], b"media-21")
         self.assertEqual(account.recorded, [(555, "", "video")])
+        account.client.copy_message.assert_not_awaited()
 
-        # An audio-only source yields nothing for a video reposter.
-        empty = farm.MediaReposter("@funny_videos", "video")
+        # An audio-only source yields nothing for a video sender.
+        empty = farm.MediaSender("@funny_videos", "video")
         await empty.refresh([FakeMediaSourceClient([31], kind="audio")])
         self.assertFalse(await empty.send(FakeMusicAccount()))
 
-    async def test_reposter_subscribes_to_the_configured_source_then_reads_it(self):
-        reposter = farm.MediaReposter("@prikoly", "video")
+    async def test_sender_subscribes_to_the_configured_source_then_reads_it(self):
+        sender = farm.MediaSender("@prikoly", "video")
         client = FakeMediaSourceClient([41, 42], kind="video", locked=True)
-        await reposter.refresh([client])
+        await sender.refresh([client])
         self.assertEqual(client.joined, ["@prikoly"])
-        self.assertEqual(sorted(reposter.message_ids), [41, 42])
+        self.assertEqual(sorted(sender.message_ids), [41, 42])
 
-        # A permanently private source still disables reposts instead of crashing.
+        # A permanently private source still disables uploads instead of crashing.
         class Unjoinable(FakeMediaSourceClient):
             async def join_chat(self, source):
                 raise RuntimeError("USER_ALREADY_PARTICIPANT")
 
         stubborn = Unjoinable([51], kind="video", locked=True)
-        broken = farm.MediaReposter("@private", "video")
+        broken = farm.MediaSender("@private", "video")
         await broken.refresh([stubborn])
         self.assertTrue(broken.failed)
         self.assertEqual(broken.message_ids, [])
         self.assertFalse(await broken.send(FakeMusicAccount()))
 
-    async def test_music_reposter_without_source_does_not_break_the_turn(self):
-        reposter = farm.MediaReposter("@sad_tracky")
-        await reposter.refresh([FakeMediaSourceClient([])])
-        self.assertEqual(reposter.next_id(), None)
-        self.assertFalse(await reposter.send(FakeMusicAccount()))
+    async def test_music_sender_without_source_does_not_break_the_turn(self):
+        sender = farm.MediaSender("@sad_tracky")
+        await sender.refresh([FakeMediaSourceClient([])])
+        self.assertEqual(sender.next_id(), None)
+        self.assertFalse(await sender.send(FakeMusicAccount()))
 
     async def test_gif_sources_rotate_between_accounts(self):
         state = farm.FarmState()

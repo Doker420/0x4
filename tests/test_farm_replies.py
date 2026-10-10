@@ -734,6 +734,102 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         )
         account._send_text.assert_awaited_once_with("Ответ", reply_to=55)
 
+    async def test_reactive_replies_upload_configured_music_and_video_from_account(self):
+        for kind in ("music", "video"):
+            with self.subTest(kind=kind):
+                account = farm.FarmAccount.__new__(farm.FarmAccount)
+                account.name = f"{kind}-bot"
+                account.persona = "дружелюбный участник"
+                account.bridge = object()
+                account.donor = object()
+                account.state = farm.FarmState()
+                account.media_bias = {
+                    "text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0,
+                }
+                sender = types.SimpleNamespace(send=AsyncMock(return_value=True))
+                account.music = sender if kind == "music" else None
+                account.video = sender if kind == "video" else None
+
+                async def send_text(_text, *, reply_to=None):
+                    async with account.state.lock:
+                        account.state.last_outgoing_message_id = 900
+                    return True
+
+                account._send_text = AsyncMock(side_effect=send_text)
+                old_cfg = farm.FARM_CFG
+                farm.FARM_CFG = {
+                    "farm": {
+                        "scenario_mode": "reactive",
+                        "music_enabled": kind == "music",
+                        "music_share_percent": 100 if kind == "music" else 0,
+                        "video_enabled": kind == "video",
+                        "video_share_percent": 100 if kind == "video" else 0,
+                        "gif_share_percent": 0,
+                    }
+                }
+                try:
+                    with (
+                        patch.object(farm, "generate_reply", new=AsyncMock(return_value="Ответ по теме")),
+                        patch.object(farm.random, "random", return_value=0),
+                    ):
+                        sent = await account._send_reply(reply_to=55, incoming_text="Вопрос")
+                finally:
+                    farm.FARM_CFG = old_cfg
+
+                self.assertTrue(sent)
+                account._send_text.assert_awaited_once_with("Ответ по теме", reply_to=55)
+                sender.send.assert_awaited_once_with(account, 900)
+
+    async def test_reactive_autonomous_turn_can_send_media_only_but_empty_answers_stay_silent(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "music-bot"
+        account.persona = "дружелюбный участник"
+        account.bridge = object()
+        account.donor = object()
+        account.state = farm.FarmState()
+        account.media_bias = {
+            "text": 1.0, "gif": 0.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0,
+        }
+        sender = types.SimpleNamespace(send=AsyncMock(return_value=True))
+        account.music = sender
+        account.video = None
+        account._send_text = AsyncMock(return_value=True)
+        old_cfg = farm.FARM_CFG
+        farm.FARM_CFG = {
+            "farm": {
+                "scenario_mode": "reactive",
+                "proactive_enabled": True,
+                "music_enabled": True,
+                "music_share_percent": 100,
+                "video_enabled": False,
+                "video_share_percent": 0,
+            }
+        }
+        try:
+            with (
+                patch.object(farm, "generate_reply", new=AsyncMock(return_value="")),
+                patch.object(farm.random, "random", return_value=0),
+            ):
+                sent = await account._send_reply()
+            self.assertTrue(sent)
+            sender.send.assert_awaited_once_with(account, None)
+            account._send_text.assert_not_awaited()
+
+            sender.send.reset_mock()
+            farm.FARM_CFG["farm"]["proactive_enabled"] = False
+            with patch.object(farm, "generate_reply", new=AsyncMock(return_value="")):
+                sent = await account._send_reply()
+            self.assertFalse(sent)
+            sender.send.assert_not_awaited()
+
+            farm.FARM_CFG["farm"]["proactive_enabled"] = True
+            with patch.object(farm, "generate_reply", new=AsyncMock(return_value="")):
+                sent = await account._send_reply(reply_to=42, incoming_text="Вопрос участника")
+            self.assertFalse(sent)
+            sender.send.assert_not_awaited()
+        finally:
+            farm.FARM_CFG = old_cfg
+
     async def test_missing_gif_falls_back_to_reply_text(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "test_account"

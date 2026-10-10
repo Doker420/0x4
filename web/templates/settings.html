@@ -63,19 +63,19 @@
     </section>
 
     <section class="card">
-      <div class="card-head"><div><h2>Гифки и музыка</h2><p class="subtle">Доли в обычных отправках и репост треков из выбранного источника.</p></div></div>
+      <div class="card-head"><div><h2>Гифки, музыка и видео</h2><p class="subtle">Доли в обычных отправках; файлы из источников загружаются и отправляются от аккаунта.</p></div></div>
       <div class="field"><label for="gif_share_percent">Больше гифок: доля гифок в отправках, %</label><input id="gif_share_percent" name="gif_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.gif_share_percent }}"><span class="help">Эта доля ходов отправляется гифкой в дополнение к весам из «Баланса ответов».</span></div>
-      <div class="check-row"><input id="music_enabled" name="music_enabled" type="checkbox" {% if settings.music_enabled %}checked{% endif %}><label for="music_enabled">Отправлять музыку репостом из источника</label></div>
+      <div class="check-row"><input id="music_enabled" name="music_enabled" type="checkbox" {% if settings.music_enabled %}checked{% endif %}><label for="music_enabled">Загружать музыку из источника и отправлять от аккаунта</label></div>
       <div class="grid-2">
         <div class="field"><label for="music_source">Источник музыки</label><input id="music_source" name="music_source" type="text" value="{{ settings.music_source }}" placeholder="@sad_tracky"><span class="help">Например @sad_tracky или числовой ID канала. Аккаунт должен быть подписан или иметь доступ к истории.</span></div>
-        <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">Трек уходит репостом отдельным сообщением, текст хода при этом публикуется.</span></div>
+        <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">В обычном ответе файл загружается отдельным сообщением после текста и отправляется самим аккаунтом; временный файл удаляется. Самостоятельная публикация без входящего сообщения возможна только при включённых «Автономных сообщениях».</span></div>
       </div>
       <span class="help">Треки берутся из последних сообщений источника и не повторяются, пока не закончатся. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
 
-      <div class="check-row" style="margin-top:14px"><input id="video_enabled" name="video_enabled" type="checkbox" {% if settings.video_enabled %}checked{% endif %}><label for="video_enabled">Отправлять видео из канала с приколами</label></div>
+      <div class="check-row" style="margin-top:14px"><input id="video_enabled" name="video_enabled" type="checkbox" {% if settings.video_enabled %}checked{% endif %}><label for="video_enabled">Загружать видео из канала и отправлять от аккаунта</label></div>
       <div class="grid-2">
         <div class="field"><label for="video_source">Источник видео</label><input id="video_source" name="video_source" type="text" value="{{ settings.video_source }}" placeholder="@prikoly"><span class="help">Ссылка на канал с видео (например @prikoly или https://t.me/prikoly) или его числовой ID. Аккаунт берёт последние видео и отправляет их как медиа.</span></div>
-        <div class="field"><label for="video_share_percent">Доля видео в отправках, %</label><input id="video_share_percent" name="video_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.video_share_percent }}"><span class="help">Ролики копируются в чат как медиа, каждый аккаунт берёт разные и без повторов, пока список не закончится.</span></div>
+        <div class="field"><label for="video_share_percent">Доля видео в отправках, %</label><input id="video_share_percent" name="video_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.video_share_percent }}"><span class="help">Видео до 512 МБ скачивается из источника, затем загружается в чат от имени выбравшего аккаунта без пересылки исходного поста. Временный файл удаляется после отправки; файлы не повторяются, пока список не закончится. Если сумма долей музыки и видео выше 100%, они нормируются пропорционально.</span></div>
       </div>
 
       <div class="check-row" style="margin-top:14px"><input id="dice_enabled" name="dice_enabled" type="checkbox" {% if settings.dice_enabled %}checked{% endif %}><label for="dice_enabled">Разрешить аккаунтам кидать кубик</label></div>

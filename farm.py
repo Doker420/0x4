@@ -24,12 +24,14 @@ from difflib import SequenceMatcher
 import json
 import logging
 import math
+import mimetypes
 import os
 import random
 import re
 import signal
 import socket
 import sys
+import tempfile
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -1986,8 +1988,11 @@ MEDIA_SOURCE_MATCHERS = {"music": _is_music_message, "video": _is_video_message}
 MEDIA_SOURCE_LABELS = {"music": "Музыка", "video": "Видео"}
 
 
-class MediaReposter:
-    """Repost music or videos from a source chat, without repeating the same post."""
+MAX_SOURCE_MEDIA_BYTES = 512 * 1024 * 1024
+
+
+class MediaSender:
+    """Download a selected source file and upload it as the chosen account."""
 
     def __init__(self, source: str, kind: str = "music") -> None:
         self.source = source
@@ -1995,6 +2000,7 @@ class MediaReposter:
         self.message_ids: list[int] = []
         self.cursor = 0
         self.failed = False
+        self.source_client: Any | None = None
 
     async def _collect(self, client: Any) -> list[int]:
         matches = MEDIA_SOURCE_MATCHERS[self.kind]
@@ -2007,11 +2013,7 @@ class MediaReposter:
         return found
 
     async def _join_source(self, client: Any) -> bool:
-        """Subscribe the account to the configured public source, then retry.
-
-        Auto-joining only ever targets the channel the owner typed into the
-        settings — never a chat discovered on the fly.
-        """
+        """Subscribe the account to the configured source, then retry reading it."""
         try:
             await client.join_chat(self.source)
             log.info("%s: аккаунт подписался на %s", MEDIA_SOURCE_LABELS[self.kind], self.source)
@@ -2032,20 +2034,22 @@ class MediaReposter:
                     found = await self._collect(client)
                 except Exception:
                     if attempt == 0 and await self._join_source(client):
-                        continue  # joined the source channel; read it once more
+                        continue  # joined the configured source; read it once more
                     log.warning("%s: источник %s не прочитан этим аккаунтом", label, self.source, exc_info=True)
                     break
                 if found:
                     random.shuffle(found)
                     self.message_ids = found
                     self.cursor = 0
-                    log.info("%s: доступно для репоста=%d из %s", label, len(found), self.source)
+                    self.source_client = client
+                    log.info("%s: доступно файлов для отправки=%d из %s", label, len(found), self.source)
                     return
                 break
         self.failed = True
-        log.warning("%s: источник %s недоступен, репосты отключены", label, self.source)
+        log.warning("%s: источник %s недоступен, отправка медиа отключена", label, self.source)
 
     def tracks_left(self) -> int:
+        """Return the number of source files available for upload."""
         return len(self.message_ids)
 
     def next_id(self) -> int | None:
@@ -2058,25 +2062,102 @@ class MediaReposter:
         self.cursor += 1
         return message_id
 
+    @staticmethod
+    def _file_suffix(message: Any, kind: str) -> str:
+        if kind == "music" and getattr(message, "voice", None):
+            return ".ogg"
+        if kind == "video" and getattr(message, "animation", None):
+            return ".mp4"
+        for name in ("audio", "voice", "video", "animation", "document"):
+            media = getattr(message, name, None)
+            if media is None:
+                continue
+            file_name = str(getattr(media, "file_name", "") or "")
+            suffix = Path(file_name).suffix.lower()
+            if suffix and re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                return suffix
+            mime_type = str(getattr(media, "mime_type", "") or "")
+            guessed = mimetypes.guess_extension(mime_type) if mime_type else None
+            if guessed and re.fullmatch(r"\.[a-z0-9]{1,8}", guessed.lower()):
+                return guessed.lower()
+        return ".mp3" if kind == "music" else ".mp4"
+
+    def _upload_method(self, message: Any) -> tuple[str, str, str]:
+        if self.kind == "music":
+            if getattr(message, "voice", None):
+                return "send_voice", "voice", "voice"
+            return "send_audio", "audio", "audio"
+        if getattr(message, "animation", None):
+            return "send_animation", "animation", "video"
+        return "send_video", "video", "video"
+
     async def send(self, account: Any, reply_to: Any = None) -> bool:
         message_id = self.next_id()
         if message_id is None:
             return False
-        kind = "audio" if self.kind == "music" else "video"
+        source_client = self.source_client or account.client
+        label = MEDIA_SOURCE_LABELS[self.kind]
         try:
-            message = await account.client.copy_message(
-                from_chat_id=self.source,
-                message_id=message_id,
-                **account._send_kwargs(reply_to),
+            source_message = await source_client.get_messages(self.source, message_id)
+            if isinstance(source_message, (list, tuple)):
+                source_message = source_message[0] if source_message else None
+            if source_message is None or not MEDIA_SOURCE_MATCHERS[self.kind](source_message):
+                log.warning("[%s] %s: исходный файл %s не найден в %s", account.name, label, message_id, self.source)
+                return False
+
+            source_size = max(
+                (
+                    int(getattr(getattr(source_message, field, None), "file_size", 0) or 0)
+                    for field in ("audio", "voice", "video", "animation", "document")
+                ),
+                default=0,
             )
-            await account._record(message, "", kind)
-            log.info(
-                "[%s] %s: репост %s из %s", account.name, MEDIA_SOURCE_LABELS[self.kind], message_id, self.source
-            )
+            if source_size > MAX_SOURCE_MEDIA_BYTES:
+                log.warning("[%s] %s: файл %s превышает лимит загрузки", account.name, label, message_id)
+                return False
+
+            with tempfile.TemporaryDirectory(prefix="0x4-media-") as temp_dir:
+                destination = Path(temp_dir) / f"{message_id}{self._file_suffix(source_message, self.kind)}"
+                downloaded = await source_client.download_media(source_message, file_name=str(destination))
+                media_path = Path(str(downloaded)) if downloaded else destination
+                if not media_path.is_file():
+                    log.warning("[%s] %s: исходный файл %s не скачан", account.name, label, message_id)
+                    return False
+                if media_path.stat().st_size > MAX_SOURCE_MEDIA_BYTES:
+                    log.warning("[%s] %s: скачанный файл %s превышает лимит загрузки", account.name, label, message_id)
+                    return False
+                try:
+                    media_path.resolve().relative_to(Path(temp_dir).resolve())
+                except ValueError:
+                    log.warning("[%s] %s: загрузчик вернул путь вне временной папки", account.name, label)
+                    return False
+
+                method_name, media_field, record_kind = self._upload_method(source_message)
+                sender = getattr(account.client, method_name, None)
+                if sender is None:
+                    log.warning("[%s] %s: клиент не поддерживает %s", account.name, label, method_name)
+                    return False
+                kwargs = account._send_kwargs(reply_to)
+                kwargs[media_field] = str(media_path)
+                if method_name == "send_audio":
+                    audio = getattr(source_message, "audio", None)
+                    for field in ("duration", "performer", "title"):
+                        value = getattr(audio, field, None) if audio is not None else None
+                        if value is not None:
+                            kwargs[field] = value
+                message = await sender(**kwargs)
+                await account._record(message, "", record_kind)
+
+            log.info("[%s] %s: файл %s загружен в чат от аккаунта", account.name, label, message_id)
             return True
         except Exception:
-            log.exception("[%s] %s: не удалось отправить %s", account.name, MEDIA_SOURCE_LABELS[self.kind], message_id)
+            log.exception("[%s] %s: не удалось скачать или загрузить файл %s из %s", account.name, label, message_id, self.source)
             return False
+
+
+# Compatibility alias for integrations using the old class name. Sending now
+# downloads the media and uploads it through the selected account's own client.
+MediaReposter = MediaSender
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2555,11 +2636,7 @@ class FarmAccount:
             log.warning("[%s] blocked canned reply at send boundary", self.name)
             text = await local_fallback()
 
-        if not text and scenario_mode != "history_dialogue":
-            log.info("[%s] содержательного ответа нет — сообщение не отправляю", self.name)
-            return False
-
-        emoji_only = self._maybe_emoji_only()
+        emoji_only = self._maybe_emoji_only() if text or scenario_mode == "history_dialogue" else ""
         if emoji_only:
             log.info("[%s] отвечаю одним эмодзи вместо фразы", self.name)
             return await self._send_text(emoji_only, reply_to=reply_to)
@@ -2570,8 +2647,25 @@ class FarmAccount:
                 text, reply_to=reply_to, media_item=media_item
             )
 
-        kind = self._pick_kind()
+        if not text:
+            # A scheduled autonomous turn may still publish configured source media,
+            # but never replace a missing answer to an incoming message with media.
+            if (
+                scenario_mode == "reactive"
+                and FARM_CFG.get("farm", {}).get("proactive_enabled", False)
+                and reply_to is None
+                and not incoming_text
+            ):
+                kind = self._plan_turn_media()
+                if kind in {"music", "video"}:
+                    return await self._send_source_media(kind, reply_to=reply_to)
+            log.info("[%s] содержательного ответа нет — сообщение не отправляю", self.name)
+            return False
+
+        kind = self._plan_turn_media()
         try:
+            if kind in {"music", "video"}:
+                return await self._send_turn_with_media(text, reply_to=reply_to, kind=kind)
             if kind == "text":
                 return await self._send_text(text, reply_to=reply_to)
             if kind == "sticker":
@@ -2765,7 +2859,7 @@ class FarmAccount:
             kind = self._plan_turn_media()
             if kind == "dice":
                 return await self._send_dice(reply_to=reply_to)
-            if kind in {"music", "video"} and await self._send_repost(kind, reply_to=reply_to):
+            if kind in {"music", "video"} and await self._send_source_media(kind, reply_to=reply_to):
                 return True
             if kind == "text":
                 kind = random.choice(["gif", "sticker", "photo", "voice"])
@@ -2785,7 +2879,7 @@ class FarmAccount:
             if kind == "dice":
                 await self._send_dice(reply_to=text_message_id)
             elif kind in {"music", "video"}:
-                await self._send_repost(kind, reply_to=text_message_id)
+                await self._send_source_media(kind, reply_to=text_message_id)
             elif kind != "text":
                 await self._send_farm_media(kind, reply_to=text_message_id, caption=text)
         # Keep the text turn as the chain anchor rather than a captionless attachment.
@@ -2806,38 +2900,49 @@ class FarmAccount:
         return value / 100.0 if math.isfinite(value) else default / 100.0
 
     def _plan_turn_media(self) -> str:
-        """Pick this turn's content: a repost, a dice roll, a boosted gif or the weighted kind."""
+        """Pick this turn's content: a source upload, a dice roll, a boosted gif or a weighted kind."""
         farm_cfg = FARM_CFG.get("farm", {})
-        if (
-            farm_cfg.get("music_enabled")
-            and getattr(self, "music", None) is not None
-            and random.random() < self._turn_media_share("music_share_percent")
+        source_media_options: list[tuple[str, float]] = []
+        for kind, enabled_key, share_key in (
+            ("music", "music_enabled", "music_share_percent"),
+            ("video", "video_enabled", "video_share_percent"),
         ):
-            return "music"
-        if (
-            farm_cfg.get("video_enabled")
-            and getattr(self, "video", None) is not None
-            and random.random() < self._turn_media_share("video_share_percent")
-        ):
-            return "video"
+            if not farm_cfg.get(enabled_key) or getattr(self, kind, None) is None:
+                continue
+            share = max(0.0, min(100.0, self._turn_media_share(share_key) * 100.0))
+            if share > 0:
+                source_media_options.append((kind, share))
+
+        if source_media_options:
+            total_share = sum(share for _, share in source_media_options)
+            # If both configured shares exceed the available 100% of turns,
+            # normalize them proportionally instead of always favoring music.
+            scale = 100.0 / total_share if total_share > 100.0 else 1.0
+            roll = random.random() * 100.0
+            for kind, share in source_media_options:
+                weighted_share = share * scale
+                if roll < weighted_share:
+                    return kind
+                roll -= weighted_share
+
         if farm_cfg.get("dice_enabled") and random.random() < self._turn_media_share("dice_share_percent"):
             return "dice"
         if random.random() < self._turn_media_share("gif_share_percent"):
             return "gif"
         return self._pick_kind()
 
-    async def _send_repost(self, kind: str, reply_to: TGMessage | int | None = None) -> bool:
-        """Send a music track or a video copied from the configured source chat."""
-        reposter = getattr(self, "music" if kind == "music" else "video", None)
-        if reposter is None:
+    async def _send_source_media(self, kind: str, reply_to: TGMessage | int | None = None) -> bool:
+        """Download source media, then upload it to the target chat from this account."""
+        sender = getattr(self, "music" if kind == "music" else "video", None)
+        if sender is None:
             return False
-        return await reposter.send(self, reply_to)
+        return await sender.send(self, reply_to)
 
     async def _send_music(self, reply_to: TGMessage | int | None = None) -> bool:
-        return await self._send_repost("music", reply_to)
+        return await self._send_source_media("music", reply_to)
 
     async def _send_video(self, reply_to: TGMessage | int | None = None) -> bool:
-        return await self._send_repost("video", reply_to)
+        return await self._send_source_media("video", reply_to)
 
     async def _send_dice(self, reply_to: TGMessage | int | None = None) -> bool:
         """Roll a Telegram dice animation instead of writing a line."""
@@ -2858,17 +2963,17 @@ class FarmAccount:
         reply_to: TGMessage | int | None,
         kind: str,
     ) -> bool:
-        """Post the turn text and, separately, a reposted track or video."""
+        """Post turn text, then upload the selected source file from this account."""
         text = str(text or "").strip()
         if not text:
-            return await self._send_repost(kind, reply_to=reply_to)
+            return await self._send_source_media(kind, reply_to=reply_to)
         sent = await self._send_text(text, reply_to=reply_to)
         if not sent:
             return False
         async with self.state.lock:
             text_message_id = self.state.last_outgoing_message_id
         if text_message_id:
-            await self._send_repost(kind, reply_to=text_message_id)
+            await self._send_source_media(kind, reply_to=text_message_id)
             async with self.state.lock:
                 self.state.last_outgoing_message_id = text_message_id
         return True
@@ -2879,7 +2984,7 @@ class FarmAccount:
         *,
         reply_to: TGMessage | int | None,
     ) -> bool:
-        """Post the turn text and, separately, a reposted track."""
+        """Post the turn text and then upload a source track from this account."""
         return await self._send_turn_with_media(text, reply_to=reply_to, kind="music")
 
     def _maybe_emoji_only(self) -> str:
@@ -3593,7 +3698,7 @@ async def run_farm() -> None:
         )
     if farm_settings.get("music_enabled") or farm_settings.get("video_enabled"):
         log.info(
-            "Репосты: музыка %s%% (%s), видео %s%% (%s), доля гифок %s%%",
+            "Медиа из источников загружаются от аккаунта: музыка %s%% (%s), видео %s%% (%s), доля гифок %s%%",
             farm_settings["music_share_percent"],
             farm_settings.get("music_source") or "не задан",
             farm_settings["video_share_percent"],
@@ -3835,25 +3940,25 @@ async def run_farm() -> None:
             account.video = None
 
         clients = [account.client for account in accounts if account.client is not None]
-        reposters = (
+        media_sources = (
             ("music", "music_enabled", "music_source", "music_share_percent"),
             ("video", "video_enabled", "video_source", "video_share_percent"),
         )
-        for kind, enabled_key, source_key, share_key in reposters:
+        for kind, enabled_key, source_key, share_key in media_sources:
             source = str(farm_settings.get(source_key) or "").strip()
             if not farm_settings.get(enabled_key) or not source:
                 continue
-            reposter = MediaReposter(source, kind)
-            await reposter.refresh(clients)
-            if reposter.tracks_left():
+            sender = MediaSender(source, kind)
+            await sender.refresh(clients)
+            if sender.tracks_left():
                 for account in accounts:
-                    setattr(account, kind, reposter)
+                    setattr(account, kind, sender)
                 log.info(
-                    "%s: репост из %s, доля %s%%, доступо %d постов",
+                    "%s: загрузка файлов из %s от аккаунтов, доля %s%%, доступно %d постов",
                     MEDIA_SOURCE_LABELS[kind],
                     source,
                     farm_settings.get(share_key),
-                    reposter.tracks_left(),
+                    sender.tracks_left(),
                 )
 
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
