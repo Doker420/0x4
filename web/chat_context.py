@@ -146,8 +146,9 @@ async def _verify_membership(client: Any, chat_id: int, account_name: str) -> st
         member = await client.get_chat_member(chat_id, int(me.id))
     except Exception as exc:
         raise PermissionError(
-            f"Аккаунт {account_name} не удалось подтвердить как участника чата; "
-            "проверьте его членство вручную."
+            f"Аккаунт {account_name} не удалось подтвердить как участника чата. "
+            "Для автовступления нужен публичный @username или invite-ссылка; по числовому ID/t.me/c/ вступить нельзя. "
+            "Проверьте, не ожидает ли invite одобрения, или добавьте аккаунт вручную."
         ) from exc
     status = _enum_name(getattr(member, "status", None))
     # Regular membership is enough; this deliberately does not require admin rights.
@@ -156,7 +157,8 @@ async def _verify_membership(client: Any, chat_id: int, account_name: str) -> st
     )
     if not is_member:
         raise PermissionError(
-            f"Аккаунт {account_name} не состоит в чате. Проверьте авто-вступление, разрешение и статус участника."
+            f"Аккаунт {account_name} ещё не участник чата. Автовступление возможно по публичному username или invite-ссылке; "
+            "по числовому ID/t.me/c/ добавьте аккаунт вручную. Проверьте разрешение и не требует ли invite одобрения."
         )
     return status
 

@@ -439,7 +439,7 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_context.manager, "get_client", new=AsyncMock(side_effect=lambda name: clients[name])),
             patch.object(chat_context.manager, "close", new=AsyncMock()),
         ):
-            with self.assertRaisesRegex(PermissionError, "не состоит в чате"):
+            with self.assertRaisesRegex(PermissionError, "не участник чата"):
                 await chat_context.collect_chat_context({
                     "chat_link": "@sample_group", "reader": "reader", "accounts": ["reader", "agent"],
                 })

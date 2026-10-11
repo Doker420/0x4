@@ -127,7 +127,7 @@
             </div>
             <div class="grid-2">
               <div class="field"><label for="live_source_topic_id">ID темы источника <span class="subtle">(необязательно)</span></label><input id="live_source_topic_id" name="live_source_topic_id" type="number" min="0" value="0" disabled><span class="help">0 — вся группа или тема из ссылки.</span></div>
-              <label class="check-row" style="align-items:flex-start"><input id="auto_join_live_source" type="checkbox" name="auto_join_live_source" disabled><span><strong>Вступить в источник, если нужно</strong><small>Только по публичному username или invite-ссылке. Используйте лишь если у вас есть разрешение.</small></span></label>
+              <label class="check-row" style="align-items:flex-start"><input id="auto_join_live_source" type="checkbox" name="auto_join_live_source" checked disabled><span><strong>Автоматически вступить в группу-источник, если аккаунт ещё не участник</strong><small>Включено по умолчанию для live-источника; можно отключить. Срабатывает по публичному @username или invite-ссылке. По числовому ID или ссылке t.me/c/ вступить нельзя: тогда аккаунт должен уже состоять в группе или нужен invite. Используйте автовступление только с разрешением.</small></span></label>
             </div>
             <div class="grid-2">
               <div class="field"><label for="source_plan_turns">Размер начального плана</label><input id="source_plan_turns" name="source_plan_turns" type="number" min="1" max="30" value="6" disabled><span class="help">1–30 коротких ходов; новые события источника добавляются отдельно. По умолчанию — 6.</span></div>

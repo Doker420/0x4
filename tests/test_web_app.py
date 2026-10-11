@@ -77,6 +77,8 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('name="automation_ack" required', chatfarm.text)
         self.assertIn("По умолчанию — бесконечная цепочка", chatfarm.text)
         self.assertIn("Группа-источник", chatfarm.text)
+        self.assertIn('name="auto_join_live_source" checked', chatfarm.text)
+        self.assertIn("по числовому id", chatfarm.text.lower())
         self.assertIn("ai подготовит фиксированный план", chatfarm.text.lower())
         self.assertIn("явное согласие автора", chatfarm.text.lower())
         self.assertIn("не пересылая сообщение", chatfarm.text.lower())
@@ -365,6 +367,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "live_source_reader": "alpha",
             "live_source_limit": "50",
             "source_plan_turns": "6",
+            "auto_join_live_source": "on",
             "min_delay": "15",
             "max_delay": "45",
             "automation_ack": "on",
@@ -389,6 +392,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         submitted = submit.await_args.args[1]
         self.assertTrue(submitted["live_source_enabled"])
         self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
+        self.assertFalse(submitted["history_auto_join"])
         self.assertFalse(submitted["source_voice_consent"])
 
         with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=77) as submit:
@@ -397,6 +401,13 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(submit.await_args.args[1]["source_voice_consent"])
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=78) as submit:
+            response = await self.client.post(
+                "/api/chatfarm/start", data={**base, "live_source": "@source_room"}
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(submit.await_args.args[1]["history_auto_join"])
 
     async def test_chatfarm_accepts_combined_dialogue_and_incoming_replies(self):
         for name in ("alpha", "beta"):

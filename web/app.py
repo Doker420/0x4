@@ -1019,10 +1019,15 @@ async def api_chatfarm_start(
         ):
             raise HTTPException(422, "Группа-источник должна отличаться от целевого чата")
         if auto_join_history_enabled and history_source_reference.get("source") not in {"invite", "username"}:
-            raise HTTPException(
-                422,
-                "Для авто-вступления в источник укажите публичный username или invite-ссылку; одного числового ID/t.me/c недостаточно.",
-            )
+            if live_source_requested:
+                # A numeric ID identifies the group but cannot authorize joining it.
+                # Keep the launch usable for accounts that are already members.
+                auto_join_history_enabled = False
+            else:
+                raise HTTPException(
+                    422,
+                    "Для авто-вступления в источник укажите публичный username или invite-ссылку; одного числового ID/t.me/c недостаточно.",
+                )
     for name in clean_names:
         account = await db.get_account(name)
         if (
