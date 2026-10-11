@@ -237,6 +237,7 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
                     {},
                     media_dir=root / "data" / "media",
                     download_media=True,
+                    allow_voice_download=True,
                     download_count=0,
                 )
 
@@ -245,6 +246,26 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(serialized["media"]["kind"], "photo")
             self.assertEqual(serialized["media"]["local_file"], "data/media/45-photo.jpg")
             self.assertTrue((root / serialized["media"]["local_file"]).is_file())
+
+    async def test_voice_is_not_downloaded_without_explicit_permission(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            message = FakeMessage(46, 701, "", datetime(2026, 10, 6, tzinfo=timezone.utc))
+            message.voice = types.SimpleNamespace(file_size=128, mime_type="audio/ogg")
+            message.download = AsyncMock(side_effect=AssertionError("voice download must be blocked"))
+            with patch.object(chat_context.db, "ROOT", root):
+                serialized, count = await chat_context._serialize_message(
+                    message,
+                    {},
+                    media_dir=root / "data" / "media",
+                    download_media=True,
+                    allow_voice_download=False,
+                    download_count=0,
+                )
+            self.assertEqual(count, 0)
+            self.assertEqual(serialized["media"]["kind"], "voice")
+            self.assertNotIn("local_file", serialized["media"])
+            message.download.assert_not_awaited()
 
     async def test_media_download_is_size_and_count_bounded(self):
         with tempfile.TemporaryDirectory() as tempdir:

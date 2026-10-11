@@ -76,6 +76,10 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Автоматизируйте только чат, где у вас есть разрешение", chatfarm.text)
         self.assertIn('name="automation_ack" required', chatfarm.text)
         self.assertIn("По умолчанию — бесконечная цепочка", chatfarm.text)
+        self.assertIn("Группа-источник", chatfarm.text)
+        self.assertIn("ai подготовит фиксированный план", chatfarm.text.lower())
+        self.assertIn("явное согласие автора", chatfarm.text.lower())
+        self.assertIn("не пересылая сообщение", chatfarm.text.lower())
         self.assertIn("права администратора не требуются", chatfarm.text)
         self.assertIn("Перед запуском взять последние сообщения как контекст", chatfarm.text)
         self.assertIn('name="history_source"', chatfarm.text)
@@ -347,6 +351,52 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["roulette_numbers"], "0-36")
         self.assertFalse(submitted["post_opening"])
         self.assertTrue(submitted["automation_acknowledged"])
+
+    async def test_chatfarm_live_source_requires_slow_queue_and_explicit_voice_consent(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        base = {
+            "accounts": "alpha",
+            "target_id": "-1001234567890",
+            "scenario_mode": "reactive",
+            "live_source_enabled": "on",
+            "live_source": "-1001234567899",
+            "live_source_reader": "alpha",
+            "live_source_limit": "50",
+            "source_plan_turns": "6",
+            "min_delay": "15",
+            "max_delay": "45",
+            "automation_ack": "on",
+        }
+        same_chat = await self.client.post(
+            "/api/chatfarm/start", data={**base, "live_source": base["target_id"]}
+        )
+        self.assertEqual(same_chat.status_code, 422)
+        self.assertIn("должна отличаться", same_chat.json()["detail"])
+
+        too_fast = await self.client.post(
+            "/api/chatfarm/start", data={**base, "min_delay": "5"}
+        )
+        self.assertEqual(too_fast.status_code, 422)
+        self.assertIn("15 секунд", too_fast.json()["detail"])
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=76) as submit:
+            response = await self.client.post("/api/chatfarm/start", data=base)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["collecting_history"])
+        self.assertTrue(response.json()["preparing_source_scenario"])
+        submitted = submit.await_args.args[1]
+        self.assertTrue(submitted["live_source_enabled"])
+        self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
+        self.assertFalse(submitted["source_voice_consent"])
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=77) as submit:
+            response = await self.client.post(
+                "/api/chatfarm/start", data={**base, "source_voice_consent": "on"}
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(submit.await_args.args[1]["source_voice_consent"])
 
     async def test_chatfarm_accepts_combined_dialogue_and_incoming_replies(self):
         for name in ("alpha", "beta"):
@@ -706,6 +756,118 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_CONTEXT_CHAT_ID"], "-1001234567899")
         collect.assert_awaited_once()
         spawn.assert_awaited_once()
+
+    async def test_live_source_plan_is_generated_before_spawn_with_voice_download_disabled(self):
+        events = []
+        source_chat_id = -1001234567899
+        target_chat_id = -1001234567890
+        process = SimpleNamespace(
+            pid=124,
+            returncode=None,
+            stdout=None,
+            wait=AsyncMock(return_value=0),
+        )
+
+        async def collect_context(payload):
+            events.append("collect")
+            self.assertFalse(payload["allow_voice_download"])
+            return {
+                "chat_id": source_chat_id,
+                "message_count": 2,
+                "context_file": f"data/chat_contexts/{source_chat_id}/context.json",
+            }
+
+        async def generate_plan(_ai, messages, **kwargs):
+            events.append("generate")
+            self.assertEqual(messages[0]["reply_to_message_id"], 5)
+            self.assertNotIn("source_voice", kwargs["media_options"])
+            return {
+                "topic": "История группы",
+                "turns": [{
+                    "account_index": 0,
+                    "text": "Короткий AI-ход",
+                    "media": "text",
+                    "reply_to_previous": False,
+                    "reaction_emoji": None,
+                    "source_voice_message_id": None,
+                }],
+            }
+
+        async def spawn_process(*_args, **kwargs):
+            events.append("spawn")
+            events.append(kwargs["env"]["FARM_OVERRIDE_SOURCE_PLAN_FILE"])
+            return process
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            data_dir = root / "data"
+            context_path = data_dir / "chat_contexts" / str(source_chat_id) / "context.json"
+            context_path.parent.mkdir(parents=True)
+            context_path.write_text(json.dumps({
+                "messages": [{
+                    "message_id": 6,
+                    "reply_to_message_id": 5,
+                    "participant_id": 1,
+                    "text": "Продолжение",
+                    "kind": "text",
+                }],
+            }), encoding="utf-8")
+            with (
+                patch.object(web_app, "FARM_PROCESS", None),
+                patch.object(web_app, "FARM_LOG_TASK", None),
+                patch.object(web_app, "FARM_LOG_FILE", root / "farm.log"),
+                patch.object(db, "ROOT", root),
+                patch.object(db, "DATA_DIR", data_dir),
+                patch.object(web_app.chat_context, "collect_chat_context", new=AsyncMock(side_effect=collect_context)),
+                patch.object(web_app.source_scenario, "generate_source_scenario", new=AsyncMock(side_effect=generate_plan)),
+                patch.object(web_app.manager.manager, "farm_sessions_busy", return_value=False),
+                patch.object(web_app.manager.manager, "prepare_for_farm", new=AsyncMock()),
+                patch.object(web_app.asyncio, "create_subprocess_exec", new=AsyncMock(side_effect=spawn_process)) as spawn,
+            ):
+                result = await web_app._h_start_chatfarm({
+                    "collect_history": True,
+                    "live_source_enabled": True,
+                    "source_voice_consent": False,
+                    "source_plan_turns": 3,
+                    "target_id": target_chat_id,
+                    "topic_id": 0,
+                    "context_reader": "alpha",
+                    "accounts": ["alpha"],
+                    "history_limit": 20,
+                    "history_reference": {
+                        "chat_ref": source_chat_id, "invite_hash": None, "topic_id": None, "source": "id",
+                    },
+                    "history_topic_id": 0,
+                    "history_auto_join": False,
+                    "min_delay": 15,
+                    "max_delay": 45,
+                    "qa_probability": 0.25,
+                    "clone_probability": 0.25,
+                    "reaction_probability": 0.35,
+                    "scenario_mode": "reactive",
+                    "scenario_topic": "",
+                    "scenario_turns": 20,
+                    "joke_every": 0,
+                    "rest_every": 0,
+                    "rest_min_sec": 60,
+                    "rest_max_sec": 120,
+                    "roulette_numbers": "0-36",
+                    "post_opening": False,
+                })
+                log_task = web_app.FARM_LOG_TASK
+                if log_task:
+                    await log_task
+                plan_path = root / "data" / "source_scenarios" / f"{source_chat_id}-{target_chat_id}.json"
+                plan_data = json.loads(plan_path.read_text(encoding="utf-8"))
+                env = spawn.await_args.kwargs["env"]
+
+        self.assertEqual(result["pid"], 124)
+        self.assertEqual(events[0:3], ["collect", "generate", "spawn"])
+        self.assertEqual(env["FARM_OVERRIDE_SOURCE_CHAT_ID"], str(source_chat_id))
+        self.assertEqual(env["FARM_OVERRIDE_SOURCE_VOICE_CONSENT"], "0")
+        self.assertEqual(plan_data["source_chat_id"], source_chat_id)
+        self.assertEqual(plan_data["target_chat_id"], target_chat_id)
+        self.assertFalse(plan_data["voice_consent"])
 
     async def test_history_dialogue_requires_a_distinct_participant_per_account(self):
         process = AsyncMock()

@@ -16,7 +16,7 @@ from fastapi import Cookie, FastAPI, File, Form, HTTPException, Request, UploadF
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import auth, channels, chat_context, db, giphy, manager, mass_actions, tasks
+from . import auth, channels, chat_context, db, giphy, manager, mass_actions, source_scenario, tasks
 from .config import (
     DICE_EMOJI,
     DICE_EMOJI_NAMES,
@@ -912,6 +912,14 @@ async def api_chatfarm_start(
     history_source: str = Form(default=""),
     history_topic_id: int = Form(default=0),
     auto_join_history: Optional[str] = Form(default=None),
+    live_source_enabled: Optional[str] = Form(default=None),
+    live_source: str = Form(default=""),
+    live_source_reader: str = Form(default=""),
+    live_source_limit: int = Form(default=100),
+    live_source_topic_id: int = Form(default=0),
+    auto_join_live_source: Optional[str] = Form(default=None),
+    source_plan_turns: int = Form(default=6),
+    source_voice_consent: Optional[str] = Form(default=None),
     scenario_turns: int = Form(default=20),
     joke_every: int = Form(default=5),
     rest_every: int = Form(default=6),
@@ -929,23 +937,27 @@ async def api_chatfarm_start(
     scenario_mode = scenario_mode.strip().lower()
     if scenario_mode not in {"reactive", "discussion", "roulette", "combined", "history_dialogue"}:
         raise HTTPException(422, "Выберите доступный режим чата")
+    live_source_requested = live_source_enabled is not None
+    if live_source_requested and scenario_mode != "reactive":
+        raise HTTPException(422, "Источник в реальном времени доступен в режиме «Без сценария»")
     if automation_ack is None:
         raise HTTPException(
             422,
             "Подтвердите разрешение, объявление участникам об автоматизации, членство в целевом чате и (если выбрано) вступление в источник истории",
         )
-    collect_history = (
+    collect_history = live_source_requested or (
         scenario_mode != "reactive"
         and (collect_context_history is not None or scenario_mode == "history_dialogue")
     )
-    if collect_history and scenario_mode not in {"discussion", "combined", "history_dialogue"}:
-        raise HTTPException(422, "История чата доступна только для режимов диалога")
-    if collect_history and history_limit < 0:
+    if collect_history and scenario_mode not in {"discussion", "combined", "history_dialogue"} and not live_source_requested:
+        raise HTTPException(422, "История чата доступна только для режимов диалога или источника в реальном времени")
+    effective_history_limit = live_source_limit if live_source_requested else history_limit
+    if collect_history and effective_history_limit < 0:
         raise HTTPException(422, "Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     behavior_only = scenario_mode == "reactive"
     topicless_history_dialogue = scenario_mode == "history_dialogue"
     scenario_topic = "" if behavior_only or topicless_history_dialogue else scenario_topic.strip()
-    if not scenario_topic and collect_history and not topicless_history_dialogue:
+    if not scenario_topic and collect_history and not topicless_history_dialogue and not live_source_requested:
         scenario_topic = "Прозрачный сценарный диалог по общим идеям из недавней истории чата; без имитации участников."
     if len(scenario_topic) > 2000:
         raise HTTPException(422, "Тема или правила сценария: максимум 2000 символов")
@@ -956,20 +968,29 @@ async def api_chatfarm_start(
         raise HTTPException(422, "Укажите Chat ID")
     if topic_id < 0:
         raise HTTPException(422, "ID темы должен быть положительным числом")
+    if live_source_requested and not 1 <= source_plan_turns <= source_scenario.MAX_PLAN_TURNS:
+        raise HTTPException(
+            422,
+            f"Размер AI-сценария должен быть 1–{source_scenario.MAX_PLAN_TURNS} ходов",
+        )
     try:
         clean_names = [validate_session_name(name) for name in names]
-        history_reader = validate_session_name(context_reader) if collect_history else ""
+        reader_value = live_source_reader if live_source_requested else context_reader
+        history_reader = validate_session_name(reader_value) if collect_history else ""
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if collect_history and (not history_reader or history_reader not in clean_names):
-        raise HTTPException(422, "Выберите сессию для чтения истории среди аккаунтов диалога")
+        raise HTTPException(422, "Выберите сессию для чтения истории среди выбранных аккаунтов")
     history_source_reference = None
     effective_history_topic = 0
-    auto_join_history_enabled = collect_history and auto_join_history is not None
+    auto_join_history_enabled = collect_history and (
+        auto_join_live_source is not None if live_source_requested else auto_join_history is not None
+    )
     if collect_history:
-        source_value = history_source.strip()
-        if topicless_history_dialogue and not source_value:
-            raise HTTPException(422, "Укажите ID или ссылку чата-источника истории отдельно от целевого чата")
+        source_value = (live_source if live_source_requested else history_source).strip()
+        if (topicless_history_dialogue or live_source_requested) and not source_value:
+            source_label = "группу-источник" if live_source_requested else "источника истории"
+            raise HTTPException(422, f"Укажите ID или ссылку {source_label} отдельно от целевого чата")
         try:
             history_source_reference = (
                 chat_context.parse_chat_link(source_value)
@@ -983,13 +1004,20 @@ async def api_chatfarm_start(
             )
         except ValueError as exc:
             raise HTTPException(422, f"Некорректный чат-источник истории: {exc}") from exc
-        if history_topic_id < 0:
+        requested_history_topic = live_source_topic_id if live_source_requested else history_topic_id
+        if requested_history_topic < 0:
             raise HTTPException(422, "ID темы источника должен быть положительным числом")
         effective_history_topic = (
-            history_topic_id
+            requested_history_topic
             or history_source_reference.get("topic_id")
             or (topic_id if not source_value else 0)
         )
+        if (
+            live_source_requested
+            and isinstance(history_source_reference.get("chat_ref"), int)
+            and int(history_source_reference["chat_ref"]) == target_id
+        ):
+            raise HTTPException(422, "Группа-источник должна отличаться от целевого чата")
         if auto_join_history_enabled and history_source_reference.get("source") not in {"invite", "username"}:
             raise HTTPException(
                 422,
@@ -1012,6 +1040,8 @@ async def api_chatfarm_start(
         raise HTTPException(422, "Задержка должна быть числом") from exc
     if not math.isfinite(min_delay) or not math.isfinite(max_delay) or min_delay < 0 or max_delay < min_delay or max_delay > 86400:
         raise HTTPException(422, "Задайте корректный диапазон задержки (0–86400 секунд)")
+    if live_source_requested and min_delay < 15:
+        raise HTTPException(422, "Для очереди AI-сценария задайте паузу не короче 15 секунд")
     if scenario_mode != "reactive":
         if len(clean_names) < 2:
             raise HTTPException(422, "Для сценария с диалогом выберите минимум два аккаунта")
@@ -1047,7 +1077,10 @@ async def api_chatfarm_start(
         "scenario_topic": scenario_topic,
         "collect_history": collect_history,
         "context_reader": history_reader,
-        "history_limit": history_limit if collect_history else 0,
+        "history_limit": effective_history_limit if collect_history else 0,
+        "live_source_enabled": live_source_requested,
+        "source_plan_turns": source_plan_turns if live_source_requested else 0,
+        "source_voice_consent": live_source_requested and source_voice_consent is not None,
         "history_reference": ({
             "chat_ref": history_source_reference["chat_ref"],
             "invite_hash": None,
@@ -1086,7 +1119,12 @@ async def api_chatfarm_start(
     except Exception:
         _discard_invite_reference(history_invite_token)
         raise
-    return {"ok": True, "task_id": task_id, "collecting_history": collect_history}
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "collecting_history": collect_history,
+        "preparing_source_scenario": live_source_requested,
+    }
 
 
 def _rotate_farm_log() -> None:
@@ -1259,9 +1297,16 @@ async def _h_start_chatfarm(payload: dict) -> dict:
                 else payload.get("topic_id") or 0
             ),
             "download_media": bool(payload.get("download_media", False))
-            or payload.get("scenario_mode") == "history_dialogue",
+            or payload.get("scenario_mode") == "history_dialogue"
+            or bool(payload.get("live_source_enabled", False)),
+            "allow_voice_download": (
+                not bool(payload.get("live_source_enabled", False))
+                or bool(payload.get("source_voice_consent", False))
+            ),
             "auto_join": bool(payload.get("history_auto_join", False)),
         })
+        if payload.get("live_source_enabled") and int(history_result.get("chat_id") or 0) == int(payload["target_id"]):
+            raise RuntimeError("Группа-источник должна отличаться от целевого чата: источник только читается, публикации идут в цель")
         if payload.get("scenario_mode") == "history_dialogue":
             account_names = list(dict.fromkeys(payload.get("accounts", [])))
             participant_ids = set()
@@ -1278,6 +1323,60 @@ async def _h_start_chatfarm(payload: dict) -> dict:
                     "Увеличьте глубину (0 — вся доступная история), выберите другой источник "
                     "или сократите число аккаунтов. Для 30 аккаунтов нужны 30 разных участников."
                 )
+        if payload.get("live_source_enabled"):
+            context_path = db.ROOT / str(history_result.get("context_file") or "")
+            try:
+                context_data = json.loads(context_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Не удалось прочитать собранную историю для AI-сценария") from exc
+            context_messages = context_data.get("messages", [])
+            voice_ids = [
+                int(item["message_id"])
+                for item in context_messages
+                if payload.get("source_voice_consent")
+                and str(item.get("kind") or "").lower() == "voice"
+                and isinstance(item.get("media"), dict)
+                and item["media"].get("local_file")
+                and str(item["media"]["local_file"]).startswith("data/chat_contexts/")
+            ]
+            saved_farm_settings = load_farm_settings(await db.get_setting("farm_settings", ""))
+            media_options = {"text", "gif"}
+            if saved_farm_settings.get("music_enabled") and saved_farm_settings.get("music_share_percent", 0) > 0:
+                media_options.add("music")
+            if saved_farm_settings.get("video_enabled") and saved_farm_settings.get("video_share_percent", 0) > 0:
+                media_options.add("video")
+            if float(payload.get("reaction_probability", 0.0)) > 0:
+                media_options.add("reaction")
+            if voice_ids:
+                media_options.add("source_voice")
+            try:
+                plan = await source_scenario.generate_source_scenario(
+                    ai,
+                    context_messages,
+                    account_count=len(payload.get("accounts", [])),
+                    turn_count=int(payload.get("source_plan_turns", 6)),
+                    media_options=media_options,
+                    voice_message_ids=voice_ids,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Не удалось подготовить сценарий до запуска: {_safe_error(exc)}") from exc
+            plan.update({
+                "source_chat_id": int(history_result["chat_id"]),
+                "target_chat_id": int(payload["target_id"]),
+                "voice_consent": bool(payload.get("source_voice_consent")),
+            })
+            plan_dir = db.DATA_DIR / "source_scenarios"
+            plan_dir.mkdir(parents=True, exist_ok=True)
+            plan_path = plan_dir / f"{int(history_result['chat_id'])}-{int(payload['target_id'])}.json"
+            temporary_plan_path = plan_path.with_suffix(".json.tmp")
+            temporary_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary_plan_path, plan_path)
+            payload["source_plan_file"] = plan_path.relative_to(db.ROOT).as_posix()
+            payload["source_chat_id"] = int(history_result["chat_id"])
+            log.info(
+                "Подготовлен AI-сценарий по истории источника %s: %d ходов; план медиа и реплаев создан до запуска",
+                history_result["chat_id"], len(plan["turns"]),
+            )
         assignments = ", ".join(
             f"{name} → участник {participant_id}"
             for name, participant_id in (history_result.get("account_participant_ids") or {}).items()
@@ -1297,6 +1396,12 @@ async def _h_start_chatfarm(payload: dict) -> dict:
             history_result["chat_id"] if history_result else payload["target_id"]
         ),
         "FARM_OVERRIDE_CONTEXT_REFRESH": "1" if history_result else "0",
+        "FARM_OVERRIDE_LIVE_SOURCE_ENABLED": "1" if payload.get("live_source_enabled") else "0",
+        "FARM_OVERRIDE_SOURCE_CHAT_ID": str(payload.get("source_chat_id", 0)),
+        "FARM_OVERRIDE_SOURCE_TOPIC_ID": str(payload.get("history_topic_id", 0)),
+        "FARM_OVERRIDE_SOURCE_VOICE_CONSENT": "1" if payload.get("source_voice_consent") else "0",
+        "FARM_OVERRIDE_SOURCE_PLAN_FILE": str(payload.get("source_plan_file", "")),
+        "FARM_OVERRIDE_SOURCE_PLAN_TURNS": str(payload.get("source_plan_turns", 0)),
         "FARM_OVERRIDE_TOPIC": str(payload.get("topic_id", 0)),
         "FARM_OVERRIDE_ACCOUNTS": ",".join(payload["accounts"]),
         "FARM_OVERRIDE_MIN_DELAY": str(payload["min_delay"]),
@@ -1337,6 +1442,8 @@ async def _h_start_chatfarm(payload: dict) -> dict:
         )
     except BaseException:
         await manager.manager.finish_farm()
+        if payload.get("source_plan_file"):
+            (db.ROOT / str(payload["source_plan_file"])).unlink(missing_ok=True)
         raise
     FARM_PROCESS = process
     FARM_LOG_TASK = asyncio.create_task(_stream_farm_logs(process), name="farm-log-reader")

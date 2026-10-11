@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from web import source_scenario
 from web.config import (
     DICE_EMOJI,
     POPULAR_EMOJI,
@@ -386,6 +387,13 @@ class FarmState:
         # Lines already sent by any account, shared farm-wide: consecutive bot
         # messages must never repeat each other.
         self.recent_texts: deque[str] = deque(maxlen=40)
+        self.source_plan_queue: deque[dict[str, Any]] = deque()
+        self.source_live_queue: deque[dict[str, Any]] = deque()
+        self.source_queue_changed = asyncio.Event()
+        self.source_event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
+        self.source_archive_media: list[dict[str, Any]] = []
+        self.source_live_media_ids: deque[int] = deque()
+        self.source_live_turn_index = 0
         self.lock = asyncio.Lock()
         self.outgoing_lock = asyncio.Lock()
         self._seen_order: deque[tuple[int, int]] = deque()
@@ -1163,6 +1171,41 @@ def _local_history_media_path(item: dict[str, Any]) -> Path | None:
     except ValueError:
         return None
     return path if path.is_file() else None
+
+
+def _cleanup_live_source_media(state: FarmState) -> None:
+    """Delete only temporary live voice uploads and strip their stale paths from saved state."""
+    live_root = (DATA_DIR / "source_live_media").resolve()
+
+    def cached_path(item: Mapping[str, Any]) -> Path | None:
+        media = item.get("media") if isinstance(item.get("media"), dict) else {}
+        relative = str(media.get("local_file") or item.get("media_file") or "").strip()
+        if not relative:
+            return None
+        path = (ROOT / relative).resolve()
+        try:
+            path.relative_to(live_root)
+        except ValueError:
+            return None
+        return path
+
+    for item in state.source_archive_media:
+        path = cached_path(item)
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Не удалось удалить временное source voice %s", path)
+    for item in state.chat_history:
+        if not isinstance(item, dict):
+            continue
+        path = cached_path(item)
+        if path is not None:
+            media = item.get("media")
+            if isinstance(media, dict):
+                media.pop("local_file", None)
+    state.source_archive_media.clear()
+    state.source_live_media_ids.clear()
 
 
 def _has_usable_assigned_history(history: list[dict[str, Any]]) -> bool:
@@ -2298,8 +2341,25 @@ class FarmAccount:
                     filters.chat(target) & filters.incoming,
                 )
             )
-            if scenario_mode == "reactive" and farm_cfg.get("proactive_enabled", False):
+            if (
+                scenario_mode == "reactive"
+                and farm_cfg.get("proactive_enabled", False)
+                and not farm_cfg.get("live_source_enabled")
+            ):
                 self._task = asyncio.create_task(self._loop(), name=f"farm-proactive-{self.name}")
+        source_chat_id = int(farm_cfg.get("source_chat_id") or 0)
+        target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+        if farm_cfg.get("live_source_enabled") and source_chat_id and source_chat_id != target_chat_id:
+            try:
+                await self.client.get_chat(source_chat_id)
+            except Exception as exc:
+                raise RuntimeError(f"[{self.name}] нет доступа к группе-источнику {source_chat_id}: {exc}") from exc
+            self.client.add_handler(
+                MessageHandler(
+                    self._on_source_incoming,
+                    filters.chat(source_chat_id) & filters.incoming,
+                )
+            )
 
     async def stop(self) -> None:
         self._running = False
@@ -2339,6 +2399,14 @@ class FarmAccount:
         if not sender or getattr(sender, "is_bot", False):
             return
         if sender.id in {account.user_id for account in self.farm_accounts if account.user_id}:
+            return
+        source_chat_id = int(FARM_CFG.get("farm", {}).get("source_chat_id") or 0)
+        target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+        if (
+            FARM_CFG.get("farm", {}).get("live_source_enabled")
+            and source_chat_id == target_chat_id == int(message.chat.id)
+        ):
+            await self._capture_live_source_message(message)
             return
         if not self._is_in_configured_topic(message):
             return
@@ -2407,6 +2475,157 @@ class FarmAccount:
         responder._background_tasks.add(task)
         task.add_done_callback(responder._background_tasks.discard)
 
+    async def _on_source_incoming(self, client: Client, message: TGMessage) -> None:
+        del client
+        await self._capture_live_source_message(message)
+
+    def _in_source_topic(self, message: TGMessage) -> bool:
+        topic_id = FARM_CFG.get("farm", {}).get("source_topic_id")
+        if not topic_id:
+            return True
+        thread_id = getattr(message, "reply_to_top_message_id", None)
+        if thread_id is None:
+            thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is not None:
+            return int(thread_id) == int(topic_id)
+        reply_id = getattr(message, "reply_to_message_id", None)
+        if reply_id is not None:
+            return int(reply_id) == int(topic_id)
+        return int(getattr(message, "id", 0)) == int(topic_id)
+
+    async def _capture_live_source_message(self, message: TGMessage) -> None:
+        farm_cfg = FARM_CFG.get("farm", {})
+        if not farm_cfg.get("live_source_enabled") or not message:
+            return
+        if getattr(message, "empty", False) or getattr(message, "service", None):
+            return
+        sender = getattr(message, "from_user", None)
+        sender_chat = getattr(message, "sender_chat", None)
+        if sender is not None and (
+            getattr(sender, "is_bot", False)
+            or sender.id in {account.user_id for account in self.farm_accounts if account.user_id}
+        ):
+            return
+        if sender is None and sender_chat is None:
+            return
+        if not self._in_source_topic(message):
+            return
+        source_chat_id = int(farm_cfg.get("source_chat_id") or 0)
+        chat = getattr(message, "chat", None)
+        chat_id = int(getattr(chat, "id", source_chat_id) or source_chat_id)
+        if not source_chat_id or chat_id != source_chat_id:
+            return
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id <= 0:
+            return
+        text = self._message_text(message)
+        kind = self._message_kind(message)
+        same_as_target = chat_id == int(FARM_CFG.get("target_chat_id") or 0)
+        event = {
+            "author": "участник источника",
+            "participant_id": None,
+            "user_id": int(getattr(sender, "id", 0) or 0),
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "text": text[:2000],
+            "source_text": text[:2000],
+            "kind": kind,
+            "media": {"kind": kind} if kind != "text" else None,
+            "direction": "incoming" if same_as_target else "context",
+            "is_question": self._looks_like_question(text),
+            "reply_to_message_id": getattr(message, "reply_to_message_id", None),
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        }
+        async with self.state.lock:
+            if not self.state.remember_message(chat_id, message_id):
+                return
+            self.state.chat_history.append(event)
+        voice_item = None
+        if kind == "voice" and farm_cfg.get("source_voice_consent"):
+            voice_item = await self._download_live_source_voice(message, event)
+        queued_event = {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "text": text[:800],
+            "kind": kind,
+            "voice_message_id": message_id if voice_item else None,
+            "reply_to_message_id": event.get("reply_to_message_id"),
+        }
+        try:
+            self.state.source_event_queue.put_nowait(queued_event)
+        except asyncio.QueueFull:
+            try:
+                self.state.source_event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self.state.source_event_queue.put_nowait(queued_event)
+            log.warning("Источник сообщений перегружен: отброшено старейшее событие")
+        log.info("[%s] новое сообщение источника %s добавлено в очередь AI-плана", self.name, message_id)
+
+    async def _download_live_source_voice(
+        self, message: TGMessage, event: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        voice = getattr(message, "voice", None)
+        try:
+            size = int(getattr(voice, "file_size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        max_file_bytes = 3 * 1024 * 1024
+        if size <= 0 or size > max_file_bytes:
+            log.info("[%s] source voice %s skipped: outside size limit", self.name, event["message_id"])
+            return None
+        source_chat_id = int(event["chat_id"])
+        live_dir = (DATA_DIR / "source_live_media" / str(source_chat_id)).resolve()
+        live_dir.mkdir(parents=True, exist_ok=True)
+        destination = live_dir / f"{int(event['message_id'])}.ogg"
+        try:
+            result = await message.download(file_name=str(destination))
+            downloaded = Path(str(result)) if result else destination
+            if not downloaded.is_file():
+                return None
+            try:
+                downloaded.resolve().relative_to(live_dir)
+            except ValueError:
+                log.warning("[%s] source voice downloader returned a path outside cache", self.name)
+                return None
+            if downloaded.stat().st_size > max_file_bytes:
+                downloaded.unlink(missing_ok=True)
+                return None
+            relative = downloaded.resolve().relative_to(ROOT.resolve()).as_posix()
+            item = {
+                "message_id": int(event["message_id"]),
+                "date": event.get("ts"),
+                "author": "участник источника",
+                "participant_id": None,
+                "text": "[voice]",
+                "kind": "voice",
+                "media": {"kind": "voice", "local_file": relative},
+                "direction": "context",
+            }
+            async with self.state.lock:
+                self.state.source_archive_media = [
+                    existing for existing in self.state.source_archive_media
+                    if int(existing.get("message_id") or 0) != int(event["message_id"])
+                ]
+                self.state.source_archive_media.append(item)
+                self.state.source_live_media_ids.append(int(event["message_id"]))
+                while len(self.state.source_live_media_ids) > 10:
+                    old_id = self.state.source_live_media_ids.popleft()
+                    for existing in list(self.state.source_archive_media):
+                        if int(existing.get("message_id") or 0) == old_id:
+                            old_path = _local_history_media_path(existing)
+                            if old_path and "source_live_media" in old_path.parts:
+                                old_path.unlink(missing_ok=True)
+                            self.state.source_archive_media.remove(existing)
+                            break
+            event["media"] = dict(item["media"])
+            log.info("[%s] source voice %s cached for account upload with consent", self.name, event["message_id"])
+            return item
+        except Exception:
+            log.warning("[%s] could not cache source voice %s", self.name, event["message_id"], exc_info=True)
+            destination.unlink(missing_ok=True)
+            return None
+
     def _is_in_configured_topic(self, message: TGMessage) -> bool:
         topic_id = FARM_CFG.get("topic_id")
         if not topic_id:
@@ -2428,6 +2647,7 @@ class FarmAccount:
             ("animation", "gif"),
             ("sticker", "sticker"),
             ("voice", "voice"),
+            ("audio", "audio"),
             ("video", "video"),
             ("document", "file"),
         ):
@@ -3245,6 +3465,86 @@ class FarmAccount:
         except Exception:
             log.exception("[%s] reaction failed", self.name)
 
+    async def _send_planned_reaction(self, emoji: str, message_id: int | None = None) -> bool:
+        if emoji not in source_scenario.REACTION_EMOJI:
+            return False
+        target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+        if message_id is None:
+            async with self.state.lock:
+                candidate = next((
+                    item for item in reversed(self.state.chat_history)
+                    if int(item.get("chat_id") or target_chat_id) == target_chat_id
+                    and item.get("direction") in {"incoming", "outgoing"}
+                    and item.get("message_id")
+                ), None)
+                message_id = int(candidate["message_id"]) if candidate else None
+        if message_id is None:
+            return False
+        try:
+            await self.client.send_reaction(
+                chat_id=target_chat_id,
+                message_id=int(message_id),
+                emoji=emoji,
+            )
+            log.info("[%s] planned reaction %s on target message %s", self.name, emoji, message_id)
+            return True
+        except RPCError as exc:
+            log.warning("[%s] planned reaction failed: %s", self.name, exc)
+        except Exception:
+            log.exception("[%s] planned reaction failed", self.name)
+        return False
+
+    def _source_archive_item(self, source_message_id: int | None = None, *, kind: str = "") -> dict[str, Any] | None:
+        if not FARM_CFG.get("farm", {}).get("source_voice_consent"):
+            return None
+        candidates = []
+        for item in self.state.source_archive_media:
+            media = item.get("media") if isinstance(item.get("media"), dict) else {}
+            item_kind = str(media.get("kind") or item.get("kind") or "").lower()
+            if kind and item_kind != kind:
+                continue
+            if source_message_id is not None and int(item.get("message_id") or 0) != int(source_message_id):
+                continue
+            path = _local_history_media_path(item)
+            if path is not None:
+                candidates.append({**item, "media": dict(media), "_local_path": path})
+        return random.choice(candidates) if candidates else None
+
+    async def _send_source_script_turn(self, turn: Mapping[str, Any]) -> bool:
+        media = str(turn.get("media") or "text")
+        text = str(turn.get("text") or "").strip()
+        reaction = turn.get("reaction_emoji")
+        if media == "reaction":
+            return await self._send_planned_reaction(str(reaction or ""))
+        async with self.state.lock:
+            previous_message_id = self.state.last_outgoing_message_id
+        reply_to = (
+            previous_message_id if turn.get("reply_to_previous") and previous_message_id
+            else FARM_CFG.get("topic_id")
+        )
+        sent = False
+        if media == "source_voice":
+            voice_item = self._source_archive_item(
+                turn.get("source_voice_message_id"), kind="voice"
+            )
+            if voice_item:
+                sent = await self._send_history_dialogue_content(
+                    text,
+                    reply_to=reply_to,
+                    media_item=voice_item,
+                    allow_account_media=False,
+                )
+        elif media in {"gif", "music", "video"}:
+            sent = await self._send_dialogue_content(text, reply_to=reply_to, kind=media)
+        elif text:
+            sent = await self._send_text(text, reply_to=reply_to)
+        if not sent and text:
+            log.warning("[%s] медиа-ходу %s не удалось загрузить вложение; отправляю текстовый fallback", self.name, media)
+            sent = await self._send_text(text, reply_to=reply_to)
+        if sent and reaction in source_scenario.REACTION_EMOJI:
+            await self._send_planned_reaction(str(reaction))
+        return sent
+
     async def _record(self, msg: TGMessage, text: str, kind: str) -> None:
         user = getattr(msg, "from_user", None)
         async with self.state.lock:
@@ -3262,6 +3562,172 @@ class FarmAccount:
             if kind == "text":
                 self.state.mark_text(text)
             self.state.mark_activity()
+
+
+def _live_source_media_options(state: FarmState, settings: Mapping[str, Any], accounts: list[FarmAccount]) -> set[str]:
+    options = {"text", "gif"}
+    if float(settings.get("reaction_probability", 0.0) or 0.0) > 0:
+        options.add("reaction")
+    if settings.get("music_enabled") and any(getattr(account, "music", None) for account in accounts):
+        options.add("music")
+    if settings.get("video_enabled") and any(getattr(account, "video", None) for account in accounts):
+        options.add("video")
+    if settings.get("source_voice_consent") and any(
+        str((item.get("media") or {}).get("kind") or item.get("kind") or "").lower() == "voice"
+        and _local_history_media_path(item) is not None
+        for item in state.source_archive_media
+    ):
+        options.add("source_voice")
+    return options
+
+
+async def run_live_source_update_worker(
+    accounts: list[FarmAccount],
+    state: FarmState,
+    stop_event: asyncio.Event,
+    settings: Mapping[str, Any],
+) -> None:
+    """Turn new source-group events into queued original target-chat turns."""
+    if not accounts:
+        return
+    min_gap = max(15.0, float(settings.get("min_delay_sec", 15) or 15))
+    next_generation_at = 0.0
+    while not stop_event.is_set():
+        try:
+            first = await asyncio.wait_for(state.source_event_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        batch = [first]
+        # Briefly coalesce bursts so one busy source chat does not cause one model call per post.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=0.8)
+        except asyncio.TimeoutError:
+            pass
+        while len(batch) < 8:
+            try:
+                batch.append(state.source_event_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        remaining = next_generation_at - time.monotonic()
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+        if stop_event.is_set():
+            return
+        # Add any updates that arrived during the rate-limit pause to this single turn.
+        while len(batch) < 8:
+            try:
+                batch.append(state.source_event_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        account_index = state.source_live_turn_index % len(accounts)
+        account = accounts[account_index]
+        batch_keys = {
+            (int(event.get("chat_id") or 0), int(event.get("message_id") or 0))
+            for event in batch
+        }
+        async with state.lock:
+            recent_history = [
+                item for item in state.chat_history
+                if (int(item.get("chat_id") or 0), int(item.get("message_id") or 0)) not in batch_keys
+            ]
+            history = recent_history[-16:]
+            voice_ids = [
+                int(item.get("message_id"))
+                for item in state.source_archive_media
+                if str((item.get("media") or {}).get("kind") or "").lower() == "voice"
+                and _local_history_media_path(item) is not None
+            ]
+        media_options = _live_source_media_options(state, settings, accounts)
+        prompt = source_scenario.build_live_update_prompt(
+            batch,
+            history,
+            persona=account.persona,
+            account_index=account_index,
+            media_options=media_options,
+            voice_message_ids=voice_ids,
+        )
+        try:
+            response = await account.bridge.ask(prompt, new_conversation=True)
+            turn = source_scenario.parse_live_source_turn(
+                response,
+                account_index=account_index,
+                account_count=len(accounts),
+                media_options=media_options,
+                voice_message_ids=voice_ids,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("[%s] не удалось добавить новый ход по группе-источнику", account.name)
+            next_generation_at = time.monotonic() + min_gap
+            continue
+        turn["source_message_id"] = int(batch[-1].get("message_id") or 0)
+        if len(state.source_live_queue) >= 64:
+            state.source_live_queue.popleft()
+            log.warning("Очередь live-сценария заполнена; отброшен старейший добавленный ход")
+        state.source_live_queue.append(turn)
+        state.source_live_turn_index += 1
+        state.source_queue_changed.set()
+        next_generation_at = time.monotonic() + min_gap
+        log.info(
+            "[%s] новый AI-ход добавлен в live-сценарий по %d сообщению(ям) источника",
+            account.name, len(batch),
+        )
+
+
+async def run_live_source_scenario(
+    accounts: list[FarmAccount],
+    state: FarmState,
+    stop_event: asyncio.Event,
+    settings: Mapping[str, Any],
+) -> None:
+    """Post the prebuilt scenario, prioritizing turns generated from fresh source updates."""
+    if not accounts:
+        return
+    min_delay = max(15.0, float(settings.get("min_delay_sec", 15) or 15))
+    max_delay = max(min_delay, float(settings.get("max_delay_sec", min_delay) or min_delay))
+    turn_index = 0
+    while not stop_event.is_set():
+        if state.source_live_queue:
+            turn = state.source_live_queue.popleft()
+            is_live = True
+        elif state.source_plan_queue:
+            turn = state.source_plan_queue.popleft()
+            is_live = False
+        else:
+            state.source_queue_changed.clear()
+            if state.source_live_queue or state.source_plan_queue:
+                continue
+            try:
+                await asyncio.wait_for(state.source_queue_changed.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            continue
+
+        if night_mode_active(settings):
+            (state.source_live_queue if is_live else state.source_plan_queue).appendleft(turn)
+            await asyncio.sleep(10)
+            continue
+        if turn_index:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=random.uniform(min_delay, max_delay))
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                break
+        account_index = int(turn.get("account_index", turn_index)) % len(accounts)
+        account = accounts[account_index]
+        async with state.outgoing_lock:
+            sent = await account._send_source_script_turn(turn)
+        label = "добавленный по live-сообщению" if is_live else "из заранее подготовленного AI-плана"
+        if sent:
+            log.info("Сценарий источника: %s отправил ход %d (%s)", account.name, turn_index + 1, label)
+        else:
+            log.warning("Сценарий источника: %s пропустил ход %d (%s)", account.name, turn_index + 1, label)
+        turn_index += 1
 
 
 async def run_scenario(
@@ -3606,6 +4072,31 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
             # These modes are topicless by design; do not inherit stale scenario text.
             farm_sub[setting] = ""
     farm_sub.update(load_farm_settings(farm_sub))
+    source_enabled = os.getenv("FARM_OVERRIDE_LIVE_SOURCE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    farm_sub["live_source_enabled"] = source_enabled
+    farm_sub["source_voice_consent"] = os.getenv("FARM_OVERRIDE_SOURCE_VOICE_CONSENT", "").strip().lower() in {"1", "true", "yes", "on"}
+    farm_sub["source_plan_file"] = os.getenv("FARM_OVERRIDE_SOURCE_PLAN_FILE", "").strip()
+    try:
+        farm_sub["source_chat_id"] = int(os.getenv("FARM_OVERRIDE_SOURCE_CHAT_ID", "0") or 0)
+        farm_sub["source_topic_id"] = max(0, int(os.getenv("FARM_OVERRIDE_SOURCE_TOPIC_ID", "0") or 0)) or None
+        farm_sub["source_plan_turns"] = max(0, min(source_scenario.MAX_PLAN_TURNS, int(os.getenv("FARM_OVERRIDE_SOURCE_PLAN_TURNS", "0") or 0)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("Проверьте ID источника и параметры AI-сценария") from exc
+    if source_enabled:
+        if farm_sub.get("scenario_mode") != "reactive":
+            raise RuntimeError("Живой источник поддерживается только в режиме «Без сценария»")
+        if farm_sub["source_chat_id"] == 0 or not farm_sub["source_plan_file"]:
+            raise RuntimeError("Для живого источника нужны ID группы и готовый AI-план")
+        if farm_sub["source_chat_id"] == int(local_cfg.get("target_chat_id") or 0):
+            raise RuntimeError("Группа-источник должна отличаться от целевого чата")
+        plan_path = (ROOT / farm_sub["source_plan_file"]).resolve()
+        try:
+            plan_path.relative_to(DATA_DIR.resolve())
+        except ValueError as exc:
+            raise RuntimeError("Файл AI-сценария должен находиться внутри data/") from exc
+        if not plan_path.is_file():
+            raise RuntimeError("Файл заранее подготовленного AI-сценария не найден")
+        farm_sub["source_plan_file"] = str(plan_path)
     if farm_sub.get("scenario_mode") == "history_dialogue":
         farm_sub.update({"scenario_topic": "", "post_opening": False})
     if farm_sub.get("scenario_mode") == "reactive":
@@ -3693,12 +4184,13 @@ async def run_farm() -> None:
     log.info("Подключаю %d аккаунтов к чату %s...", len(FARM_CFG["accounts"]), FARM_CFG["target_chat_id"])
     farm_settings = FARM_CFG["farm"]
     scenario_mode = farm_settings.get("scenario_mode", "reactive")
+    live_source_enabled = bool(farm_settings.get("live_source_enabled"))
     if farm_settings.get("night_mode_enabled"):
         log.info(
             "Ночной режим включён: %s UTC — ходы, автономные сообщения, реакции и ответы приостановлены",
             night_mode_label(farm_settings),
         )
-    if farm_settings.get("idle_enabled"):
+    if farm_settings.get("idle_enabled") and not live_source_enabled:
         log.info(
             "Простой чата: оживление после %s с тишины, пауза между оживлениями %s с, гифок %s%% — пишет один аккаунт по очереди",
             farm_settings["idle_after_sec"],
@@ -3718,7 +4210,13 @@ async def run_farm() -> None:
         log.info("Кубик: доля ходов %s%% (%s)", farm_settings["dice_share_percent"], farm_settings["dice_emoji"])
     if farm_settings.get("emoji_only_enabled"):
         log.info("Ответ одним эмодзи: доля ответов %s%%", farm_settings["emoji_only_percent"])
-    if scenario_mode == "reactive":
+    if scenario_mode == "reactive" and live_source_enabled:
+        log.info(
+            "Режим без сценария с группой-источником: план AI будет отправляться только в цель %s; "
+            "новые события источника добавляются в очередь",
+            FARM_CFG.get("target_chat_id"),
+        )
+    elif scenario_mode == "reactive":
         log.info(
             "Режим без сценария: ответы на сообщения; сценарная цепочка отключена, автономная активность=%s",
             farm_settings["proactive_enabled"],
@@ -3779,9 +4277,9 @@ async def run_farm() -> None:
     if context_chat_id == 0:
         raise SystemExit("FARM_OVERRIDE_CONTEXT_CHAT_ID не может быть нулём")
     context_file = DATA_DIR / "chat_contexts" / str(context_chat_id) / "context.json"
-    if scenario_mode != "reactive" and context_chat_id != chat_id:
+    if (scenario_mode != "reactive" or live_source_enabled) and context_chat_id != chat_id:
         log.info("История цели %s будет использована из чата-источника %s", chat_id, context_chat_id)
-    collected = await load_json(context_file, {}) if scenario_mode != "reactive" else {}
+    collected = await load_json(context_file, {}) if scenario_mode != "reactive" or live_source_enabled else {}
     context_rows = collected.get("messages", []) if isinstance(collected, dict) else []
     raw_participant_mapping = collected.get("account_participant_ids") if isinstance(collected, dict) else None
     if isinstance(raw_participant_mapping, dict):
@@ -3840,6 +4338,8 @@ async def run_farm() -> None:
                 "media": dict(media) if media else None,
                 "direction": "context",
                 "is_question": False,
+                "reply_to_message_id": item.get("reply_to_message_id"),
+                "topic_id": item.get("topic_id"),
                 "ts": str(item.get("date") or ""),
             }
             participant_id = context_event["participant_id"]
@@ -3870,6 +4370,72 @@ async def run_farm() -> None:
     else:
         log.info("   тема=%r, история=%d", state.topic, len(state.chat_history))
 
+    source_plan_path: Path | None = None
+    if live_source_enabled:
+        if context_chat_id != int(farm_settings.get("source_chat_id") or 0):
+            raise SystemExit("ID собранной истории не совпадает с live-источником")
+        if not context_rows:
+            raise SystemExit("В группе-источнике нет сообщений для подготовки сценария")
+        source_voice_consent = bool(farm_settings.get("source_voice_consent"))
+        state.source_archive_media = []
+        voice_message_ids: list[int] = []
+        for item in context_rows:
+            if not isinstance(item, dict):
+                continue
+            media = item.get("media") if isinstance(item.get("media"), dict) else {}
+            kind = str(media.get("kind") or item.get("kind") or "").lower()
+            if kind not in {"gif", "sticker", "photo", "video", "voice", "audio", "document"}:
+                continue
+            if kind == "voice" and not source_voice_consent:
+                continue
+            if _local_history_media_path(item) is None:
+                continue
+            state.source_archive_media.append(dict(item))
+            if kind == "voice":
+                try:
+                    voice_message_ids.append(int(item.get("message_id")))
+                except (TypeError, ValueError):
+                    continue
+        source_plan_path = Path(str(farm_settings.get("source_plan_file") or "")).resolve()
+        source_plan_data = await load_json(source_plan_path, {})
+        if not isinstance(source_plan_data, dict):
+            raise SystemExit("Файл заранее подготовленного AI-сценария повреждён")
+        if (
+            int(source_plan_data.get("source_chat_id") or 0) != context_chat_id
+            or int(source_plan_data.get("target_chat_id") or 0) != chat_id
+        ):
+            raise SystemExit("AI-сценарий предназначен для другой пары групп")
+        media_options = {"text", "gif"}
+        if float(farm_settings.get("reaction_probability", 0.0) or 0.0) > 0:
+            media_options.add("reaction")
+        if farm_settings.get("music_enabled") and farm_settings.get("music_share_percent", 0) > 0:
+            media_options.add("music")
+        if farm_settings.get("video_enabled") and farm_settings.get("video_share_percent", 0) > 0:
+            media_options.add("video")
+        if source_voice_consent and voice_message_ids:
+            media_options.add("source_voice")
+        normalized_plan = source_scenario.parse_source_scenario(
+            source_plan_data,
+            account_count=len(FARM_CFG["accounts"]),
+            turn_count=len(source_plan_data.get("turns", [])),
+            media_options=media_options,
+            voice_message_ids=voice_message_ids,
+        )
+        state.topic = normalized_plan["topic"]
+        state.source_plan_queue.extend(normalized_plan["turns"])
+        if normalized_plan["turns"]:
+            state.source_live_turn_index = (
+                int(normalized_plan["turns"][-1].get("account_index", -1)) + 1
+            ) % max(1, len(FARM_CFG["accounts"]))
+        if state.source_plan_queue:
+            state.source_queue_changed.set()
+        log.info(
+            "AI-план загружен до подключения к чату: %d ходов, %d исходных медиа, голосовые %s",
+            len(state.source_plan_queue),
+            len(state.source_archive_media),
+            "разрешены по согласию" if source_voice_consent else "выключены",
+        )
+
     # 4) DeepSeek is optional because its bridge is supplied locally by the operator.
     bridge = None
     if os.getenv("FARM_NO_LLM", "").lower() not in {"1", "true", "yes"}:
@@ -3883,6 +4449,8 @@ async def run_farm() -> None:
             log.warning("DeepSeek недоступен (%s); используется локальный ответ/донор", exc)
     else:
         log.info("DeepSeek выключен флагом FARM_NO_LLM")
+    if live_source_enabled and bridge is None:
+        raise SystemExit("Для live-источника нужен доступный DeepSeek: AI должен дополнять сценарий по новым сообщениям")
 
     accounts: list[FarmAccount] = []
     stop_event = asyncio.Event()
@@ -3903,6 +4471,8 @@ async def run_farm() -> None:
     reactor: asyncio.Task | None = None
     idler: asyncio.Task | None = None
     scenario_task: asyncio.Task | None = None
+    source_scenario_task: asyncio.Task | None = None
+    source_update_task: asyncio.Task | None = None
     try:
         for account_cfg in FARM_CFG["accounts"]:
             name = account_cfg.get("name", "?")
@@ -3971,7 +4541,9 @@ async def run_farm() -> None:
                 )
 
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
-        if scenario_mode == "reactive":
+        if scenario_mode == "reactive" and live_source_enabled:
+            log.info("🎉 Live-источник запущен: %d аккаунтов; источник только читается, публикации идут в цель", len(accounts))
+        elif scenario_mode == "reactive":
             log.info("🎉 Ферма запущена: %d аккаунтов; ответы по настройкам поведения без сценария", len(accounts))
         elif scenario_mode == "combined":
             log.info("🎉 Объединённый режим запущен: %d аккаунтов; диалог и ответы на сообщения", len(accounts))
@@ -3987,7 +4559,28 @@ async def run_farm() -> None:
                 log.exception("Сценарий завершился с ошибкой")
                 stop_event.set()
 
-        if scenario_mode in {"discussion", "roulette", "combined", "history_dialogue"}:
+        async def run_source_scenario_safely() -> None:
+            try:
+                await run_live_source_scenario(accounts, state, stop_event, farm_settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Live-сценарий завершился с ошибкой")
+                stop_event.set()
+
+        async def run_source_updates_safely() -> None:
+            try:
+                await run_live_source_update_worker(accounts, state, stop_event, farm_settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Worker обновления live-сценария завершился с ошибкой")
+                stop_event.set()
+
+        if live_source_enabled:
+            source_scenario_task = asyncio.create_task(run_source_scenario_safely(), name="farm-live-source-scenario")
+            source_update_task = asyncio.create_task(run_source_updates_safely(), name="farm-live-source-updates")
+        elif scenario_mode in {"discussion", "roulette", "combined", "history_dialogue"}:
             scenario_task = asyncio.create_task(run_scenario_safely(), name="farm-scenario")
 
         async def autosave() -> None:
@@ -4042,12 +4635,17 @@ async def run_farm() -> None:
         saver = asyncio.create_task(autosave(), name="farm-autosave")
         if bridge:
             watchdog = asyncio.create_task(bridge_watchdog(), name="farm-watchdog")
-        reactor = asyncio.create_task(reaction_worker(), name="farm-reactor")
-        idler = asyncio.create_task(idle_activity_worker(), name="farm-idle")
+        if not live_source_enabled:
+            reactor = asyncio.create_task(reaction_worker(), name="farm-reactor")
+            idler = asyncio.create_task(idle_activity_worker(), name="farm-idle")
         await stop_event.wait()
 
     finally:
-        active_tasks = [task for task in (saver, watchdog, reactor, idler, scenario_task) if task is not None]
+        active_tasks = [
+            task for task in (
+                saver, watchdog, reactor, idler, scenario_task, source_scenario_task, source_update_task
+            ) if task is not None
+        ]
         for task in active_tasks:
             task.cancel()
         if active_tasks:
@@ -4063,8 +4661,16 @@ async def run_farm() -> None:
                 await bridge.stop()
             except Exception:
                 log.exception("DeepSeek stop failed")
+        if live_source_enabled:
+            _cleanup_live_source_media(state)
         await save_json(state_file, state.to_dict())
         await save_json(STATS_FILE, FARM_STATS)
+        if source_plan_path is not None:
+            try:
+                source_plan_path.resolve().relative_to(DATA_DIR.resolve())
+                source_plan_path.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                log.warning("Не удалось удалить одноразовый AI-план %s", source_plan_path)
         log.info("Ферма остановлена.")
 
 

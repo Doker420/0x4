@@ -212,6 +212,53 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(account._running)
         self.assertEqual(len(account.client.handlers), 1)
 
+    async def test_live_source_adds_read_only_handler_separate_from_target(self):
+        target_chat_id = -1001234567890
+        source_chat_id = -1001234567899
+        farm.FARM_CFG = {
+            "target_chat_id": target_chat_id,
+            "topic_id": None,
+            "farm": {
+                "scenario_mode": "reactive",
+                "live_source_enabled": True,
+                "source_chat_id": source_chat_id,
+                "source_voice_consent": False,
+            },
+        }
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.client = FakeTelegramClient()
+        account.user_id = None
+        account.state = state
+        account.farm_accounts = [account]
+        account._running = False
+        account._task = None
+
+        await account.start()
+
+        self.assertEqual(len(account.client.handlers), 2)
+        source_handler = account.client.handlers[1]
+        self.assertIs(source_handler.callback.__self__, account)
+        self.assertIs(source_handler.callback.__func__, farm.FarmAccount._on_source_incoming)
+        message = types.SimpleNamespace(
+            id=901,
+            empty=False,
+            service=None,
+            from_user=types.SimpleNamespace(id=200, is_bot=False, username="reader", first_name="Reader"),
+            sender_chat=None,
+            chat=types.SimpleNamespace(id=source_chat_id),
+            text="Новая реплика источника",
+            caption=None,
+            reply_to_message_id=17,
+        )
+        await source_handler.callback(None, message)
+
+        self.assertEqual(state.source_event_queue.qsize(), 1)
+        self.assertEqual(state.chat_history[-1]["direction"], "context")
+        self.assertEqual(state.chat_history[-1]["reply_to_message_id"], 17)
+        self.assertEqual(account.client.messages, [])
+
     async def test_incoming_message_handler_stays_enabled_in_combined_mode(self):
         farm.FARM_CFG["farm"]["scenario_mode"] = "combined"
         state = farm.FarmState()

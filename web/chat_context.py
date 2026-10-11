@@ -259,6 +259,7 @@ async def _serialize_message(
     *,
     media_dir: Path,
     download_media: bool,
+    allow_voice_download: bool,
     download_count: int,
 ) -> tuple[dict[str, Any], int]:
     sender = getattr(message, "from_user", None)
@@ -291,7 +292,7 @@ async def _serialize_message(
         "reply_to_message_id": getattr(message, "reply_to_message_id", None),
         "topic_id": _message_topic_id(message),
     }
-    if media and download_media:
+    if media and download_media and (media.get("kind") != "voice" or allow_voice_download):
         local_file, download_count = await _download_media(message, media, media_dir, download_count)
         if local_file:
             item["media"]["local_file"] = local_file
@@ -318,6 +319,7 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     topic_id = _resolve_topic_id(payload.get("topic_id"), reference)
     download_media = bool(payload.get("download_media", False))
+    allow_voice_download = bool(payload.get("allow_voice_download", True))
 
     account_rows: dict[str, dict[str, Any]] = {}
     for name in account_names:
@@ -387,6 +389,7 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
                 author_labels,
                 media_dir=media_dir,
                 download_media=download_media,
+                allow_voice_download=allow_voice_download,
                 download_count=download_count,
             )
             messages.append(serialized)

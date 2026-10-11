@@ -109,6 +109,42 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["followups_max"], 1)
         self.assertEqual(config["farm"]["proactive_interval_sec"], 300)
 
+    async def test_live_source_runtime_validates_plan_path_and_distinct_chat(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            data_dir = root / "data"
+            plan_path = data_dir / "source_scenarios" / "plan.json"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text("{}", encoding="utf-8")
+            overrides = {
+                "FARM_OVERRIDE_LIVE_SOURCE_ENABLED": "1",
+                "FARM_OVERRIDE_SOURCE_CHAT_ID": "-1001234567899",
+                "FARM_OVERRIDE_SOURCE_TOPIC_ID": "12",
+                "FARM_OVERRIDE_SOURCE_VOICE_CONSENT": "0",
+                "FARM_OVERRIDE_SOURCE_PLAN_FILE": "data/source_scenarios/plan.json",
+                "FARM_OVERRIDE_SOURCE_PLAN_TURNS": "6",
+                "FARM_OVERRIDE_SCENARIO_MODE": "reactive",
+                "FARM_OVERRIDE_SCENARIO_TOPIC": "",
+                "FARM_OVERRIDE_MIN_DELAY": "15",
+                "FARM_OVERRIDE_MAX_DELAY": "45",
+            }
+            with (
+                patch.object(farm, "ROOT", root),
+                patch.object(farm, "DATA_DIR", data_dir),
+                patch.dict(os.environ, overrides),
+            ):
+                config, _settings = await farm._load_runtime_config()
+                self.assertTrue(config["farm"]["live_source_enabled"])
+                self.assertEqual(config["farm"]["source_chat_id"], -1001234567899)
+                self.assertEqual(config["farm"]["source_topic_id"], 12)
+                self.assertFalse(config["farm"]["source_voice_consent"])
+                self.assertEqual(config["farm"]["source_plan_file"], str(plan_path.resolve()))
+                self.assertEqual(config["farm"]["min_delay_sec"], 15)
+
+                with self.assertRaisesRegex(RuntimeError, "должна отличаться"):
+                    with patch.dict(os.environ, {"FARM_OVERRIDE_SOURCE_CHAT_ID": "-1001234567890"}):
+                        await farm._load_runtime_config()
+
     async def test_panel_settings_and_account_edits_feed_farm_runtime(self):
         config, settings = await farm._load_runtime_config()
         self.assertEqual(config["target_chat_id"], -1001234567890)
