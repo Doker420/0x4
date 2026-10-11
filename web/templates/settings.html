@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}Поведение · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">Правила и интеграции</p>
+    <h1>Поведение агента</h1>
+    <p class="subtle">Общие инструкции, скорость ответа, реакции, выбор медиа и параметры DeepSeek. Изменения применятся при следующем запуске чата.</p>
+  </div>
+  <span class="badge {{ 'badge-ok' if deepseek_available else 'badge-unauthorized' }}">{{ 'DeepSeek bridge найден' if deepseek_available else 'DeepSeek bridge не установлен' }}</span>
+</section>
+
+{% if not deepseek_available %}
+<div class="notice warning" style="margin-bottom:18px"><strong>Генерация DeepSeek пока недоступна.</strong> Репозиторий не содержит приватный модуль <code>vendor/Deepseek-API</code> — положите его на сервер отдельно. Панель и ответы-резерв работают без него; секреты API здесь не запрашиваются.</div>
+{% endif %}
+
+<form id="settings_form" onsubmit="saveSettings(event)">
+  <div class="grid" style="grid-template-columns:minmax(0,1.2fr) minmax(280px,.8fr)">
+    <section class="card">
+      <div class="card-head"><div><h2>Поведение</h2><p class="subtle">Инструкции, ритм и автономность. Эти правила добавляются к индивидуальной персоне аккаунта.</p></div><span class="pill badge-ok">Ответы — реплаем</span></div>
+      <div class="field">
+        <label for="agent_prompt">Общие указания агенту</label>
+        <textarea id="agent_prompt" name="agent_prompt" rows="5" maxlength="5000">{{ settings.agent_prompt }}</textarea>
+        <span class="help">Стиль и границы поведения. Максимум 5000 символов.</span>
+      </div>
+      <div class="grid-2">
+        <div class="field"><label for="min_delay_sec">Мин. задержка ответа, сек</label><input id="min_delay_sec" name="min_delay_sec" type="number" min="0" max="86400" step="0.5" value="{{ settings.min_delay_sec }}" required></div>
+        <div class="field"><label for="max_delay_sec">Макс. задержка ответа, сек</label><input id="max_delay_sec" name="max_delay_sec" type="number" min="0" max="86400" step="0.5" value="{{ settings.max_delay_sec }}" required></div>
+      </div>
+      <div class="grid-2">
+        <div class="field"><label for="default_reply_probability">Вероятность ответа на обычные сообщения, 0–1</label><input id="default_reply_probability" name="default_reply_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.default_reply_probability }}"><span class="help">По умолчанию 0,25: обычные реплики остаются контекстом чаще. На распознанный вопрос или просьбу отвечает один случайный аккаунт; индивидуальные настройки задаются у аккаунта.</span></div>
+        <div class="field"><label for="reaction_probability">Вероятность реакции, 0–1</label><input id="reaction_probability" name="reaction_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.reaction_probability }}"></div>
+        <div class="field"><label for="qa_probability">Q&amp;A-сценарии, вес 0–1</label><input id="qa_probability" name="qa_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.qa_probability }}"></div>
+        <div class="field"><label for="clone_probability">Диалоговые сценарии, вес 0–1</label><input id="clone_probability" name="clone_probability" type="number" min="0" max="1" step="0.05" value="{{ settings.clone_probability }}"></div>
+      </div>
+      <div class="check-row"><input id="typing_simulation" name="typing_simulation" type="checkbox" {% if settings.typing_simulation %}checked{% endif %}><label for="typing_simulation">Показывать «печатает…» перед текстовым ответом</label></div>
+      <div class="check-row"><input id="proactive_enabled" name="proactive_enabled" type="checkbox" {% if settings.proactive_enabled %}checked{% endif %}><label for="proactive_enabled">Автономные сообщения: аккаунты пишут сами по таймеру, без входящего сообщения</label></div>
+      <span class="help">Это тот самый переключатель автономных сообщений. Включено — ферма начинает не больше одной автономной активности за выбранный интервал, независимо от числа аккаунтов (Q&A может состоять из вопроса и ответа); выключено — аккаунты не начинают диалог сами. Его же можно переключить на странице «Чат» перед запуском фермы.</span>
+      <div class="field"><label for="proactive_interval_sec">Минимальная пауза между автономными действиями всей фермы, сек</label><input id="proactive_interval_sec" name="proactive_interval_sec" type="number" min="60" max="86400" step="60" value="{{ settings.proactive_interval_sec }}"><span class="help">По умолчанию 300 секунд (5 минут). Интервал общий для всех аккаунтов; Q&A-связка с двумя репликами считается одним действием.</span></div>
+      <div class="check-row"><input id="followups_enabled" name="followups_enabled" type="checkbox" {% if settings.followups_enabled %}checked{% endif %}><label for="followups_enabled">Подхват темы другими аккаунтами (по умолчанию выключен)</label></div>
+      <div class="field"><label for="followups_max">Сколько аккаунтов подхватывают тему</label><input id="followups_max" name="followups_max" type="number" min="0" max="3" step="1" value="{{ settings.followups_max }}"><span class="help">По умолчанию на вопрос отвечает один аккаунт. Включите подхват, если нужны дополнительные реплики; 1–3 других аккаунта добавят по одной короткой фразе.</span></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>Ночной режим</h2><p class="subtle">Окно тишины по времени сервера. Часовой пояс не переводится — всё считается в UTC.</p></div><span class="pill badge-ok" id="server_utc_badge">Сервер UTC: {{ server_utc_now }}</span></div>
+      <div class="check-row"><input id="night_mode_enabled" name="night_mode_enabled" type="checkbox" {% if settings.night_mode_enabled %}checked{% endif %}><label for="night_mode_enabled">Включить ночной режим (пауза активности)</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="night_mode_start">Начало, UTC (ЧЧ:ММ)</label><input id="night_mode_start" name="night_mode_start" type="time" step="60" value="{{ settings.night_mode_start }}" required><span class="help">Например 23:00 — по времени сервера в UTC.</span></div>
+        <div class="field"><label for="night_mode_end">Конец, UTC (ЧЧ:ММ)</label><input id="night_mode_end" name="night_mode_end" type="time" step="60" value="{{ settings.night_mode_end }}" required><span class="help">Например 07:00 — по времени сервера в UTC. Окно через полночь поддерживается.</span></div>
+      </div>
+      <span class="help">В этом окне аккаунты не публикуют ходы сценария, не отвечают на сообщения, не ставят реакции и не выходят с автономными сообщениями; входящие сообщения по-прежнему сохраняются в контекст. Время берётся с сервера в UTC — сверьтесь с текущим значением справа от заголовка. Изменения применятся при следующем запуске чат-фермы.</span>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>Простой чата</h2><p class="subtle">Оживление, когда участники молчат. Роли разделяются: за один интервал пишет только один аккаунт по очереди.</p></div></div>
+      <div class="check-row"><input id="idle_enabled" name="idle_enabled" type="checkbox" {% if settings.idle_enabled %}checked{% endif %}><label for="idle_enabled">Включить оживление при простое</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="idle_after_sec">Молчание до оживления, сек</label><input id="idle_after_sec" name="idle_after_sec" type="number" min="60" max="86400" step="10" value="{{ settings.idle_after_sec }}"><span class="help">Например 900 — чат молчит 15 минут, прежде чем аккаунт напишет.</span></div>
+        <div class="field"><label for="idle_cooldown_sec">Пауза между оживлениями, сек</label><input id="idle_cooldown_sec" name="idle_cooldown_sec" type="number" min="60" max="86400" step="10" value="{{ settings.idle_cooldown_sec }}"><span class="help">Минимальный интервал между такими сообщениями: не даёт всем аккаунтам заговорить разом.</span></div>
+      </div>
+      <div class="field"><label for="idle_gif_percent">Доля гифок при простое, %</label><input id="idle_gif_percent" name="idle_gif_percent" type="number" min="0" max="100" step="1" value="{{ settings.idle_gif_percent }}"><span class="help">С какой вероятностью вместо короткой фразы аккаунт отправит гифку. Аккаунты чередуются по кругу, так что одновременно пишет один.</span></div>
+      <span class="help">Оживление не срабатывает в ночном окне и не мешает живым диалогам: любой входящий сдвигает таймер простоя. Изменения применятся при следующем запуске чат-фермы.</span>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>Гифки, музыка и видео</h2><p class="subtle">Доли в обычных отправках; файлы из источников загружаются и отправляются от аккаунта.</p></div></div>
+      <div class="field"><label for="gif_share_percent">Больше гифок: доля гифок в отправках, %</label><input id="gif_share_percent" name="gif_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.gif_share_percent }}"><span class="help">Эта доля ходов отправляется гифкой в дополнение к весам из «Баланса ответов».</span></div>
+      <div class="check-row"><input id="music_enabled" name="music_enabled" type="checkbox" {% if settings.music_enabled %}checked{% endif %}><label for="music_enabled">Загружать музыку из источника и отправлять от аккаунта</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="music_source">Источник музыки</label><input id="music_source" name="music_source" type="text" value="{{ settings.music_source }}" placeholder="@sad_tracky"><span class="help">Например @sad_tracky или числовой ID канала. Аккаунт должен быть подписан или иметь доступ к истории.</span></div>
+        <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">В обычном ответе файл загружается отдельным сообщением после текста и отправляется самим аккаунтом; временный файл удаляется. Самостоятельная публикация без входящего сообщения возможна только при включённых «Автономных сообщениях».</span></div>
+      </div>
+      <span class="help">Треки берутся из последних сообщений источника и не повторяются, пока не закончатся. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
+
+      <div class="check-row" style="margin-top:14px"><input id="video_enabled" name="video_enabled" type="checkbox" {% if settings.video_enabled %}checked{% endif %}><label for="video_enabled">Загружать видео из канала и отправлять от аккаунта</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="video_source">Источник видео</label><input id="video_source" name="video_source" type="text" value="{{ settings.video_source }}" placeholder="@prikoly"><span class="help">Ссылка на канал с видео (например @prikoly или https://t.me/prikoly) или его числовой ID. Аккаунт берёт последние видео и отправляет их как медиа.</span></div>
+        <div class="field"><label for="video_share_percent">Доля видео в отправках, %</label><input id="video_share_percent" name="video_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.video_share_percent }}"><span class="help">Видео до 512 МБ скачивается из источника, затем загружается в чат от имени выбравшего аккаунта без пересылки исходного поста. Временный файл удаляется после отправки; файлы не повторяются, пока список не закончится. Если сумма долей музыки и видео выше 100%, они нормируются пропорционально.</span></div>
+      </div>
+
+      <div class="check-row" style="margin-top:14px"><input id="dice_enabled" name="dice_enabled" type="checkbox" {% if settings.dice_enabled %}checked{% endif %}><label for="dice_enabled">Разрешить аккаунтам кидать кубик</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="dice_share_percent">Доля кубиков в отправках, %</label><input id="dice_share_percent" name="dice_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.dice_share_percent }}"><span class="help">С этой вероятностью ход заменяется случайным броском Telegram — цифра выпадает сама, аккаунт её не выбирает.</span></div>
+        <div class="field"><label for="dice_emoji">Что кидать</label><select id="dice_emoji" name="dice_emoji">{% for emoji in dice_emoji %}<option value="{{ emoji }}" {% if settings.dice_emoji == emoji %}selected{% endif %}>{{ dice_emoji_names[emoji] }} {{ emoji }}</option>{% endfor %}</select><span class="help">Кубик 🎲, дартс, боулинг, баскетбол, футбол или слоты — анимацию считает Telegram.</span></div>
+      </div>
+
+      <div class="check-row" style="margin-top:14px"><input id="emoji_only_enabled" name="emoji_only_enabled" type="checkbox" {% if settings.emoji_only_enabled %}checked{% endif %}><label for="emoji_only_enabled">Отвечать одним эмодзи</label></div>
+      <div class="grid-2">
+        <div class="field"><label for="emoji_only_percent">Доля таких ответов, %</label><input id="emoji_only_percent" name="emoji_only_percent" type="number" min="0" max="100" step="1" value="{{ settings.emoji_only_percent }}"><span class="help">Ответ на вопрос иногда уходит одним популярным эмодзи вместо фразы.</span></div>
+        <div class="field"><label for="emoji_set">Набор эмодзи</label><input id="emoji_set" name="emoji_set" type="text" value="{{ settings.emoji_set }}" placeholder="😂 ❤️ 🔥 👍 🤔"><span class="help">Пусто — популярный набор (😂 ❤️ 🔥 👍 😍 🎉 🙌 😉 🤔 👀 💯 ✨ 😄 🙏 😎 🤣 😅 😊 🥰 😘). Можно вписать свои через пробел.</span></div>
+      </div>
+      <span class="help">Гифки каждый раз запрашиваются случайные у провайдера (GIPHY/Tenor) и не повторяются между аккаунтами, пока есть свежие.</span>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>Баланс ответов</h2><p class="subtle">Относительные веса, не обязаны в сумме давать 100.</p></div></div>
+      {% set bias = settings.default_media_bias %}
+      <div class="field"><label for="media_text">Текст, %</label><input id="media_text" name="media_text" type="number" min="0" step="1" value="{{ (bias.text * 100)|round|int }}"></div>
+      <div class="field"><label for="media_gif">GIF, %</label><input id="media_gif" name="media_gif" type="number" min="0" step="1" value="{{ (bias.gif * 100)|round|int }}"></div>
+      <div class="field"><label for="media_sticker">Стикеры, %</label><input id="media_sticker" name="media_sticker" type="number" min="0" step="1" value="{{ (bias.sticker * 100)|round|int }}"></div>
+      <div class="field"><label for="media_photo">Фото, %</label><input id="media_photo" name="media_photo" type="number" min="0" step="1" value="{{ (bias.photo * 100)|round|int }}"></div>
+      <div class="field"><label for="media_voice">Голосовые, %</label><input id="media_voice" name="media_voice" type="number" min="0" step="1" value="{{ (bias.voice * 100)|round|int }}"></div>
+      <div class="notice">Эти общие веса применяются аккаунтам в режиме «Общие настройки»; индивидуальные веса задаются в карточке аккаунта. Если выбранный тип медиа недоступен, агент отправит текст вместо молчания.</div>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <div class="card-head"><div><h2>DeepSeek</h2><p class="subtle">Режимы применяются к веб-генерации и чат-агентам при следующем запуске.</p></div><span class="badge {{ 'badge-ok' if deepseek_connected else 'badge-unknown' }}">{{ 'Клиент подключён' if deepseek_connected else 'Клиент не подключён' }}</span></div>
+      <div class="field"><label for="deepseek_model">Режим модели</label><select id="deepseek_model" name="deepseek_model"><option value="default" {% if settings.deepseek_model == 'default' %}selected{% endif %}>Обычный</option><option value="expert" {% if settings.deepseek_model == 'expert' %}selected{% endif %}>Экспертный</option></select></div>
+      <div class="check-row"><input id="deepseek_thinking" name="deepseek_thinking" type="checkbox" {% if settings.deepseek_thinking %}checked{% endif %}><label for="deepseek_thinking">DeepThink</label></div>
+      <div class="check-row"><input id="deepseek_search" name="deepseek_search" type="checkbox" {% if settings.deepseek_search %}checked{% endif %}><label for="deepseek_search">Веб-поиск</label></div>
+      <span class="help">Панель показывает статус локального bridge, но не хранит и не запрашивает DeepSeek-пароль.</span>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><div><h2>GIF-провайдеры</h2><p class="subtle">Ключи хранятся на сервере в локальной БД; поле остаётся пустым после сохранения.</p></div></div>
+      <div class="field"><label for="giphy_key">GIPHY API Key</label><input id="giphy_key" name="giphy_key" type="password" autocomplete="new-password" placeholder="{{ 'Ключ уже задан — оставьте пустым, чтобы не менять' if keys.giphy_key_set else 'Вставьте ключ GIPHY' }}"></div>
+      <div class="check-row"><input id="clear_giphy_key" name="clear_giphy_key" type="checkbox"><label for="clear_giphy_key">Удалить сохранённый GIPHY-ключ</label></div>
+      <div class="field"><label for="tenor_key">Tenor API Key <span class="subtle">(резерв)</span></label><input id="tenor_key" name="tenor_key" type="password" autocomplete="new-password" placeholder="{{ 'Ключ уже задан — оставьте пустым, чтобы не менять' if keys.tenor_key_set else 'Вставьте ключ Tenor' }}"></div>
+      <div class="check-row"><input id="clear_tenor_key" name="clear_tenor_key" type="checkbox"><label for="clear_tenor_key">Удалить сохранённый Tenor-ключ</label></div>
+      <button type="submit" style="margin-top:10px">Сохранить настройки</button>
+    </section>
+  </div>
+  <div id="settings_output" class="notice" hidden></div>
+</form>
+
+<section class="card">
+  <div class="card-head"><div><h2>Проверка GIF-поиска</h2><p class="subtle">Проверяет API-ключ и результаты до запуска агента.</p></div></div>
+  <div class="actions">
+    <input id="gif_query" placeholder="Например: кот радуется" style="max-width:420px">
+    <button type="button" class="secondary" onclick="searchGifs()">Найти GIF</button>
+  </div>
+  <div id="gif_status" class="help" style="margin-top:12px"></div>
+  <div id="gif_preview" class="media-preview"></div>
+</section>
+
+<script>
+async function saveSettings(event) {
+  event.preventDefault();
+  const output = document.getElementById('settings_output');
+  const button = event.submitter;
+  if (button) { button.disabled = true; }
+  try {
+    const data = await postForm('/api/settings/save', event.target);
+    showMessage(output, 'Настройки сохранены. Для уже запущенной фермы перезапустите процесс, чтобы применить их.', 'success');
+    document.getElementById('giphy_key').value = '';
+    document.getElementById('tenor_key').value = '';
+  } catch (error) { showMessage(output, error.message, 'error'); }
+  finally { if (button) button.disabled = false; }
+  return false;
+}
+async function searchGifs() {
+  const query = document.getElementById('gif_query').value.trim();
+  const status = document.getElementById('gif_status');
+  const preview = document.getElementById('gif_preview');
+  preview.replaceChildren(); status.textContent = 'Ищу…';
+  try {
+    const response = await fetch('/api/gif/search?q=' + encodeURIComponent(query));
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Поиск не выполнен');
+    if (!data.urls.length) { status.textContent = 'Ничего не найдено. Проверьте ключ GIPHY/Tenor и сохраните настройки.'; return; }
+    status.textContent = `Найдено GIF: ${data.urls.length}`;
+    for (const url of data.urls.slice(0, 8)) {
+      const image = document.createElement('img'); image.src = url; image.alt = 'GIF preview'; image.loading = 'lazy';
+      preview.appendChild(image);
+    }
+  } catch (error) { status.textContent = error.message; }
+}
+</script>
+{% endblock %}
