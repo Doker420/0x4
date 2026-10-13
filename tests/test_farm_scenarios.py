@@ -280,6 +280,21 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         farm.FARM_CFG = self.old_cfg
 
+    def test_context_refreshes_dates_only_for_archived_history(self):
+        history = [
+            {"direction": "context", "text": "Вчера 2023-10-12 было 7 заявок по 1200 рублей."},
+            {"direction": "incoming", "text": "Вчера мы получили 3 ответа."},
+        ]
+        with patch.object(
+            farm.source_scenario, "today_in_local_timezone", return_value=datetime.date(2026, 10, 13)
+        ):
+            rendered = farm.build_context(history)
+
+        self.assertIn("13 октября 2026 года", rendered)
+        self.assertIn("7 заявок по 1200 рублей", rendered)
+        self.assertIn("Вчера мы получили 3 ответа", rendered)
+        self.assertNotIn("2023-10-12", rendered)
+
     def test_behavior_only_state_discards_scenario_and_archive_but_keeps_incoming_chat(self):
         state = farm.FarmState()
         incoming = {
@@ -479,6 +494,33 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("UNIQUE_ARCHIVE_FOR_OTHER_BOT_ONLY", prompt)
         self.assertNotIn("STALE_COMMON_TOPIC_MUST_NOT_LEAK", prompt)
 
+    async def test_history_generator_refreshes_dates_but_keeps_archived_numbers(self):
+        state = farm.FarmState()
+        state.account_contexts = {"bot": [{
+            "author": "участник 1", "participant_id": 1,
+            "text": "Вчера встретились 2022-08-01, собрали 3 заявки по цене 2500 рублей.",
+            "source_text": "Вчера встретились 2022-08-01, собрали 3 заявки по цене 2500 рублей.",
+            "direction": "context", "kind": "text",
+        }]}
+        bridge = types.SimpleNamespace(
+            is_ready=True,
+            ask=AsyncMock(return_value="Встретились 2022-08-01, обсудили 3 заявки по цене 2500 рублей."),
+        )
+
+        with patch.object(
+            farm.source_scenario, "today_in_local_timezone", return_value=datetime.date(2026, 10, 13)
+        ):
+            answer = await farm.generate_history_dialogue_turn(
+                bridge, state, "синтетическая роль", 1, account_name="bot"
+            )
+
+        self.assertEqual(
+            answer, "Встретились 13 октября 2026 года, обсудили 3 заявки по цене 2500 рублей."
+        )
+        prompt = bridge.ask.await_args.args[0]
+        self.assertIn("13 октября 2026 года", prompt)
+        self.assertNotIn("2022-08-01", prompt)
+
     async def test_history_generator_retries_when_model_ignores_assigned_archive(self):
         state = farm.FarmState()
         state.account_contexts = {"bot": [{
@@ -599,6 +641,12 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("критерий", line.casefold())
         self.assertNotIn("компромисс", line.casefold())
         self.assertNotEqual(line.strip(), source)
+
+    def test_history_casualizer_uses_at_most_one_shortening(self):
+        with patch.object(farm.random, "choice", side_effect=lambda options: options[0]):
+            line = farm._history_slang_line("Сейчас, что вообще происходит?")
+
+        self.assertEqual(line, "Щас, что вообще происходит?")
 
     async def test_offline_history_turns_rotate_through_the_whole_assigned_archive(self):
         messages = [

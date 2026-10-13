@@ -630,7 +630,7 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("автоматизированный аккаунт", prompt)
         self.assertIn("не выдумывай факты", prompt)
         self.assertIn("не начинай с «Спасибо за вопрос»", prompt)
-        self.assertIn("не вычитывай реплику до литературной точности", prompt)
+        self.assertIn("не обязательно и не каждый раз", prompt)
 
     async def test_behavior_only_reply_omits_stale_scenario_topic(self):
         state = farm.FarmState()

@@ -655,7 +655,7 @@ REPLY_PROMPT = """Ты — автоматизированный аккаунт �
 - не превращай каждую реплику в уточняющий вопрос: на «хз», «ага», «ок» и короткие реакции отвечай коротко и естественно; медиа без подписи не описывай так, будто видел его содержимое
 - отвечай на языке последних сообщений; можно использовать уместные эмодзи
 - не соглашайся автоматически: не используй пустые формулы вроде «в этом определённо есть смысл»; если тезис неясен или спорен, ответь по конкретным данным либо честно обозначь, чего не хватает
-- не вычитывай реплику до литературной точности: иногда допустимы пропущенная запятая, короткая фраза без точки или разговорное сокращение; не добавляй ошибки в каждое сообщение и сохраняй понятность
+- пиши просто и по-разговорному, без лишних пояснений; иногда допустимо одно естественное сокращение или лёгкая опечатка, но только в части реплик — не обязательно и не каждый раз; сохраняй понятность
 
 Твоя реплика:"""
 
@@ -756,7 +756,9 @@ def build_context(history: deque[dict[str, Any]], limit: int = 12) -> str:
             who = "участник чата"
         else:
             who = "собеседник"
-        text = item.get("text") or f"[{item.get('kind', 'media')}]"
+        text = str(item.get("text") or f"[{item.get('kind', 'media')}]")
+        if direction == "context":
+            text = source_scenario.normalize_historical_dates(text)
         lines.append(f"{who}: {text}")
     return "\n".join(lines) or "(пусто)"
 
@@ -1044,6 +1046,7 @@ DIALOGUE_PROGRESS_STEPS = (
 
 
 DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплики для автоматизированного, явно сценарного диалога в групповом чате. Не имитируй конкретного реального участника и не заявляй о личном опыте; если тебя прямо спрашивают, автоматизирован ли аккаунт, ответь честно.
+Сегодняшняя дата для упоминаний из архива: {current_date}; остальные числовые факты не меняй.
 Тема/цель сценария — только границы разговора, а не вопрос, на который каждый аккаунт должен отвечать заново:
 {topic}
 
@@ -1061,7 +1064,7 @@ DISCUSSION_TURN_PROMPT = """Ты создаёшь короткие реплик�
 Последние реплики (имена авторов обезличены):
 {context}
 
-Строго соблюдай последовательность: только первый ход этапа может непосредственно отозваться на историческую реплику; каждый следующий ход сначала развивает конкретный тезис предыдущего аккаунта, затем добавляет ровно один новый критерий, последствие или проверяемое действие. Не отвечай снова на стартовую тему, не раздавай отдельный ответ каждому участнику и не задавай каждому аккаунту один и тот же вопрос. Если данных не хватает, прямо обозначь пробел вместо догадки. Не цитируй историю целиком и не приписывай автору личность или стиль. Не выдумывай факты, личный опыт или актуальные сведения. Не начинай с «Мысль про…», «Согласен, здесь важно не торопиться с выводами», «Что для вас главное?» или «А если посмотреть с другой стороны?». Не перефразируй предыдущую реплику без нового содержательного шага. Вопрос — только конкретный и не в каждом ходе. 1–2 предложения, максимум 240 символов; разговорный, слегка неформальный стиль.
+Строго соблюдай последовательность: только первый ход этапа может непосредственно отозваться на историческую реплику; каждый следующий ход сначала развивает конкретный тезис предыдущего аккаунта, затем добавляет ровно один новый критерий, последствие или проверяемое действие. Не отвечай снова на стартовую тему, не раздавай отдельный ответ каждому участнику и не задавай каждому аккаунту один и тот же вопрос. Если данных не хватает, прямо обозначь пробел вместо догадки. Не цитируй историю целиком и не приписывай автору личность или стиль. Не выдумывай факты, личный опыт или актуальные сведения. Не начинай с «Мысль про…», «Согласен, здесь важно не торопиться с выводами», «Что для вас главное?» или «А если посмотреть с другой стороны?». Не перефразируй предыдущую реплику без нового содержательного шага. Вопрос — только конкретный и не в каждом ходе. 1–2 коротких предложения, максимум 240 символов; разговорный и слегка неформальный стиль. Иногда допустимо короткое сокращение или лёгкая естественная опечатка, но не в каждой реплике; не добавляй слов ради неформальности.
 {extra_instruction}
 Только текст реплики:"""
 
@@ -1070,6 +1073,7 @@ HISTORY_DIALOGUE_TURN_PROMPT = """Ты — автоматизированный 
 Для этого режима НЕТ общей темы и нет заданного извне предмета разговора. Не придумывай тему и не строй рассуждение.
 
 Разговор ведётся сообщениями из архива: возьми конкретную реплику из назначенного архива ниже и перескажи её своими словами как обычную короткую реплику в чате — так, будто просто общаешься в чате. Это обычная болтовня, а не разбор темы.
+Сегодняшняя дата: {current_date}. Даты из архива уже актуализированы; цены, количества и прочие числа сохраняй.
 
 Назначенный архив (только этого аккаунта, другие авторы недоступны):
 {source_context}
@@ -1087,8 +1091,8 @@ HISTORY_DIALOGUE_TURN_PROMPT = """Ты — автоматизированный 
 Как писать:
 - одно короткое предложение, до 160 символов, разговорно и просто
 - перескажи суть выбранной архивной реплики своими словами; можно начать с короткой реакции («ну», «короче», «ахах», «вот это да», «ого»)
-- допустимы 1–2 естественные опечатки и разговорные сокращения («щас», «че», «норм», «ваще», «короче»), строчная буква в начале — это нормально
-- добавь 1–2 уместных эмодзи
+- иногда можно вставить одно понятное разговорное сокращение («щас», «че», «норм») или лёгкую опечатку; это необязательно и не должно быть в каждой реплике
+- строчная буква в начале допустима; добавь 1–2 уместных эмодзи
 - не делай аналитических выводов, не вводи критерии, компромиссы и проверки, не задавай вопросов вида «что для вас важнее»
 - не добавляй новую тему, внешние факты и выдуманные детали; не описывай медиа, которого не видел
 - не копируй формулировку из архива дословно и не повторяй последнюю реплику цепочки
@@ -1156,7 +1160,7 @@ def _history_source_text(item: dict[str, Any]) -> str:
         return ""
     if re.fullmatch(r"\[media:[^\]]+\]", text, re.IGNORECASE):
         return ""
-    return text
+    return source_scenario.normalize_historical_dates(text)
 
 
 def _local_history_media_path(item: dict[str, Any]) -> Path | None:
@@ -1311,12 +1315,22 @@ _HISTORY_EMOJI = ("🙂", "😄", "😂", "🔥", "👀", "😅", "🤔", "👍"
 
 
 def _history_slang_line(text: str) -> str:
-    line = text
-    for source, replacement in _HISTORY_SLANG:
-        if source == replacement:
-            continue
-        line = re.sub(rf"\b{re.escape(source)}\b", replacement, line, count=1, flags=re.IGNORECASE)
-    return line
+    options = [
+        (source, replacement) for source, replacement in _HISTORY_SLANG
+        if source != replacement and re.search(rf"\b{re.escape(source)}\b", text, re.IGNORECASE)
+    ]
+    if not options:
+        return text
+    source, replacement = random.choice(options)
+
+    def preserve_sentence_case(match: re.Match[str]) -> str:
+        if match.group(0)[:1].isupper():
+            return replacement[:1].upper() + replacement[1:]
+        return replacement
+
+    return re.sub(
+        rf"\b{re.escape(source)}\b", preserve_sentence_case, text, count=1, flags=re.IGNORECASE
+    )
 
 
 def _history_inject_typo(text: str) -> str:
@@ -1378,8 +1392,8 @@ def _history_offline_turn(
     leads = _history_leads_for(persona)
     candidates: list[str] = []
     for offset in range(4):
-        line = _history_slang_line(base)
-        if random.random() < 0.8:
+        line = _history_slang_line(base) if random.random() < 0.35 else base
+        if random.random() < 0.2:
             line = _history_inject_typo(line)
         lead = leads[(len(candidates) + offset) % len(leads)]
         # Do not stack a lead-in on a message that already opens with one.
@@ -1795,6 +1809,7 @@ async def generate_dialogue_turn(
     if bridge and getattr(bridge, "is_ready", False):
         try:
             prompt = DISCUSSION_TURN_PROMPT.format(
+                current_date=source_scenario.format_local_date(),
                 topic=topic[:2000],
                 history_seed=history_seed,
                 previous_turn=previous_turn,
@@ -1807,7 +1822,9 @@ async def generate_dialogue_turn(
             ) + _repetition_hint(recent_lines)
             # The transcript gives continuity; the separate seed keeps the model
             # anchored to human-provided content instead of looping on bot questions.
-            text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            text = source_scenario.normalize_historical_dates(
+                (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+            )
             rejected = bool(text) and (
                 is_dialogue_echo(text, history)
                 or _is_canned_reply(text)
@@ -1822,7 +1839,9 @@ async def generate_dialogue_turn(
                     "Сделай следующий содержательный шаг: добавь новый критерий, компромисс или проверяемое действие; "
                     "не цитируй историю и не используй круговые фразы."
                 )
-                text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                text = source_scenario.normalize_historical_dates(
+                    (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                )
                 if text and (
                     is_dialogue_echo(text, history)
                     or _is_canned_reply(text)
@@ -1882,6 +1901,7 @@ async def generate_history_dialogue_turn(
         text = ""
         if bridge and getattr(bridge, "is_ready", False):
             prompt = HISTORY_DIALOGUE_TURN_PROMPT.format(
+                current_date=source_scenario.format_local_date(),
                 persona=persona[:500],
                 global_prompt=global_prompt[:2000] or "соблюдай синтетическую роль и пиши естественно",
                 history_seed=_short_context_line(source_text, 360),
@@ -1890,7 +1910,9 @@ async def generate_history_dialogue_turn(
                 previous_turn=previous_turn,
             ) + _repetition_hint(recent_lines)
             try:
-                text = (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+                text = source_scenario.normalize_historical_dates(
+                    (await bridge.ask(prompt)).strip().strip('"').strip("«»")[:280]
+                )
                 if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
                     text = ""
                 rejected = bool(text) and (
@@ -1909,7 +1931,9 @@ async def generate_history_dialogue_turn(
                         "Возьми другую деталь из архива и перескажи её иначе, своими словами. "
                         "Не вводи новую тему и не копируй исходную формулировку."
                     )
-                    text = (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                    text = source_scenario.normalize_historical_dates(
+                        (await bridge.ask(retry_prompt)).strip().strip('"').strip("«»")[:280]
+                    )
                     if text.casefold() in {"[no_text]", "no_text", "[skip]", "skip"}:
                         text = ""
                     if text and (
