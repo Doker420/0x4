@@ -16,7 +16,7 @@ from fastapi import Cookie, FastAPI, File, Form, HTTPException, Request, UploadF
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import auth, channels, chat_context, db, farm_control, giphy, manager, mass_actions, source_scenario, tasks
+from . import auth, channels, chat_context, db, giphy, manager, mass_actions, source_scenario, tasks
 from .config import (
     DICE_EMOJI,
     DICE_EMOJI_NAMES,
@@ -248,72 +248,6 @@ async def _persist_farm_switches(**values: Any) -> None:
 
 def _safe_error(exc: Exception) -> str:
     return str(exc).strip()[:300] or type(exc).__name__
-
-
-def _request_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _runtime_delay(value: Any, label: str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(422, f"{label}: укажите число от 0 до 86400 секунд") from exc
-    if not math.isfinite(parsed) or not 0 <= parsed <= 86400:
-        raise HTTPException(422, f"{label}: укажите число от 0 до 86400 секунд")
-    return parsed
-
-
-def _normalized_chat_reference(value: Any, label: str, *, allow_invite: bool = True) -> str:
-    try:
-        reference = chat_context.parse_chat_link(str(value or "").strip())
-    except ValueError as exc:
-        raise HTTPException(422, f"{label}: {exc}") from exc
-    if reference.get("invite_hash"):
-        if not allow_invite:
-            raise HTTPException(422, f"{label}: invite-ссылка не подходит для этого действия")
-        return f"https://t.me/+{reference['invite_hash']}"
-    chat_ref = reference.get("chat_ref")
-    if chat_ref is None:
-        raise HTTPException(422, f"{label}: не удалось определить чат")
-    if isinstance(chat_ref, str):
-        return f"@{chat_ref.lstrip('@')}"
-    return str(int(chat_ref))
-
-
-async def _send_farm_control_command(action: str, payload: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
-    process = FARM_PROCESS
-    if process is None or process.returncode is not None or not process.pid:
-        raise HTTPException(409, "Чат-ферма не запущена")
-    pid = int(process.pid)
-    status = farm_control.read_status(pid)
-    if not status or not status.get("ready"):
-        raise HTTPException(409, "Чат-ферма ещё подключает аккаунты; попробуйте через несколько секунд")
-    if not status.get("supports_hot_control"):
-        raise HTTPException(409, "Горячее управление доступно только в режиме «Без сценария»")
-    try:
-        command_id = farm_control.write_command(pid, action, payload)
-    except OSError as exc:
-        raise HTTPException(503, "Не удалось передать команду работающей ферме") from exc
-    deadline = asyncio.get_running_loop().time() + max(1.0, timeout)
-    try:
-        while asyncio.get_running_loop().time() < deadline:
-            result = farm_control.read_result(pid, command_id)
-            if result is not None:
-                if not result.get("ok"):
-                    raise HTTPException(409, str(result.get("error") or "Команда отклонена")[:300])
-                data = result.get("result")
-                return data if isinstance(data, dict) else {"result": data}
-            if process.returncode is not None:
-                raise HTTPException(409, "Чат-ферма завершилась до выполнения команды")
-            await asyncio.sleep(0.2)
-        raise HTTPException(504, "Ферма не успела выполнить команду; проверьте лог перед повтором")
-    finally:
-        farm_control.cancel_command(pid, command_id)
 
 
 # ─── Lifecycle ───
@@ -996,11 +930,6 @@ async def api_chatfarm_start(
     proactive_enabled: Optional[str] = Form(default=None),
     followups_enabled: Optional[str] = Form(default=None),
     followups_max: int = Form(default=DEFAULT_FARM_SETTINGS["followups_max"]),
-    reply_destination: str = Form(default="group"),
-    reply_filter_include: str = Form(default=""),
-    reply_filter_exclude: str = Form(default=""),
-    reply_only_questions: Optional[str] = Form(default=None),
-    direct_message_ack: Optional[str] = Form(default=None),
     automation_ack: Optional[str] = Form(default=None),
     web_auth: Optional[str] = Cookie(default=None),
 ):
@@ -1011,33 +940,24 @@ async def api_chatfarm_start(
     live_source_requested = live_source_enabled is not None
     if live_source_requested and scenario_mode != "reactive":
         raise HTTPException(422, "Источник в реальном времени доступен в режиме «Без сценария»")
-    if not _request_bool(automation_ack):
+    if automation_ack is None:
         raise HTTPException(
             422,
             "Подтвердите разрешение, объявление участникам об автоматизации, членство в целевом чате и (если выбрано) вступление в источник истории",
         )
-    reply_destination = str(reply_destination or "group").strip().lower()
-    if reply_destination not in {"group", "direct"}:
-        raise HTTPException(422, "Выберите ответы в группе или личные сообщения")
-    if reply_destination == "direct" and not _request_bool(direct_message_ack):
-        raise HTTPException(
-            422,
-            "Для личных сообщений отдельно подтвердите, что участники уведомлены и разрешили получать их",
-        )
-    if len(reply_filter_include) > 1000 or len(reply_filter_exclude) > 1000:
-        raise HTTPException(422, "Каждое поле фильтра может содержать не больше 1000 символов")
     collect_history = live_source_requested or (
-        collect_context_history is not None or scenario_mode == "history_dialogue"
+        scenario_mode != "reactive"
+        and (collect_context_history is not None or scenario_mode == "history_dialogue")
     )
-    if collect_history and scenario_mode not in {"reactive", "discussion", "combined", "history_dialogue"} and not live_source_requested:
-        raise HTTPException(422, "История чата доступна только в режиме без сценария, режиме диалога или источника в реальном времени")
+    if collect_history and scenario_mode not in {"discussion", "combined", "history_dialogue"} and not live_source_requested:
+        raise HTTPException(422, "История чата доступна только для режимов диалога или источника в реальном времени")
     effective_history_limit = live_source_limit if live_source_requested else history_limit
     if collect_history and effective_history_limit < 0:
         raise HTTPException(422, "Глубина истории должна быть неотрицательной; 0 означает всю доступную историю")
     behavior_only = scenario_mode == "reactive"
     topicless_history_dialogue = scenario_mode == "history_dialogue"
     scenario_topic = "" if behavior_only or topicless_history_dialogue else scenario_topic.strip()
-    if not behavior_only and not scenario_topic and collect_history and not topicless_history_dialogue and not live_source_requested:
+    if not scenario_topic and collect_history and not topicless_history_dialogue and not live_source_requested:
         scenario_topic = "Прозрачный сценарный диалог по общим идеям из недавней истории чата; без имитации участников."
     if len(scenario_topic) > 2000:
         raise HTTPException(422, "Тема или правила сценария: максимум 2000 символов")
@@ -1184,22 +1104,13 @@ async def api_chatfarm_start(
         "proactive_enabled": proactive_enabled is not None,
         "followups_enabled": followups_enabled is not None,
         "followups_max": max(0, min(3, int(followups_max))),
-        "reply_destination": reply_destination,
-        "reply_filter_include": reply_filter_include.strip()[:1000],
-        "reply_filter_exclude": reply_filter_exclude.strip()[:1000],
-        "reply_only_questions": reply_only_questions is not None,
-        "direct_message_acknowledged": _request_bool(direct_message_ack),
-        "automation_acknowledged": _request_bool(automation_ack),
+        "automation_acknowledged": automation_ack is not None,
     }
     # Keep these switches where they are used: the same toggles live in «Поведение».
     await _persist_farm_switches(
         proactive_enabled=proactive_enabled is not None,
         followups_enabled=followups_enabled is not None,
         followups_max=max(0, min(3, int(followups_max))),
-        reply_destination=reply_destination,
-        reply_filter_include=reply_filter_include.strip()[:1000],
-        reply_filter_exclude=reply_filter_exclude.strip()[:1000],
-        reply_only_questions=reply_only_questions is not None,
     )
     history_invite_token = (
         _store_invite_reference(history_source_reference)
@@ -1550,203 +1461,6 @@ async def api_chatfarm_status(web_auth: Optional[str] = Cookie(default=None)):
     _current_owner(web_auth)
     running = FARM_PROCESS is not None and FARM_PROCESS.returncode is None
     return {"running": running, "pid": FARM_PROCESS.pid if running else None}
-
-
-@app.get("/api/chatfarm/runtime")
-async def api_chatfarm_runtime(web_auth: Optional[str] = Cookie(default=None)):
-    _current_owner(web_auth)
-    process = FARM_PROCESS
-    running = process is not None and process.returncode is None
-    status = farm_control.read_status(int(process.pid)) if running and process and process.pid else None
-    status = status or {"ready": False, "supports_hot_control": False, "mode": None, "accounts": [], "settings": {}}
-    active_names = {
-        str(item.get("name"))
-        for item in status.get("accounts", [])
-        if isinstance(item, dict) and item.get("name")
-    }
-    available = []
-    if running and status.get("ready"):
-        for row in await db.list_accounts(enabled_only=True):
-            if (
-                row.get("name") not in active_names
-                and row.get("api_id")
-                and row.get("api_hash")
-                and row.get("session_status") == "authorized"
-            ):
-                available.append({"name": row["name"], "username": row.get("username") or ""})
-    return {
-        **status,
-        "running": running,
-        "pid": process.pid if running and process else None,
-        "available_accounts": available,
-    }
-
-
-@app.post("/api/chatfarm/control")
-async def api_chatfarm_control(request: Request, web_auth: Optional[str] = Cookie(default=None)):
-    _current_owner(web_auth)
-    try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(422, "Ожидается JSON-команда горячего управления") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(422, "Команда должна быть JSON-объектом")
-    action = str(body.get("action") or "").strip()
-    process = FARM_PROCESS
-    if process is None or process.returncode is not None or not process.pid:
-        raise HTTPException(409, "Чат-ферма не запущена")
-    status = farm_control.read_status(int(process.pid))
-    if not status or not status.get("ready"):
-        raise HTTPException(409, "Чат-ферма ещё подключает аккаунты; попробуйте через несколько секунд")
-    if not status.get("supports_hot_control"):
-        raise HTTPException(409, "Горячее управление доступно только в режиме «Без сценария»")
-    active_names = {
-        str(item.get("name"))
-        for item in status.get("accounts", [])
-        if isinstance(item, dict) and item.get("name")
-    }
-    payload: dict[str, Any] = {}
-    timeout = 120.0
-
-    if action == "update_settings":
-        settings = status.get("settings") if isinstance(status.get("settings"), dict) else {}
-        for key in ("min_delay_sec", "max_delay_sec"):
-            if key in body:
-                payload[key] = _runtime_delay(body[key], "Минимальная пауза" if key == "min_delay_sec" else "Максимальная пауза")
-        low = float(payload.get("min_delay_sec", settings.get("min_delay_sec", 2)))
-        high = float(payload.get("max_delay_sec", settings.get("max_delay_sec", 8)))
-        if high < low:
-            raise HTTPException(422, "Максимальная пауза должна быть не меньше минимальной")
-        if "reply_probability_override" in body:
-            raw_override = body.get("reply_probability_override")
-            payload["reply_probability_override"] = (
-                None if raw_override in (None, "", "account")
-                else _probability(raw_override, "Вероятность ответа")
-            )
-        if "reaction_probability" in body:
-            payload["reaction_probability"] = _probability(body["reaction_probability"], "Вероятность реакции")
-        if "proactive_interval_sec" in body:
-            payload["proactive_interval_sec"] = _seconds_field(
-                body["proactive_interval_sec"], "Интервал автономных сообщений", low=60, high=86400
-            )
-        if "reply_destination" in body:
-            destination = str(body.get("reply_destination") or "group").strip().lower()
-            if destination not in {"group", "direct"}:
-                raise HTTPException(422, "Выберите ответы в группе или личные сообщения")
-            payload["reply_destination"] = destination
-        destination = payload.get("reply_destination", settings.get("reply_destination", "group"))
-        payload["direct_message_ack"] = _request_bool(body.get("direct_message_ack"))
-        if destination == "direct" and not payload["direct_message_ack"]:
-            raise HTTPException(422, "Для личных сообщений подтвердите уведомление и согласие участников")
-        for key in ("reply_filter_include", "reply_filter_exclude"):
-            if key in body:
-                value = str(body.get(key) or "")
-                if len(value) > 1000:
-                    raise HTTPException(422, "Каждое поле фильтра может содержать не больше 1000 символов")
-                payload[key] = value.strip()
-        if "reply_only_questions" in body:
-            payload["reply_only_questions"] = _request_bool(body.get("reply_only_questions"))
-        for key in ("proactive_enabled", "followups_enabled", "music_enabled", "video_enabled"):
-            if key in body:
-                payload[key] = _request_bool(body.get(key))
-        if "followups_max" in body:
-            try:
-                value = int(body["followups_max"])
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise HTTPException(422, "Число дополнительных ответов должно быть 0–3") from exc
-            if not 0 <= value <= 3:
-                raise HTTPException(422, "Число дополнительных ответов должно быть 0–3")
-            payload["followups_max"] = value
-        for key, label in (("music_source", "источник музыки"), ("video_source", "источник видео")):
-            if key in body:
-                value = str(body.get(key) or "").strip()
-                if not value and key == "video_source":
-                    payload[key] = ""
-                elif not value:
-                    raise HTTPException(422, f"Укажите {label}")
-                else:
-                    normalized = _normalized_chat_reference(value, label, allow_invite=False)
-                    payload[key] = normalized
-        for key, label in (("music_share_percent", "Доля музыки"), ("video_share_percent", "Доля видео")):
-            if key in body:
-                payload[key] = _percent_field(body[key], label)
-        music_enabled = payload.get("music_enabled", settings.get("music_enabled", False))
-        music_source = payload.get("music_source", settings.get("music_source", ""))
-        video_enabled = payload.get("video_enabled", settings.get("video_enabled", False))
-        video_source = payload.get("video_source", settings.get("video_source", ""))
-        if music_enabled and not music_source:
-            raise HTTPException(422, "Для музыки укажите источник перед включением")
-        if video_enabled and not video_source:
-            raise HTTPException(422, "Для видео укажите источник перед включением")
-        result = await _send_farm_control_command(action, payload)
-        persisted = {key: value for key, value in payload.items() if key != "direct_message_ack"}
-        if persisted:
-            await _persist_farm_switches(**persisted)
-        return {"ok": True, "result": result}
-
-    if action == "add_account":
-        from .manager import validate_session_name
-        try:
-            name = validate_session_name(str(body.get("name") or ""))
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        row = await db.get_account(name)
-        if (
-            not row or not row.get("enabled") or not row.get("api_id") or not row.get("api_hash")
-            or row.get("session_status") != "authorized"
-        ):
-            raise HTTPException(422, f"Аккаунт {name} выключен, не настроен или не авторизован")
-        if name in active_names:
-            raise HTTPException(409, f"Аккаунт {name} уже работает")
-        payload = {"name": name}
-        timeout = 150.0
-    elif action == "remove_account":
-        name = str(body.get("name") or "").strip()
-        if name not in active_names:
-            raise HTTPException(422, "Выберите работающий аккаунт")
-        payload = {"name": name}
-        timeout = 45.0
-    elif action == "send_media":
-        account = str(body.get("account") or "").strip()
-        kind = str(body.get("kind") or "").strip().lower()
-        if account not in active_names or kind not in {"gif", "video", "music"}:
-            raise HTTPException(422, "Выберите активный аккаунт и GIF, видео или музыку")
-        payload = {"account": account, "kind": kind}
-    elif action == "membership":
-        account = str(body.get("account") or "").strip()
-        operation = str(body.get("operation") or "").strip().lower()
-        if account not in active_names or operation not in {"join", "leave"}:
-            raise HTTPException(422, "Выберите активный аккаунт и действие вступить/выйти")
-        reference = _normalized_chat_reference(
-            body.get("chat"), "Чат", allow_invite=operation == "join"
-        )
-        payload = {"account": account, "operation": operation, "chat": reference}
-    elif action == "comment_post":
-        account = str(body.get("account") or "").strip()
-        url = str(body.get("url") or "").strip()
-        comment = str(body.get("comment") or "").strip()
-        include_filter = str(body.get("include_filter") or "")
-        exclude_filter = str(body.get("exclude_filter") or "")
-        if account not in active_names:
-            raise HTTPException(422, "Выберите активный аккаунт")
-        if not url or len(url) > 512:
-            raise HTTPException(422, "Укажите ссылку на пост Telegram (до 512 символов)")
-        if not comment or len(comment) > 4000:
-            raise HTTPException(422, "Текст комментария должен содержать 1–4000 символов")
-        if len(include_filter) > 1000 or len(exclude_filter) > 1000:
-            raise HTTPException(422, "Каждое поле фильтра комментариев может содержать не больше 1000 символов")
-        payload = {
-            "account": account,
-            "url": url,
-            "comment": comment,
-            "include_filter": include_filter.strip(),
-            "exclude_filter": exclude_filter.strip(),
-        }
-    else:
-        raise HTTPException(422, "Неизвестная команда горячего управления")
-
-    result = await _send_farm_control_command(action, payload, timeout=timeout)
-    return {"ok": True, "result": result}
 
 
 @app.get("/api/chatfarm/logs")
@@ -2180,11 +1894,7 @@ async def api_settings_save(
     if model not in {"default", "expert"}:
         raise HTTPException(422, "Режим DeepSeek должен быть default или expert")
     media_bias = _media_weights(media_text, media_gif, media_sticker, media_photo, media_voice)
-    current_settings = load_farm_settings(
-        await db.get_setting("farm_settings", ""), migrate_legacy=True
-    )
     saved = load_farm_settings({
-        **current_settings,
         "agent_prompt": agent_prompt.strip(),
         "min_delay_sec": min_delay_sec,
         "max_delay_sec": max_delay_sec,

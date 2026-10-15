@@ -44,28 +44,6 @@
       </div>
       <div class="notice warning" style="margin:0 0 10px">Автоматизируйте только чат, где у вас есть разрешение, и предупредите участников. Для чата назначения аккаунты должны быть участниками; явное авто-вступление доступно только для источника истории ниже.</div>
       <label class="check-row" style="align-items:flex-start;margin:0 0 16px"><input id="automation_ack" type="checkbox" name="automation_ack" required><span>У меня есть разрешение, я объявил в чате об автоматических сообщениях, выбранные аккаунты состоят в целевом чате и (если включу ниже) могут вступить в чат-источник.</span></label>
-      <details id="response_options" open style="margin:0 0 14px">
-        <summary style="cursor:pointer;color:#b7c8dc;font-weight:700;font-size:13px">Куда отвечать и фильтры</summary>
-        <div class="card compact" style="margin:10px 0;background:rgba(8,15,23,.48)">
-          <div class="field">
-            <label for="reply_destination">Ответ участнику</label>
-            <select id="reply_destination" name="reply_destination" onchange="updateDmConsentFields()">
-              <option value="group" {% if settings.reply_destination != 'direct' %}selected{% endif %}>Ответить в целевой группе реплаем</option>
-              <option value="direct" {% if settings.reply_destination == 'direct' %}selected{% endif %}>Написать автору сообщения в личные сообщения</option>
-            </select>
-            <span class="help">Один ответственный аккаунт; личное сообщение отправляется только автору сообщения в группе, не участникам «вхолодную». Возможность написать зависит от настроек Telegram получателя.</span>
-          </div>
-          <label id="direct_message_ack_row" class="check-row" style="align-items:flex-start" hidden>
-            <input id="direct_message_ack" type="checkbox" name="direct_message_ack" disabled>
-            <span><strong>Подтверждаю уведомление участников и их согласие на личные сообщения</strong><small>Если аккаунт не может написать этому пользователю, сообщение не будет отправлено в группу автоматически.</small></span>
-          </label>
-          <div class="grid-2">
-            <div class="field"><label for="reply_filter_include">Отвечать, если есть любой ключевой фрагмент <span class="subtle">(необязательно)</span></label><textarea id="reply_filter_include" name="reply_filter_include" rows="2" maxlength="1000" placeholder="например: доставка, настройка, вопрос">{{ settings.reply_filter_include }}</textarea><span class="help">Несколько фраз через запятую или с новой строки.</span></div>
-            <div class="field"><label for="reply_filter_exclude">Пропускать при наличии фрагмента <span class="subtle">(необязательно)</span></label><textarea id="reply_filter_exclude" name="reply_filter_exclude" rows="2" maxlength="1000" placeholder="например: реклама, спам">{{ settings.reply_filter_exclude }}</textarea><span class="help">Исключающие фразы проверяются первыми.</span></div>
-          </div>
-          <label class="check-row" style="align-items:flex-start"><input id="reply_only_questions" type="checkbox" name="reply_only_questions" {% if settings.reply_only_questions %}checked{% endif %}><span><strong>Отвечать только на вопросы</strong><small>Вопросы распознаются и без знака «?»; фильтры ключевых фраз применяются дополнительно.</small></span></label>
-        </div>
-      </details>
       <div id="scenario_fields" class="card compact" hidden style="margin:0 0 16px;background:rgba(8,15,23,.48)">
         <div class="field" id="scenario_topic_field">
           <label for="scenario_topic">Общая тема, вопрос или правила игры</label>
@@ -112,14 +90,13 @@
       <p class="help">Время сервера сейчас: <strong>{{ server_utc_now }} UTC</strong>. Ночной режим (окно тишины, время в UTC) настраивается в разделе «Поведение» и действует на ходы, ответы, реакции и автономные сообщения.</p>
         <p id="scenario_runtime_help" class="help">Нет сценарной темы, стартового сообщения и цепочки авто-диалога; используются сохранённые настройки поведения аккаунтов.</p>
       </div>
-      <div id="history_context_mount"></div>
       <div class="field">
         <label>Аккаунты</label>
         <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
           {% for a in accounts %}
             <label class="check-row">
               <input type="checkbox" class="account-choice" value="{{ a.name }}" {% if a.enabled and a.session_status == 'authorized' %}checked{% endif %} {% if not a.enabled or a.session_status != 'authorized' %}disabled{% endif %}>
-              <span><strong>{{ a.name }}</strong> <small>{{ '@' + a.username if a.username else a.phone }} · шанс ответа {{ ((settings.reply_probability_override if settings.reply_probability_override is not none else (a.reply_probability if a.behavior_customized else settings.default_reply_probability)) * 100)|round|int }}%</small></span>
+              <span><strong>{{ a.name }}</strong> <small>{{ '@' + a.username if a.username else a.phone }} · шанс ответа {{ ((a.reply_probability if a.behavior_customized else settings.default_reply_probability) * 100)|round|int }}%</small></span>
               <span class="badge {{ 'badge-authorized' if a.session_status == 'authorized' else 'badge-unauthorized' }}" style="margin-left:auto">{{ 'готов' if a.session_status == 'authorized' else 'нужен вход' }}</span>
             </label>
           {% endfor %}
@@ -176,84 +153,6 @@
     <div id="farm_output" class="notice" hidden style="margin-top:14px"></div>
   </section>
 
-  <section id="farm_runtime_controls" class="card" hidden style="grid-column:1 / -1">
-    <div class="card-head">
-      <div><h2>Управление без остановки</h2><p id="runtime_summary" class="subtle">Настройки и действия применяются к работающим сессиям; публикация идёт только в целевой чат.</p></div>
-      <button class="secondary small" type="button" onclick="refreshRuntimeControls()">Обновить список</button>
-    </div>
-    <div class="grid-2">
-      <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
-        <h3 style="margin:0 0 10px">Аккаунты</h3>
-        <div class="grid-2">
-          <div class="field"><label for="runtime_add_account">Добавить уже авторизованный аккаунт</label><select id="runtime_add_account"></select><button class="secondary small" type="button" onclick="changeRuntimeAccount('add')">＋ Добавить в ферму</button><span class="help">Здесь можно добавить включённую, уже авторизованную сессию. Первичный вход нового аккаунта и правки .session доступны после остановки.</span></div>
-          <div class="field"><label for="runtime_remove_account">Убрать из фермы</label><select id="runtime_remove_account"></select><button class="secondary small" type="button" onclick="changeRuntimeAccount('remove')">− Убрать аккаунт</button><span class="help">Ферма должна сохранить хотя бы один активный аккаунт.</span></div>
-        </div>
-      </div>
-      <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
-        <h3 style="margin:0 0 10px">Настройки ответов</h3>
-        <div class="grid-2">
-          <div class="field"><label for="runtime_min_delay">Мин. пауза, сек</label><input id="runtime_min_delay" type="number" min="0" max="86400" step="0.5"></div>
-          <div class="field"><label for="runtime_max_delay">Макс. пауза, сек</label><input id="runtime_max_delay" type="number" min="0" max="86400" step="0.5"></div>
-          <div class="field"><label for="runtime_reply_mode">Шанс ответа</label><select id="runtime_reply_mode" onchange="updateRuntimeReplyMode()"><option value="account">Индивидуальный у каждого аккаунта</option><option value="uniform">Одинаковый для работающих аккаунтов</option></select></div>
-          <div class="field"><label for="runtime_reply_probability">Общий шанс, %</label><input id="runtime_reply_probability" type="number" min="0" max="100" step="1" disabled></div>
-          <div class="field"><label for="runtime_reply_destination">Куда отправлять ответы</label><select id="runtime_reply_destination" onchange="updateRuntimeDmConsent()"><option value="group">В группу, реплаем</option><option value="direct">В личные сообщения автору</option></select></div>
-          <label id="runtime_dm_consent_row" class="check-row" style="align-items:flex-start" hidden><input id="runtime_dm_consent" type="checkbox"><span><strong>Участники уведомлены и согласны на DM</strong><small>Без согласия личные сообщения не включайте.</small></span></label>
-          <div class="field"><label for="runtime_include_filter">Включающий фильтр фраз</label><textarea id="runtime_include_filter" rows="2" maxlength="1000" placeholder="необязательно"></textarea></div>
-          <div class="field"><label for="runtime_exclude_filter">Исключающий фильтр фраз</label><textarea id="runtime_exclude_filter" rows="2" maxlength="1000" placeholder="необязательно"></textarea></div>
-        </div>
-        <label class="check-row"><input id="runtime_questions_only" type="checkbox"><span><strong>Отвечать только на вопросы</strong></span></label>
-        <div class="grid-2" style="margin-top:8px">
-          <div class="field"><label for="runtime_music_source">Источник музыки</label><input id="runtime_music_source" maxlength="512" placeholder="@username или ID"></div>
-          <div class="field"><label for="runtime_video_source">Источник видео</label><input id="runtime_video_source" maxlength="512" placeholder="@username или ID"></div>
-        </div>
-        <div class="grid-2">
-          <div class="field"><label for="runtime_music_share">Доля музыки, %</label><input id="runtime_music_share" type="number" min="0" max="100" step="1"></div>
-          <div class="field"><label for="runtime_video_share">Доля видео, %</label><input id="runtime_video_share" type="number" min="0" max="100" step="1"></div>
-        </div>
-        <div class="grid-2">
-          <label class="check-row"><input id="runtime_music_enabled" type="checkbox"><span>Музыка также участвует в авто-выборе</span></label>
-          <label class="check-row"><input id="runtime_video_enabled" type="checkbox"><span>Видео также участвует в авто-выборе</span></label>
-        </div>
-        <div class="grid-2">
-          <label class="check-row"><input id="runtime_proactive_enabled" type="checkbox"><span>Автономные сообщения</span></label>
-          <label class="check-row"><input id="runtime_followups_enabled" type="checkbox"><span>Короткие дополнительные ответы</span></label>
-        </div>
-        <div class="grid-2">
-          <div class="field"><label for="runtime_followups_max">Максимум дополнительных ответов (0–3)</label><input id="runtime_followups_max" type="number" min="0" max="3" step="1"></div>
-          <div class="field"><label for="runtime_reaction_probability">Вероятность реакции (0–1)</label><input id="runtime_reaction_probability" type="number" min="0" max="1" step="0.05"></div>
-          <div class="field"><label for="runtime_proactive_interval">Интервал автономных сообщений, сек</label><input id="runtime_proactive_interval" type="number" min="60" max="86400" step="60"></div>
-        </div>
-        <button class="secondary" type="button" onclick="saveRuntimeSettings()">Сохранить и применить сейчас</button>
-      </div>
-      <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
-        <h3 style="margin:0 0 10px">Отправить медиа в цель</h3>
-        <div class="field"><label for="runtime_media_account">Аккаунт-отправитель</label><select id="runtime_media_account"></select></div>
-        <div class="actions"><button class="secondary" type="button" onclick="sendRuntimeMedia('gif')">GIF</button><button class="secondary" type="button" onclick="sendRuntimeMedia('video')">Видео</button><button class="secondary" type="button" onclick="sendRuntimeMedia('music')">Музыка</button></div>
-        <p class="help">Видео и музыка скачиваются из настроенного источника и загружаются заново клиентом выбранного аккаунта — не пересылаются. Результат отправляется в целевой чат.</p>
-      </div>
-      <div class="card compact" style="margin:0;background:rgba(8,15,23,.48)">
-        <h3 style="margin:0 0 10px">Вступить в группу или выйти</h3>
-        <div class="field"><label for="runtime_membership_account">Аккаунт</label><select id="runtime_membership_account"></select></div>
-        <div class="field"><label for="runtime_membership_chat">Username, ID или invite-ссылка</label><input id="runtime_membership_chat" maxlength="512" placeholder="@groupname или ссылка t.me"></div>
-        <div class="actions"><button class="secondary" type="button" onclick="changeMembership('join')">Вступить</button><button class="secondary" type="button" onclick="changeMembership('leave')">Выйти</button></div>
-        <p class="help">Нельзя выйти из текущего целевого чата или используемого live-источника. Источник live-режима остаётся только для чтения.</p>
-      </div>
-      <div class="card compact" style="margin:0;background:rgba(8,15,23,.48);grid-column:1 / -1">
-        <h3 style="margin:0 0 10px">Комментарий по ссылке</h3>
-        <div class="grid-2">
-          <div class="field"><label for="runtime_comment_account">Аккаунт</label><select id="runtime_comment_account"></select></div>
-          <div class="field"><label for="runtime_comment_url">Ссылка на пост Telegram</label><input id="runtime_comment_url" maxlength="512" placeholder="https://t.me/channel/123"></div>
-          <div class="field"><label for="runtime_comment_include">Комментировать, если в посте есть фраза <span class="subtle">(необязательно)</span></label><textarea id="runtime_comment_include" rows="2" maxlength="1000"></textarea></div>
-          <div class="field"><label for="runtime_comment_exclude">Пропустить пост при фразе <span class="subtle">(необязательно)</span></label><textarea id="runtime_comment_exclude" rows="2" maxlength="1000"></textarea></div>
-        </div>
-        <div class="field"><label for="runtime_comment_text">Комментарий</label><textarea id="runtime_comment_text" rows="3" maxlength="4000" placeholder="Короткий комментарий по делу"></textarea></div>
-        <button class="secondary" type="button" onclick="commentByLink()">Проверить фильтры и отправить в целевой чат</button>
-        <p class="help">Можно комментировать пост в целевой группе или пост канала, связанного с целевой группой. Комментарии к live-источнику не отправляются.</p>
-      </div>
-    </div>
-    <div id="runtime_output" class="notice" hidden style="margin-top:12px"></div>
-  </section>
-
   <section class="card" style="display:flex;flex-direction:column;min-height:580px">
     <div class="card-head">
       <div><h2>Лог работы</h2><p class="subtle">Сюда попадают подключения, полученные сообщения и результаты отправки.</p></div>
@@ -269,146 +168,10 @@ let logsTimer;
 let farmStartPending = false;
 let delayTouched = false;
 let turnsTouched = false;
-let runtimePid = null;
-let runtimeRefreshBusy = false;
-let runtimeCommandBusy = false;
-let runtimeSettingsLoaded = false;
 const reactiveDelayDefaults = {
   min: {{ settings.min_delay_sec|tojson }},
   max: {{ settings.max_delay_sec|tojson }},
 };
-function updateDmConsentFields() {
-  const destination = document.getElementById('reply_destination');
-  const row = document.getElementById('direct_message_ack_row');
-  const input = document.getElementById('direct_message_ack');
-  if (!destination || !row || !input) return;
-  const direct = destination.value === 'direct';
-  row.hidden = !direct;
-  input.disabled = !direct;
-  input.required = direct;
-}
-function updateRuntimeDmConsent() {
-  const direct = document.getElementById('runtime_reply_destination')?.value === 'direct';
-  const row = document.getElementById('runtime_dm_consent_row');
-  const input = document.getElementById('runtime_dm_consent');
-  if (!row || !input) return;
-  row.hidden = !direct;
-  input.disabled = !direct;
-}
-function updateRuntimeReplyMode() {
-  const uniform = document.getElementById('runtime_reply_mode')?.value === 'uniform';
-  const input = document.getElementById('runtime_reply_probability');
-  if (input) input.disabled = !uniform;
-}
-function runtimeMessage(text, kind = '') {
-  const output = document.getElementById('runtime_output');
-  showMessage(output, text, kind);
-}
-async function sendRuntimeCommand(action, payload = {}) {
-  if (runtimeCommandBusy) throw new Error('Дождитесь завершения предыдущей команды.');
-  runtimeCommandBusy = true;
-  try {
-    const response = await fetch('/api/chatfarm/control', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action, ...payload}),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Не удалось применить команду');
-    return data.result || {};
-  } finally {
-    runtimeCommandBusy = false;
-  }
-}
-function setSelectOptions(selectId, rows, labelFn, preferred = '') {
-  const select = document.getElementById(selectId);
-  if (!select) return;
-  const oldValue = preferred || select.value;
-  select.replaceChildren();
-  for (const row of rows) {
-    const option = document.createElement('option');
-    option.value = row.name;
-    option.textContent = labelFn(row);
-    select.appendChild(option);
-  }
-  if (!rows.length) {
-    const option = document.createElement('option');
-    option.value = '';
-    option.textContent = 'Нет доступных аккаунтов';
-    select.appendChild(option);
-    select.disabled = true;
-    return;
-  }
-  select.disabled = false;
-  if (rows.some(row => row.name === oldValue)) select.value = oldValue;
-}
-async function refreshRuntimeControls(force = false) {
-  if (runtimeRefreshBusy) return;
-  runtimeRefreshBusy = true;
-  try {
-    const response = await fetch('/api/chatfarm/runtime');
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Не удалось получить состояние фермы');
-    const panel = document.getElementById('farm_runtime_controls');
-    if (!data.running) {
-      panel.hidden = true;
-      runtimePid = null;
-      runtimeSettingsLoaded = false;
-      return;
-    }
-    panel.hidden = false;
-    const settings = data.settings || {};
-    const active = Array.isArray(data.accounts) ? data.accounts : [];
-    const available = Array.isArray(data.available_accounts) ? data.available_accounts : [];
-    const summary = document.getElementById('runtime_summary');
-    if (!data.ready) {
-      summary.textContent = `PID ${data.pid}: аккаунты ещё подключаются; управление появится после готовности.`;
-      panel.querySelectorAll('button, input, select, textarea').forEach(control => { control.disabled = true; });
-      return;
-    }
-    if (!data.supports_hot_control) {
-      summary.textContent = 'Горячее управление доступно только при запуске «Без сценария». Остановите этот сценарий, чтобы переключить режим.';
-      panel.querySelectorAll('button, input, select, textarea').forEach(control => { control.disabled = true; });
-      return;
-    }
-    panel.querySelectorAll('button, input, select, textarea').forEach(control => { control.disabled = false; });
-    summary.textContent = `Без сценария · цель ${data.target_chat_id} · работает аккаунтов: ${active.length}. Все ручные публикации направляются в цель.`;
-    setSelectOptions('runtime_add_account', available, row => `${row.name}${row.username ? ` · @${row.username}` : ''}`);
-    setSelectOptions('runtime_remove_account', active, row => row.name);
-    for (const id of ['runtime_media_account', 'runtime_membership_account', 'runtime_comment_account']) {
-      setSelectOptions(id, active, row => row.name);
-    }
-    if (force || runtimePid !== data.pid || !runtimeSettingsLoaded) {
-      document.getElementById('runtime_min_delay').value = settings.min_delay_sec ?? 2;
-      document.getElementById('runtime_max_delay').value = settings.max_delay_sec ?? 8;
-      document.getElementById('runtime_reply_mode').value = settings.reply_probability_override == null ? 'account' : 'uniform';
-      document.getElementById('runtime_reply_probability').value = Math.round(Number(settings.reply_probability_override ?? settings.default_reply_probability ?? 0.25) * 100);
-      document.getElementById('runtime_reply_destination').value = settings.reply_destination || 'group';
-      document.getElementById('runtime_include_filter').value = settings.reply_filter_include || '';
-      document.getElementById('runtime_exclude_filter').value = settings.reply_filter_exclude || '';
-      document.getElementById('runtime_questions_only').checked = Boolean(settings.reply_only_questions);
-      document.getElementById('runtime_music_source').value = settings.music_source || '';
-      document.getElementById('runtime_video_source').value = settings.video_source || '';
-      document.getElementById('runtime_music_share').value = settings.music_share_percent ?? 0;
-      document.getElementById('runtime_video_share').value = settings.video_share_percent ?? 0;
-      document.getElementById('runtime_music_enabled').checked = Boolean(settings.music_enabled);
-      document.getElementById('runtime_video_enabled').checked = Boolean(settings.video_enabled);
-      document.getElementById('runtime_proactive_enabled').checked = Boolean(settings.proactive_enabled);
-      document.getElementById('runtime_followups_enabled').checked = Boolean(settings.followups_enabled);
-      document.getElementById('runtime_followups_max').value = settings.followups_max ?? 1;
-      document.getElementById('runtime_reaction_probability').value = settings.reaction_probability ?? 0.35;
-      document.getElementById('runtime_proactive_interval').value = settings.proactive_interval_sec ?? 300;
-      updateRuntimeReplyMode();
-      updateRuntimeDmConsent();
-      runtimePid = data.pid;
-      runtimeSettingsLoaded = true;
-    }
-  } catch (error) {
-    console.error('farm runtime controls', error);
-  } finally {
-    runtimeRefreshBusy = false;
-  }
-}
 function updateScenarioForm() {
   const selector = document.getElementById('scenario_mode');
   if (!selector) return;
@@ -418,16 +181,15 @@ function updateScenarioForm() {
   const historyDialogue = mode === 'history_dialogue';
   const roulette = mode === 'roulette';
   const supportsHistory = mode === 'discussion' || combined || historyDialogue;
-  const canUseHistory = supportsHistory || mode === 'reactive';
   const liveSourceToggle = document.getElementById('live_source_enabled');
   if (mode !== 'reactive') liveSourceToggle.checked = false;
   liveSourceToggle.disabled = mode !== 'reactive';
   const liveSourceEnabled = mode === 'reactive' && liveSourceToggle.checked;
   const historyCheckbox = document.getElementById('collect_context_history');
   if (historyDialogue) historyCheckbox.checked = true;
-  else if (!canUseHistory) historyCheckbox.checked = false;
+  else if (!supportsHistory) historyCheckbox.checked = false;
   historyCheckbox.disabled = historyDialogue;
-  const useHistory = canUseHistory && historyCheckbox.checked;
+  const useHistory = supportsHistory && historyCheckbox.checked;
   const scenarioTopic = document.getElementById('scenario_topic');
   const postOpening = document.getElementById('post_opening');
   if (mode === 'reactive') {
@@ -440,7 +202,7 @@ function updateScenarioForm() {
   }
   document.getElementById('scenario_fields').hidden = !active;
   document.getElementById('roulette_fields').hidden = !roulette;
-  document.getElementById('history_context_fields').hidden = !canUseHistory;
+  document.getElementById('history_context_fields').hidden = !supportsHistory;
   document.getElementById('history_context_options').hidden = !useHistory;
   document.getElementById('scenario_topic_field').hidden = historyDialogue;
   document.getElementById('post_opening_row').hidden = historyDialogue;
@@ -482,8 +244,6 @@ function updateScenarioForm() {
   }
   document.getElementById('scenario_mode_help').textContent = liveSourceEnabled
     ? 'Режим без сценария с включённым источником: AI подготовит фиксированный план до старта, затем будет пополнять его по новым сообщениям группы. Посты идут только в целевой чат.'
-    : mode === 'reactive' && useHistory
-      ? 'Без сценария: перед запуском соберём обезличенную историю и будем использовать её только как контекст для ответов. Цепочка авто-диалога не включается.'
     : historyDialogue
       ? 'Нужны только целевой чат, источник истории и глубина сбора. Источник укажите отдельно, даже если это тот же чат. Контекст собирается заранее; общая тема и настройки анекдотов/пауз не требуются. Администратор для чтения не нужен.'
     : combined
@@ -497,8 +257,6 @@ function updateScenarioForm() {
     ? 'AI-план и новые ходы публикуются только в целевой чат с паузой от 15 секунд. Источник только читается. Чтобы не перегружать чат, автономный таймер, простои и случайные реакции вне плана отключены; ответы на вопросы участников цели остаются активны.'
     : historyDialogue
     ? 'Общая тема и стартовая публикация отключены. Анекдоты и длинные паузы работают как обычно. Аккаунты общаются сообщениями из собранной истории своего участника — коротко и разговорно, с опечатками и смайлами, плюс гифки, стикеры, фото, видео и голосовые. Работает и без DeepSeek: реплики берутся из назначенного архива. Ответы на вопросы живых участников и реакции остаются активны; роли синтетические, стиль реальных авторов не копируется.'
-    : mode === 'reactive' && useHistory
-      ? 'Сценария нет: архивная история используется как контекст при ответе участникам, без самостоятельных ходов. Если источник пустой, собирается история целевого чата.'
     : combined
       ? 'Сообщения в выбранной теме попадают в контекст. Вопросы и просьбы распознаются по смыслу — знак вопроса не обязателен; один случайный аккаунт может ответить реплаем. Обычные сообщения остаются контекстом без автоматического ответа. После лимита диалога ответы продолжаются до ручной остановки.'
       : roulette
@@ -529,8 +287,6 @@ function updateScenarioForm() {
         : 'Задержка перед ответом на входящее сообщение.';
   document.getElementById('btn_start_farm').textContent = liveSourceEnabled
     ? '▶ Собрать сообщения, подготовить AI-план и запустить'
-    : mode === 'reactive' && useHistory
-      ? '▶ Собрать историю и запустить без сценария'
     : historyDialogue
       ? '▶ Собрать историю и запустить диалог'
       : combined
@@ -541,114 +297,11 @@ function updateScenarioForm() {
           ? '▶ Запустить диалог по теме'
           : '▶ Запустить без сценария';
 }
-async function changeRuntimeAccount(operation) {
-  const add = operation === 'add';
-  const select = document.getElementById(add ? 'runtime_add_account' : 'runtime_remove_account');
-  const name = select?.value || '';
-  if (!name) return runtimeMessage('Выберите аккаунт.', 'warning');
-  if (!add && !confirm(`Убрать ${name} из работающей фермы?`)) return;
-  try {
-    runtimeMessage(add ? `Подключаю ${name}…` : `Отключаю ${name}…`, '');
-    const result = await sendRuntimeCommand(add ? 'add_account' : 'remove_account', {name});
-    runtimeMessage(add ? `Аккаунт ${name} подключён без остановки.` : `Аккаунт ${name} убран без остановки.`, 'success');
-    await refreshRuntimeControls(true);
-  } catch (error) { runtimeMessage(error.message, 'error'); }
-}
-async function saveRuntimeSettings() {
-  const minDelay = Number(document.getElementById('runtime_min_delay').value);
-  const maxDelay = Number(document.getElementById('runtime_max_delay').value);
-  if (!Number.isFinite(minDelay) || !Number.isFinite(maxDelay) || minDelay < 0 || maxDelay < minDelay) {
-    return runtimeMessage('Проверьте диапазон паузы: максимум не меньше минимума.', 'error');
-  }
-  const destination = document.getElementById('runtime_reply_destination').value;
-  const directAck = document.getElementById('runtime_dm_consent').checked;
-  if (destination === 'direct' && !directAck) {
-    return runtimeMessage('Для DM подтвердите уведомление и согласие участников.', 'error');
-  }
-  const mode = document.getElementById('runtime_reply_mode').value;
-  const replyProbability = Number(document.getElementById('runtime_reply_probability').value);
-  if (mode === 'uniform' && (!Number.isFinite(replyProbability) || replyProbability < 0 || replyProbability > 100)) {
-    return runtimeMessage('Общий шанс ответа должен быть от 0 до 100%.', 'error');
-  }
-  const payload = {
-    min_delay_sec: minDelay,
-    max_delay_sec: maxDelay,
-    reply_probability_override: mode === 'uniform' ? replyProbability / 100 : null,
-    reply_destination: destination,
-    direct_message_ack: directAck,
-    reply_filter_include: document.getElementById('runtime_include_filter').value,
-    reply_filter_exclude: document.getElementById('runtime_exclude_filter').value,
-    reply_only_questions: document.getElementById('runtime_questions_only').checked,
-    music_source: document.getElementById('runtime_music_source').value,
-    video_source: document.getElementById('runtime_video_source').value,
-    music_share_percent: Number(document.getElementById('runtime_music_share').value),
-    video_share_percent: Number(document.getElementById('runtime_video_share').value),
-    music_enabled: document.getElementById('runtime_music_enabled').checked,
-    video_enabled: document.getElementById('runtime_video_enabled').checked,
-    proactive_enabled: document.getElementById('runtime_proactive_enabled').checked,
-    proactive_interval_sec: Number(document.getElementById('runtime_proactive_interval').value),
-    reaction_probability: Number(document.getElementById('runtime_reaction_probability').value),
-    followups_enabled: document.getElementById('runtime_followups_enabled').checked,
-    followups_max: Number(document.getElementById('runtime_followups_max').value),
-  };
-  try {
-    runtimeMessage('Применяю настройки к работающим аккаунтам…', '');
-    const result = await sendRuntimeCommand('update_settings', payload);
-    const warnings = result.media_warnings?.length ? ` Предупреждения по медиа: ${result.media_warnings.join('; ')}` : '';
-    runtimeMessage(`Настройки сохранены и применены.${warnings}`, result.media_warnings?.length ? 'warning' : 'success');
-    await refreshRuntimeControls(true);
-  } catch (error) { runtimeMessage(error.message, 'error'); }
-}
-async function sendRuntimeMedia(kind) {
-  const account = document.getElementById('runtime_media_account').value;
-  if (!account) return runtimeMessage('Выберите аккаунт-отправитель.', 'warning');
-  try {
-    runtimeMessage(`Отправляю ${kind} от ${account} в целевой чат…`, '');
-    await sendRuntimeCommand('send_media', {account, kind});
-    runtimeMessage(`${kind.toUpperCase()} отправлен от ${account} в целевой чат.`, 'success');
-    setTimeout(loadLogs, 300);
-  } catch (error) { runtimeMessage(error.message, 'error'); }
-}
-async function changeMembership(operation) {
-  const account = document.getElementById('runtime_membership_account').value;
-  const chat = document.getElementById('runtime_membership_chat').value.trim();
-  if (!account || !chat) return runtimeMessage('Выберите аккаунт и укажите группу.', 'warning');
-  if (operation === 'leave' && !confirm(`Аккаунт ${account} выйдет из ${chat}?`)) return;
-  try {
-    runtimeMessage(operation === 'join' ? `Вступаю в ${chat}…` : `Выхожу из ${chat}…`, '');
-    const result = await sendRuntimeCommand('membership', {account, operation, chat});
-    runtimeMessage(result.already ? `${account} уже состоит в группе.` : `${operation === 'join' ? 'Вступил в' : 'Вышел из'} ${result.title || chat}.`, 'success');
-    setTimeout(loadLogs, 300);
-  } catch (error) { runtimeMessage(error.message, 'error'); }
-}
-async function commentByLink() {
-  const account = document.getElementById('runtime_comment_account').value;
-  const url = document.getElementById('runtime_comment_url').value.trim();
-  const comment = document.getElementById('runtime_comment_text').value.trim();
-  if (!account || !url || !comment) return runtimeMessage('Укажите аккаунт, ссылку и текст комментария.', 'warning');
-  try {
-    runtimeMessage('Проверяю пост и фильтры…', '');
-    const result = await sendRuntimeCommand('comment_post', {
-      account,
-      url,
-      comment,
-      include_filter: document.getElementById('runtime_comment_include').value,
-      exclude_filter: document.getElementById('runtime_comment_exclude').value,
-    });
-    if (result.skipped) runtimeMessage(result.reason || 'Пост не прошёл фильтры; комментарий не отправлен.', 'warning');
-    else runtimeMessage(`Комментарий отправлен в целевой чат от ${account}.`, 'success');
-    setTimeout(loadLogs, 300);
-  } catch (error) { runtimeMessage(error.message, 'error'); }
-}
 document.getElementById('min_delay')?.addEventListener('input', () => { delayTouched = true; });
 document.getElementById('max_delay')?.addEventListener('input', () => { delayTouched = true; });
 document.getElementById('scenario_turns')?.addEventListener('input', () => { turnsTouched = true; });
-const historyFields = document.getElementById('history_context_fields');
-const historyMount = document.getElementById('history_context_mount');
-if (historyFields && historyMount) historyMount.appendChild(historyFields);
 document.getElementById('collect_context_history')?.addEventListener('change', updateScenarioForm);
 document.getElementById('live_source_enabled')?.addEventListener('change', updateScenarioForm);
-document.getElementById('reply_destination')?.addEventListener('change', updateDmConsentFields);
 function updateSelectedAccounts() {
   const names = [...document.querySelectorAll('.account-choice:checked')].map(item => item.value);
   const target = document.getElementById('selected_accounts');
@@ -662,7 +315,6 @@ function updateSelectedAccounts() {
 }
 document.querySelectorAll('.account-choice').forEach(item => item.addEventListener('change', updateSelectedAccounts));
 updateSelectedAccounts();
-updateDmConsentFields();
 updateScenarioForm();
 
 async function checkStatus() {
@@ -679,7 +331,6 @@ async function checkStatus() {
       badge.className = 'badge badge-pending'; badge.textContent = '○ Остановлено';
       stop.hidden = true; if (start) start.disabled = farmStartPending;
     }
-    refreshRuntimeControls();
   } catch (error) { console.error('farm status', error); }
 }
 async function loadLogs() {

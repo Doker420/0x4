@@ -62,12 +62,6 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.db_patcher.stop()
         self.tempdir.cleanup()
 
-    async def test_behavior_only_loads_history_only_when_requested_for_the_run(self):
-        self.assertFalse(farm._should_load_archived_context("reactive", False, False))
-        self.assertTrue(farm._should_load_archived_context("reactive", False, True))
-        self.assertTrue(farm._should_load_archived_context("reactive", True, False))
-        self.assertTrue(farm._should_load_archived_context("history_dialogue", False, False))
-
     async def test_behavior_only_runtime_clears_saved_scenario_topic_and_opening(self):
         with patch.dict(os.environ, {
             "FARM_OVERRIDE_SCENARIO_MODE": "reactive",
@@ -114,26 +108,6 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settings["followups_enabled"])
         self.assertEqual(settings["followups_max"], 1)
         self.assertEqual(config["farm"]["proactive_interval_sec"], 300)
-
-    async def test_reply_override_and_destination_feed_every_active_account(self):
-        await db.set_setting("farm_settings", json.dumps({
-            "reply_probability_override": 0.6,
-            "reply_destination": "direct",
-            "reply_filter_include": "support, help",
-            "reply_filter_exclude": "spam",
-            "reply_only_questions": True,
-        }))
-        with patch.dict(os.environ, {
-            "FARM_OVERRIDE_SCENARIO_MODE": "reactive",
-            "FARM_OVERRIDE_SCENARIO_TOPIC": "",
-        }):
-            config, settings = await farm._load_runtime_config()
-
-        self.assertEqual(settings["reply_destination"], "direct")
-        self.assertEqual(settings["reply_filter_include"], "support, help")
-        self.assertTrue(settings["reply_only_questions"])
-        self.assertEqual([item["reply_probability"] for item in config["accounts"]], [0.6, 0.6])
-        self.assertEqual([item["_configured_reply_probability"] for item in config["accounts"]], [0.75, 0.25])
 
     async def test_live_source_runtime_validates_plan_path_and_distinct_chat(self):
         with tempfile.TemporaryDirectory() as tempdir:

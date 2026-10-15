@@ -24,7 +24,6 @@ __pycache__/
 
 # Uploaded archives / local databases
 Fix1.zip*
-/0x4-fixed-source.zip
 /0x4-telegram-control-panel.zip
 *.db
 *.db-shm

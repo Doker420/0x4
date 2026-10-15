@@ -35,34 +35,6 @@ class ConfigTests(unittest.TestCase):
         settings = load_farm_settings({"scenario_mode": "history_dialogue"})
         self.assertEqual(settings["scenario_mode"], "history_dialogue")
 
-    def test_live_reply_controls_are_sanitized(self):
-        defaults = load_farm_settings({})
-        self.assertIsNone(defaults["reply_probability_override"])
-        self.assertEqual(defaults["reply_destination"], "group")
-        self.assertFalse(defaults["reply_only_questions"])
-
-        settings = load_farm_settings({
-            "reply_probability_override": "1.5",
-            "reply_destination": "DIRECT",
-            "reply_filter_include": " help,\nsetup ",
-            "reply_filter_exclude": "spam",
-            "reply_only_questions": "on",
-        })
-        self.assertEqual(settings["reply_probability_override"], 1.0)
-        self.assertEqual(settings["reply_destination"], "direct")
-        self.assertEqual(settings["reply_filter_include"], "help,\nsetup")
-        self.assertEqual(settings["reply_filter_exclude"], "spam")
-        self.assertTrue(settings["reply_only_questions"])
-
-        invalid = load_farm_settings({
-            "reply_probability_override": "not-a-number",
-            "reply_destination": "outside",
-            "reply_filter_include": "x" * 1200,
-        })
-        self.assertIsNone(invalid["reply_probability_override"])
-        self.assertEqual(invalid["reply_destination"], "group")
-        self.assertEqual(len(invalid["reply_filter_include"]), 1000)
-
     def test_scenario_settings_are_sanitized(self):
         settings = load_farm_settings({
             "scenario_mode": "unknown",
