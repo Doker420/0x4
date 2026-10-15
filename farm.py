@@ -33,12 +33,13 @@ import socket
 import sys
 import tempfile
 import time
+from urllib.parse import unquote, urlparse
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from web import source_scenario
+from web import farm_control, source_scenario
 from web.config import (
     DICE_EMOJI,
     POPULAR_EMOJI,
@@ -2272,6 +2273,28 @@ DEFAULT_SYNTHETIC_STYLES = (
 )
 
 
+def reply_message_passes_filters(text: str, is_question: bool, settings: Mapping[str, Any]) -> bool:
+    """Apply the optional live reply filters to one incoming group message."""
+    if settings.get("reply_only_questions") and not is_question:
+        return False
+    normalized = str(text or "").casefold()
+    included = [
+        item.strip().casefold()
+        for item in re.split(r"[,;\n]+", str(settings.get("reply_filter_include") or ""))
+        if item.strip()
+    ]
+    excluded = [
+        item.strip().casefold()
+        for item in re.split(r"[,;\n]+", str(settings.get("reply_filter_exclude") or ""))
+        if item.strip()
+    ]
+    if included and not any(item in normalized for item in included):
+        return False
+    if excluded and any(item in normalized for item in excluded):
+        return False
+    return True
+
+
 class FarmAccount:
     def __init__(self, cfg, bridge, state, donor, farm_accounts_ref):
         self.cfg = cfg
@@ -2288,10 +2311,17 @@ class FarmAccount:
         )
         self.persona: str = configured_persona or f"Синтетическая роль {role_digest[:8]}: {default_role}"
         try:
-            self.reply_probability = max(0.0, min(1.0, float(cfg.get("reply_probability", 0.25))))
+            self.configured_reply_probability = max(
+                0.0, min(1.0, float(cfg.get("_configured_reply_probability", cfg.get("reply_probability", 0.25))))
+            )
         except (TypeError, ValueError):
-            self.reply_probability = 0.25
+            self.configured_reply_probability = 0.25
+        try:
+            self.reply_probability = max(0.0, min(1.0, float(cfg.get("reply_probability", self.configured_reply_probability))))
+        except (TypeError, ValueError):
+            self.reply_probability = self.configured_reply_probability
         self.media_bias = normalize_media_bias(cfg.get("media_bias"))
+        self.base_bridge = bridge
         session_factory = getattr(bridge, "session", None)
         if callable(session_factory):
             chat_scope = f"{FARM_CFG.get('target_chat_id', 'default')}:{FARM_CFG.get('topic_id') or 0}"
@@ -2303,6 +2333,7 @@ class FarmAccount:
         self.farm_accounts = farm_accounts_ref
         self.user_id: int | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        self._dm_states: dict[int, FarmState] = {}
 
         session_string = os.getenv(f"SESSION_{self.name.upper()}")
         client_kwargs: dict[str, Any] = {
@@ -2401,6 +2432,7 @@ class FarmAccount:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        self._dm_states.clear()
         await self._close_client_connection()
 
     async def _close_client_connection(self) -> None:
@@ -2414,7 +2446,8 @@ class FarmAccount:
 
     async def _on_incoming(self, client: Client, message: TGMessage) -> None:
         del client
-        scenario_mode = FARM_CFG.get("farm", {}).get("scenario_mode", "reactive")
+        farm_cfg = FARM_CFG.get("farm", {})
+        scenario_mode = farm_cfg.get("scenario_mode", "reactive")
         if scenario_mode not in {"reactive", "combined", "history_dialogue"}:
             return
         if not message or getattr(message, "empty", False) or getattr(message, "service", None):
@@ -2475,6 +2508,9 @@ class FarmAccount:
         if scenario_mode in {"combined", "history_dialogue"} and not is_question:
             log.info("[%s] входящее сообщение %s сохранено как контекст; вопрос не распознан", self.name, message.id)
             return
+        if not reply_message_passes_filters(text, is_question, farm_cfg):
+            log.info("[%s] входящее сообщение %s пропущено фильтрами ответа", self.name, message.id)
+            return
 
         candidates = [account for account in self.farm_accounts if account._running]
         if not candidates:
@@ -2491,9 +2527,15 @@ class FarmAccount:
         if not is_question and random.random() >= response_probability:
             log.info("[%s] обычное сообщение %s пропущено по настроенной вероятности", responder.name, message.id)
             return
-        log.info("[%s] ответ на сообщение %s запланирован реплаем", responder.name, message.id)
+        destination = str(farm_cfg.get("reply_destination") or "group")
+        if destination == "direct":
+            log.info("[%s] ответ на сообщение %s запланирован в личные сообщения", responder.name, message.id)
+            coroutine = responder._answer_direct_message(message, text)
+        else:
+            log.info("[%s] ответ на сообщение %s запланирован реплаем в группе", responder.name, message.id)
+            coroutine = responder._answer_with_followups(message, text, candidates, is_question=is_question)
         task = asyncio.create_task(
-            responder._answer_with_followups(message, text, candidates, is_question=is_question),
+            coroutine,
             name=f"reply-{responder.name}-{message.id}",
         )
         responder._background_tasks.add(task)
@@ -2718,6 +2760,108 @@ class FarmAccount:
             log.warning("[%s] не удалось отправить реплай на сообщение %s", self.name, message.id)
         return reply_id
 
+    async def _answer_direct_message(self, message: TGMessage, incoming_text: str) -> bool:
+        """Reply to one group participant by DM without mixing their private state with the room."""
+        sender = getattr(message, "from_user", None)
+        if not sender or not getattr(sender, "id", None):
+            return False
+        recipient_id = int(sender.id)
+        dm_state = self._dm_states.setdefault(recipient_id, FarmState())
+        target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+        async with self.state.lock:
+            public_history = [
+                dict(item) for item in self.state.chat_history
+                if int(item.get("chat_id") or target_chat_id) == target_chat_id
+                and item.get("direction") != "context"
+            ][-24:]
+            archived = list(self.state.account_contexts.get(self.name, []))
+            recent_texts = list(self.state.recent_texts)
+        private_history = [
+            dict(item) for item in dm_state.chat_history
+            if int(item.get("chat_id") or 0) == recipient_id
+        ]
+        dm_state.chat_history = deque(
+            sorted([*public_history, *private_history], key=lambda item: str(item.get("ts") or ""))[-60:],
+            maxlen=60,
+        )
+        dm_state.topic = ""
+        dm_state.account_contexts = {self.name: archived}
+        dm_state.account_participant_ids = None
+        dm_state.recent_texts = deque(recent_texts, maxlen=40)
+
+        farm_cfg = FARM_CFG.get("farm", {})
+        min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
+        max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
+        delay = random.uniform(min_delay, max_delay)
+        if delay:
+            await asyncio.sleep(delay)
+        if night_mode_active(farm_cfg):
+            return False
+
+        chat_scope = f"{target_chat_id}:{FARM_CFG.get('topic_id') or 0}"
+        session_factory = getattr(self.base_bridge, "session", None)
+        dm_bridge = (
+            session_factory(f"farm:{chat_scope}:account:{self.name}:dm:{recipient_id}")
+            if callable(session_factory)
+            else self.bridge
+        )
+        try:
+            reply = await generate_reply(
+                dm_bridge,
+                dm_state,
+                self.donor,
+                self.persona,
+                incoming_text,
+                include_scenario_topic=False,
+                account_name=self.name,
+            )
+        except Exception:
+            log.exception("[%s] private reply generation failed", self.name)
+            reply = ""
+        if _is_canned_reply(reply):
+            reply = ""
+        if not reply:
+            async with dm_state.lock:
+                donor_history, live_history = _state_history_parts(dm_state, self.name)
+                history = [*donor_history[-8:], *live_history[-60:]]
+                recent = list(dm_state.recent_texts)
+            reply = _offline_conversational_reply(incoming_text, history, avoid=recent)
+        reply = str(reply or "").strip()[:280]
+        if not reply:
+            log.info("[%s] DM-пропуск: нет безопасного текста ответа", self.name)
+            return False
+
+        async with self.state.outgoing_lock:
+            try:
+                if farm_cfg.get("typing_simulation", True):
+                    try:
+                        await self.client.send_chat_action(recipient_id, ChatAction.TYPING)
+                    except Exception:
+                        log.debug("[%s] DM typing indicator skipped", self.name, exc_info=True)
+                sent = await self.client.send_message(chat_id=recipient_id, text=reply)
+            except Exception:
+                log.warning(
+                    "[%s] не удалось написать участнику %s в личные сообщения; проверьте, что он может принимать DM",
+                    self.name,
+                    recipient_id,
+                    exc_info=True,
+                )
+                return False
+        async with dm_state.lock:
+            dm_state.chat_history.append({
+                "author": self.name,
+                "user_id": self.user_id or 0,
+                "message_id": int(getattr(sent, "id", 0) or 0),
+                "chat_id": recipient_id,
+                "text": reply,
+                "kind": "text",
+                "direction": "outgoing",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+            dm_state.mark_text(reply)
+        log.info("[%s] личное сообщение участнику %s отправлено", self.name, recipient_id)
+        return True
+
     async def _answer_with_followups(
         self,
         message: TGMessage,
@@ -2776,19 +2920,19 @@ class FarmAccount:
             log.info("[%s] подхватил тему реплаем на %s", account.name, chain_target)
 
     async def _loop(self) -> None:
-        farm_cfg = FARM_CFG.get("farm", {})
-        min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
-        max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
-        proactive_interval = farm_cfg.get("proactive_interval_sec", 300)
         while self._running:
             try:
+                farm_cfg = FARM_CFG.get("farm", {})
+                min_delay = max(0.0, float(farm_cfg.get("min_delay_sec", 2)))
+                max_delay = max(min_delay, float(farm_cfg.get("max_delay_sec", 8)))
                 await asyncio.sleep(random.uniform(min_delay, max_delay))
                 if not self._running or random.random() > self.reply_probability:
                     continue
-                if night_mode_active(FARM_CFG.get("farm", {})):
+                farm_cfg = FARM_CFG.get("farm", {})
+                if night_mode_active(farm_cfg):
                     log.info("[%s] ночной режим: автономная активность приостановлена", self.name)
                     continue
-                if not await self.state.claim_proactive_slot(proactive_interval):
+                if not await self.state.claim_proactive_slot(farm_cfg.get("proactive_interval_sec", 300)):
                     continue
                 log.info("[%s] получил общий слот автономной активности", self.name)
                 await self._act()
@@ -4037,6 +4181,16 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
     if not accounts:
         raise RuntimeError("Нет активных авторизованных аккаунтов. Добавьте сессию в разделе «Аккаунты».")
 
+    reply_override = farm_settings.get("reply_probability_override")
+    for account in accounts:
+        try:
+            configured_probability = max(0.0, min(1.0, float(account.get("reply_probability", farm_settings["default_reply_probability"]))))
+        except (TypeError, ValueError, OverflowError):
+            configured_probability = float(farm_settings["default_reply_probability"])
+        account["_configured_reply_probability"] = configured_probability
+        if reply_override is not None:
+            account["reply_probability"] = float(reply_override)
+
     local_cfg["accounts"] = accounts
     target_override = os.getenv("FARM_OVERRIDE_TARGET", "").strip()
     if target_override and int(target_override) != 0:
@@ -4137,6 +4291,452 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
     return local_cfg, farm_settings
 
 
+def _should_load_archived_context(
+    scenario_mode: str, live_source_enabled: bool, context_refresh: bool
+) -> bool:
+    """Reactive mode loads an archive only when the operator collected one for this run."""
+    return str(scenario_mode or "reactive") != "reactive" or bool(live_source_enabled) or bool(context_refresh)
+
+
+def _runtime_status(accounts: list[FarmAccount], settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Public, credential-free status for the web panel's hot-control card."""
+    return {
+        "ready": bool(accounts),
+        "supports_hot_control": settings.get("scenario_mode", "reactive") == "reactive",
+        "mode": str(settings.get("scenario_mode") or "reactive"),
+        "target_chat_id": int(FARM_CFG.get("target_chat_id") or 0),
+        "source_chat_id": int(settings.get("source_chat_id") or 0),
+        "accounts": [
+            {"name": account.name, "reply_probability": float(account.reply_probability)}
+            for account in accounts if account._running
+        ],
+        "settings": {
+            key: settings.get(key)
+            for key in (
+                "min_delay_sec", "max_delay_sec", "default_reply_probability",
+                "reply_probability_override", "reply_destination", "reply_filter_include",
+                "reply_filter_exclude", "reply_only_questions", "proactive_enabled",
+                "followups_enabled", "followups_max", "proactive_interval_sec", "reaction_probability",
+                "music_enabled", "music_source", "music_share_percent", "video_enabled", "video_source",
+                "video_share_percent",
+            )
+        },
+    }
+
+
+async def _load_runtime_account_config(name: str, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Read one existing authorized account for hot-add without opening a second session."""
+    from web import db as web_db
+    from web.manager import validate_session_name
+
+    clean_name = validate_session_name(name)
+    await web_db.init_db()
+    row = await web_db.get_account(clean_name)
+    if (
+        not row or not row.get("enabled") or not row.get("api_id") or not row.get("api_hash")
+        or row.get("session_status") != "authorized"
+    ):
+        raise RuntimeError(f"Аккаунт {clean_name} выключен, не настроен или не авторизован")
+    cfg = dict(row)
+    cfg["name"] = clean_name
+    cfg["enabled"] = bool(cfg.get("enabled", 1))
+    try:
+        media_bias = json.loads(cfg.get("media_bias") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        media_bias = {}
+    if not isinstance(media_bias, dict):
+        media_bias = {}
+    if not cfg.get("behavior_customized"):
+        cfg["reply_probability"] = settings.get("default_reply_probability", 0.25)
+        media_bias = settings.get("default_media_bias") or media_bias
+    cfg["media_bias"] = normalize_media_bias(media_bias, settings.get("default_media_bias"))
+    cfg.setdefault("persona", "обычный участник чата")
+    try:
+        configured = max(0.0, min(1.0, float(cfg.get("reply_probability", 0.25))))
+    except (TypeError, ValueError, OverflowError):
+        configured = float(settings.get("default_reply_probability", 0.25))
+    cfg["_configured_reply_probability"] = configured
+    override = settings.get("reply_probability_override")
+    cfg["reply_probability"] = configured if override is None else float(override)
+    return cfg
+
+
+def _assign_archive_context_to_account(account_name: str, state: FarmState) -> None:
+    """Give a hot-added account one still-unassigned anonymized participant, if available."""
+    if account_name in state.account_contexts:
+        return
+    participant_mapping = state.account_participant_ids
+    if participant_mapping is None:
+        state.account_contexts[account_name] = []
+        return
+    used = {int(value) for value in participant_mapping.values()}
+    by_participant: dict[int, list[dict[str, Any]]] = {}
+    for item in state.chat_history:
+        if item.get("direction") != "context":
+            continue
+        participant_id = _context_participant_id(item)
+        if participant_id is not None:
+            by_participant.setdefault(participant_id, []).append(dict(item))
+    available = sorted(participant_id for participant_id in by_participant if participant_id not in used)
+    if available:
+        participant_id = available[0]
+        participant_mapping[account_name] = participant_id
+        state.account_contexts[account_name] = by_participant[participant_id]
+    else:
+        state.account_contexts[account_name] = []
+
+
+def parse_telegram_message_link(value: str) -> tuple[str | int, int]:
+    """Parse a public or private t.me message URL into a chat reference and message ID."""
+    text = str(value or "").strip()
+    if not text or len(text) > 512:
+        raise ValueError("Укажите ссылку на сообщение Telegram")
+    candidate = text if "://" in text else f"https://t.me/{text.lstrip('/')}"
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() not in {"http", "https"} or host not in {"t.me", "telegram.me", "www.t.me", "www.telegram.me"}:
+        raise ValueError("Поддерживаются ссылки на сообщения t.me или telegram.me")
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if parts and parts[0] == "s":
+        parts = parts[1:]
+    if parts and parts[0] == "c":
+        if len(parts) < 3 or not parts[1].isdigit():
+            raise ValueError("В приватной ссылке не найден ID сообщения")
+        message_part = parts[3] if len(parts) >= 4 else parts[2]
+        if not message_part.isdigit():
+            raise ValueError("В приватной ссылке не найден ID сообщения")
+        return int(f"-100{parts[1]}"), int(message_part)
+    if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9_]{3,64}", parts[0]):
+        raise ValueError("В ссылке не найден публичный чат и ID сообщения")
+    message_part = parts[2] if len(parts) >= 3 else parts[1]
+    if not message_part.isdigit():
+        raise ValueError("В ссылке не найден публичный чат и ID сообщения")
+    return f"@{parts[0]}", int(message_part)
+
+
+async def _ensure_runtime_media_sender(
+    kind: str,
+    accounts: list[FarmAccount],
+    media_senders: dict[str, MediaSender],
+    source: str,
+) -> MediaSender:
+    reference = str(source or "").strip()
+    if not reference:
+        raise RuntimeError(f"Источник для {MEDIA_SOURCE_LABELS[kind].lower()} не задан")
+    sender = media_senders.get(kind)
+    if sender is None or sender.source != reference or sender.failed or not sender.tracks_left():
+        sender = MediaSender(reference, kind)
+        clients = [account.client for account in accounts if account._running and account.client is not None]
+        await sender.refresh(clients)
+        if not sender.tracks_left():
+            media_senders.pop(kind, None)
+            for account in accounts:
+                setattr(account, kind, None)
+            raise RuntimeError(f"Не удалось прочитать файлы {MEDIA_SOURCE_LABELS[kind].lower()} из {reference}")
+        media_senders[kind] = sender
+    for account in accounts:
+        setattr(account, kind, sender)
+    return sender
+
+
+async def _comment_from_runtime(
+    account: FarmAccount,
+    state: FarmState,
+    *,
+    url: str,
+    comment: str,
+    include_filter: str = "",
+    exclude_filter: str = "",
+) -> dict[str, Any]:
+    chat_ref, message_id = parse_telegram_message_link(url)
+    original_chat = await account.client.get_chat(chat_ref)
+    original_chat_id = int(original_chat.id)
+    settings = FARM_CFG.get("farm", {})
+    source_chat_id = int(settings.get("source_chat_id") or 0)
+    target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+    if settings.get("live_source_enabled") and original_chat_id == source_chat_id:
+        raise RuntimeError("Live-источник доступен только для чтения; комментарии в нём отключены")
+    original = await account.client.get_messages(original_chat_id, message_id)
+    if isinstance(original, (list, tuple)):
+        original = original[0] if original else None
+    if original is None or getattr(original, "empty", False):
+        raise RuntimeError("Исходный пост не найден или недоступен аккаунту")
+    post_text = account._message_text(original)
+    filter_settings = {
+        "reply_filter_include": include_filter,
+        "reply_filter_exclude": exclude_filter,
+        "reply_only_questions": False,
+    }
+    if not reply_message_passes_filters(post_text, False, filter_settings):
+        return {"sent": False, "skipped": True, "reason": "Исходный пост не прошёл заданные фильтры"}
+
+    reply_id = message_id
+    if original_chat_id != target_chat_id:
+        linked_chat = getattr(original_chat, "linked_chat", None)
+        if not linked_chat or int(getattr(linked_chat, "id", 0) or 0) != target_chat_id:
+            raise RuntimeError("Ссылка должна вести на целевой чат или на пост, связанный с ним")
+        if settings.get("live_source_enabled") and int(linked_chat.id) == source_chat_id:
+            raise RuntimeError("Live-источник доступен только для чтения; комментарии в нём отключены")
+        discussion_lookup = getattr(account.client, "get_discussion_message", None)
+        if callable(discussion_lookup):
+            discussion_messages = await discussion_lookup(original_chat_id, message_id)
+            if not isinstance(discussion_messages, (list, tuple)):
+                discussion_messages = [discussion_messages]
+            target_message = next((
+                item for item in discussion_messages
+                if int(getattr(getattr(item, "chat", None), "id", 0) or 0) == target_chat_id
+            ), None)
+            if target_message is None:
+                raise RuntimeError("Не удалось найти ветку обсуждения в целевом чате")
+            reply_id = int(target_message.id)
+
+    async with state.outgoing_lock:
+        sent = await account.client.send_message(
+            chat_id=target_chat_id,
+            text=comment,
+            reply_to_message_id=reply_id,
+        )
+    return {"sent": True, "message_id": int(getattr(sent, "id", 0) or 0), "target_chat_id": target_chat_id}
+
+
+async def _apply_runtime_control(
+    command: Mapping[str, Any],
+    accounts: list[FarmAccount],
+    state: FarmState,
+    donor: DonorCorpus,
+    bridge: Any,
+    farm_settings: dict[str, Any],
+    media_senders: dict[str, MediaSender],
+) -> dict[str, Any]:
+    action = str(command.get("action") or "")
+    payload = command.get("payload") if isinstance(command.get("payload"), Mapping) else {}
+    if str(farm_settings.get("scenario_mode") or "reactive") != "reactive":
+        raise RuntimeError("Горячее управление доступно только в режиме «Без сценария»")
+
+    if action == "update_settings":
+        from web.config import load_farm_settings
+
+        allowed = {
+            "min_delay_sec", "max_delay_sec", "reply_probability_override", "reply_destination",
+            "reply_filter_include", "reply_filter_exclude", "reply_only_questions",
+            "proactive_enabled", "proactive_interval_sec", "followups_enabled", "followups_max",
+            "reaction_probability", "music_enabled", "music_source", "music_share_percent",
+            "video_enabled", "video_source", "video_share_percent",
+        }
+        changes = {key: payload[key] for key in allowed if key in payload}
+        if not changes:
+            raise RuntimeError("Нет настроек для обновления")
+        if changes.get("reply_destination", farm_settings.get("reply_destination", "group")) == "direct" and payload.get("direct_message_ack") is not True:
+            raise RuntimeError("Для личных сообщений подтвердите уведомление и согласие участников")
+        for key in ("min_delay_sec", "max_delay_sec"):
+            if key in changes:
+                try:
+                    value = float(changes[key])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(f"{key}: укажите число") from exc
+                if not math.isfinite(value) or not 0 <= value <= 86400:
+                    raise RuntimeError(f"{key}: укажите значение от 0 до 86400 секунд")
+                changes[key] = value
+        if "min_delay_sec" in changes or "max_delay_sec" in changes:
+            proposed_min = float(changes.get("min_delay_sec", farm_settings.get("min_delay_sec", 2)))
+            proposed_max = float(changes.get("max_delay_sec", farm_settings.get("max_delay_sec", 8)))
+            if proposed_max < proposed_min:
+                raise RuntimeError("Максимальная пауза должна быть не меньше минимальной")
+        previous = dict(farm_settings)
+        proposed = {**farm_settings, **changes}
+        validated = load_farm_settings(proposed)
+        farm_settings.update(validated)
+
+        override = farm_settings.get("reply_probability_override")
+        for account in accounts:
+            account.reply_probability = (
+                account.configured_reply_probability if override is None else float(override)
+            )
+
+        if previous.get("proactive_enabled") != farm_settings.get("proactive_enabled"):
+            if farm_settings.get("proactive_enabled"):
+                for account in accounts:
+                    if account._task is None or account._task.done():
+                        account._task = asyncio.create_task(account._loop(), name=f"farm-proactive-{account.name}")
+            else:
+                for account in accounts:
+                    task = account._task
+                    account._task = None
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+        media_warnings: list[str] = []
+        for kind, source_key, enabled_key in (
+            ("music", "music_source", "music_enabled"),
+            ("video", "video_source", "video_enabled"),
+        ):
+            source = str(farm_settings.get(source_key) or "").strip()
+            if source != str(previous.get(source_key) or "").strip():
+                media_senders.pop(kind, None)
+                for account in accounts:
+                    setattr(account, kind, None)
+            if farm_settings.get(enabled_key) and source:
+                try:
+                    await _ensure_runtime_media_sender(kind, accounts, media_senders, source)
+                except Exception as exc:
+                    media_warnings.append(str(exc)[:200])
+                    log.warning("Не удалось обновить источник %s: %s", kind, exc)
+        result = {"updated": sorted(changes), "media_warnings": media_warnings}
+        return result
+
+    if action == "add_account":
+        name = str(payload.get("name") or "").strip()
+        if any(account.name == name for account in accounts):
+            raise RuntimeError(f"Аккаунт {name} уже работает")
+        cfg = await _load_runtime_account_config(name, farm_settings)
+        account = FarmAccount(cfg, bridge, state, donor, accounts)
+        try:
+            await account.start(timeout=90.0)
+        except Exception:
+            await account.stop()
+            raise
+        _assign_archive_context_to_account(account.name, state)
+        for kind in ("music", "video"):
+            sender = media_senders.get(kind)
+            setattr(account, kind, sender)
+        accounts.append(account)
+        for active in accounts:
+            active.farm_accounts = accounts
+        log.info("[control] аккаунт %s добавлен без остановки фермы", account.name)
+        return {"account": account.name, "accounts": [item.name for item in accounts]}
+
+    if action == "remove_account":
+        name = str(payload.get("name") or "").strip()
+        account = next((item for item in accounts if item.name == name), None)
+        if account is None:
+            raise RuntimeError(f"Аккаунт {name} сейчас не запущен")
+        if len(accounts) <= 1:
+            raise RuntimeError("Нельзя удалить последний активный аккаунт")
+        await account.stop()
+        accounts.remove(account)
+        state.account_contexts.pop(name, None)
+        state.used_archive_ids.pop(name, None)
+        if isinstance(state.account_participant_ids, dict):
+            state.account_participant_ids.pop(name, None)
+        for active in accounts:
+            active.farm_accounts = accounts
+        log.info("[control] аккаунт %s отключён без остановки фермы", name)
+        return {"account": name, "accounts": [item.name for item in accounts]}
+
+    account_name = str(payload.get("account") or "").strip()
+    account = next((item for item in accounts if item.name == account_name and item._running), None)
+    if account is None:
+        raise RuntimeError("Выберите активный аккаунт")
+
+    if action == "send_media":
+        kind = str(payload.get("kind") or "").strip().lower()
+        if kind == "gif":
+            async with state.outgoing_lock:
+                sent = await account._send_farm_media("gif", reply_to=None)
+        elif kind in {"music", "video"}:
+            source_key = "music_source" if kind == "music" else "video_source"
+            sender = await _ensure_runtime_media_sender(
+                kind,
+                accounts,
+                media_senders,
+                str(farm_settings.get(source_key) or ""),
+            )
+            async with state.outgoing_lock:
+                sent = await sender.send(account, reply_to=None)
+        else:
+            raise RuntimeError("Выберите GIF, видео или музыку")
+        if not sent:
+            raise RuntimeError(f"Не удалось отправить {kind} в целевой чат")
+        log.info("[control] %s отправил %s в целевой чат", account.name, kind)
+        return {"sent": True, "kind": kind, "account": account.name}
+
+    if action == "membership":
+        operation = str(payload.get("operation") or "").strip().lower()
+        reference = str(payload.get("chat") or "").strip()
+        if operation not in {"join", "leave"} or not reference or len(reference) > 512:
+            raise RuntimeError("Укажите действие вступить/выйти и чат")
+        chat = await account.client.get_chat(reference)
+        chat_id = int(chat.id)
+        target_chat_id = int(FARM_CFG.get("target_chat_id") or 0)
+        source_chat_id = int(farm_settings.get("source_chat_id") or 0)
+        if operation == "leave" and chat_id in {target_chat_id, source_chat_id}:
+            raise RuntimeError("Нельзя выйти из целевого чата или активного источника, пока ферма работает")
+        if operation == "join":
+            try:
+                joined = await account.client.join_chat(reference)
+                result = {"joined": True, "title": str(getattr(joined, "title", "") or chat.title or reference)}
+            except Exception as exc:
+                if type(exc).__name__ == "UserAlreadyParticipant":
+                    result = {"joined": False, "already": True, "title": str(chat.title or reference)}
+                else:
+                    raise
+        else:
+            await account.client.leave_chat(chat_id)
+            result = {"left": True, "title": str(chat.title or reference)}
+        log.info("[control] %s: %s %s", account.name, operation, result.get("title", reference))
+        return result
+
+    if action == "comment_post":
+        comment = str(payload.get("comment") or "").strip()
+        if not comment or len(comment) > 4000:
+            raise RuntimeError("Текст комментария должен содержать 1–4000 символов")
+        result = await _comment_from_runtime(
+            account,
+            state,
+            url=str(payload.get("url") or ""),
+            comment=comment,
+            include_filter=str(payload.get("include_filter") or "")[:1000],
+            exclude_filter=str(payload.get("exclude_filter") or "")[:1000],
+        )
+        if result.get("sent"):
+            log.info("[control] %s оставил комментарий в целевом чате", account.name)
+        return {**result, "account": account.name}
+
+    raise RuntimeError("Неизвестная команда горячего управления")
+
+
+async def _run_runtime_control_worker(
+    accounts: list[FarmAccount],
+    state: FarmState,
+    donor: DonorCorpus,
+    bridge: Any,
+    farm_settings: dict[str, Any],
+    media_senders: dict[str, MediaSender],
+    stop_event: asyncio.Event,
+    pid: int,
+) -> None:
+    """Poll a per-process file inbox and execute trusted web-panel actions in the farm loop."""
+    while not stop_event.is_set():
+        for command in farm_control.read_commands(pid):
+            command_id = str(command.get("id") or "")
+            try:
+                result = await _apply_runtime_control(
+                    command,
+                    accounts,
+                    state,
+                    donor,
+                    bridge,
+                    farm_settings,
+                    media_senders,
+                )
+                farm_control.write_result(pid, command_id, {"ok": True, "result": result})
+            except Exception as exc:
+                log.warning("[control] команда %s отклонена: %s", command.get("action", "?"), exc, exc_info=True)
+                try:
+                    farm_control.write_result(pid, command_id, {"ok": False, "error": str(exc)[:300] or type(exc).__name__})
+                except Exception:
+                    log.exception("Не удалось вернуть результат команды горячего управления")
+            try:
+                farm_control.publish_status(pid, _runtime_status(accounts, farm_settings))
+            except Exception:
+                log.exception("Не удалось обновить состояние горячего управления")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def idle_activity_tick(
     accounts: list[Any],
     state: FarmState,
@@ -4199,6 +4799,8 @@ async def idle_activity_tick(
 async def run_farm() -> None:
     global FARM_CFG
 
+    control_pid = os.getpid()
+    farm_control.clear_process_files(control_pid)
     FARM_CFG, farm_settings = await _load_runtime_config()
     if not FARM_CFG.get("target_chat_id"):
         raise SystemExit("target_chat_id не задан")
@@ -4209,6 +4811,7 @@ async def run_farm() -> None:
     farm_settings = FARM_CFG["farm"]
     scenario_mode = farm_settings.get("scenario_mode", "reactive")
     live_source_enabled = bool(farm_settings.get("live_source_enabled"))
+    context_refresh = os.getenv("FARM_OVERRIDE_CONTEXT_REFRESH", "").strip().lower() in {"1", "true", "yes"}
     if farm_settings.get("night_mode_enabled"):
         log.info(
             "Ночной режим включён: %s UTC — ходы, автономные сообщения, реакции и ответы приостановлены",
@@ -4274,10 +4877,15 @@ async def run_farm() -> None:
         state.load(saved)
     if scenario_mode == "reactive":
         state.reset_for_behavior_only()
-        log.info(
-            "Режим без сценария: сброшены тема, исходящие сценарные реплики и архивный контекст; сохранены только последние входящие сообщения (%d)",
-            len(state.chat_history),
-        )
+        if context_refresh:
+            log.info(
+                "Режим без сценария: очищены прежняя тема и архив; после сбора будет загружен новый исторический контекст для ответов"
+            )
+        else:
+            log.info(
+                "Режим без сценария: сброшены тема, исходящие сценарные реплики и архивный контекст; сохранены только последние входящие сообщения (%d)",
+                len(state.chat_history),
+            )
     elif scenario_mode == "history_dialogue":
         state.reset_for_behavior_only()
         state.topic = ""
@@ -4301,9 +4909,11 @@ async def run_farm() -> None:
     if context_chat_id == 0:
         raise SystemExit("FARM_OVERRIDE_CONTEXT_CHAT_ID не может быть нулём")
     context_file = DATA_DIR / "chat_contexts" / str(context_chat_id) / "context.json"
-    if (scenario_mode != "reactive" or live_source_enabled) and context_chat_id != chat_id:
+    if (scenario_mode != "reactive" or live_source_enabled or context_refresh) and context_chat_id != chat_id:
         log.info("История цели %s будет использована из чата-источника %s", chat_id, context_chat_id)
-    collected = await load_json(context_file, {}) if scenario_mode != "reactive" or live_source_enabled else {}
+    collected = await load_json(context_file, {}) if _should_load_archived_context(
+        scenario_mode, live_source_enabled, context_refresh
+    ) else {}
     context_rows = collected.get("messages", []) if isinstance(collected, dict) else []
     raw_participant_mapping = collected.get("account_participant_ids") if isinstance(collected, dict) else None
     if isinstance(raw_participant_mapping, dict):
@@ -4497,6 +5107,7 @@ async def run_farm() -> None:
     scenario_task: asyncio.Task | None = None
     source_scenario_task: asyncio.Task | None = None
     source_update_task: asyncio.Task | None = None
+    control_worker: asyncio.Task | None = None
     try:
         for account_cfg in FARM_CFG["accounts"]:
             name = account_cfg.get("name", "?")
@@ -4543,6 +5154,7 @@ async def run_farm() -> None:
             account.video = None
 
         clients = [account.client for account in accounts if account.client is not None]
+        media_senders: dict[str, MediaSender] = {}
         media_sources = (
             ("music", "music_enabled", "music_source", "music_share_percent"),
             ("video", "video_enabled", "video_source", "video_share_percent"),
@@ -4554,6 +5166,7 @@ async def run_farm() -> None:
             sender = MediaSender(source, kind)
             await sender.refresh(clients)
             if sender.tracks_left():
+                media_senders[kind] = sender
                 for account in accounts:
                     setattr(account, kind, sender)
                 log.info(
@@ -4565,6 +5178,20 @@ async def run_farm() -> None:
                 )
 
         FARM_STATS["started_at"] = datetime.now().isoformat(timespec="seconds")
+        farm_control.publish_status(control_pid, _runtime_status(accounts, farm_settings))
+        control_worker = asyncio.create_task(
+            _run_runtime_control_worker(
+                accounts,
+                state,
+                donor,
+                bridge,
+                farm_settings,
+                media_senders,
+                stop_event,
+                control_pid,
+            ),
+            name="farm-control",
+        )
         if scenario_mode == "reactive" and live_source_enabled:
             log.info("🎉 Live-источник запущен: %d аккаунтов; источник только читается, публикации идут в цель", len(accounts))
         elif scenario_mode == "reactive":
@@ -4667,7 +5294,7 @@ async def run_farm() -> None:
     finally:
         active_tasks = [
             task for task in (
-                saver, watchdog, reactor, idler, scenario_task, source_scenario_task, source_update_task
+                saver, watchdog, reactor, idler, scenario_task, source_scenario_task, source_update_task, control_worker
             ) if task is not None
         ]
         for task in active_tasks:
@@ -4696,6 +5323,7 @@ async def run_farm() -> None:
             except (OSError, ValueError):
                 log.warning("Не удалось удалить одноразовый AI-план %s", source_plan_path)
         log.info("Ферма остановлена.")
+        farm_control.clear_process_files(control_pid)
 
 
 # ═══════════════════════════════════════════════════════════════

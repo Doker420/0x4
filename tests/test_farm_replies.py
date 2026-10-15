@@ -907,6 +907,73 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         account.media_bias = {"text": 0.0, "gif": 1.0, "sticker": 0.0, "photo": 0.0, "voice": 0.0}
         self.assertEqual(account._pick_kind(), "gif")
 
+    async def test_direct_reply_sends_only_to_the_message_author_in_private_chat(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "reply_agent"
+        account.persona = "краткий собеседник"
+        account.base_bridge = object()
+        account.bridge = object()
+        account.donor = object()
+        account.state = farm.FarmState()
+        account._dm_states = {}
+        account.user_id = 500
+        account.client = types.SimpleNamespace(
+            send_message=AsyncMock(return_value=types.SimpleNamespace(id=987)),
+            send_chat_action=AsyncMock(),
+        )
+        message = types.SimpleNamespace(
+            id=45,
+            from_user=types.SimpleNamespace(id=1234, username="participant"),
+            chat=types.SimpleNamespace(id=-100777),
+        )
+        old_cfg = farm.FARM_CFG
+        farm.FARM_CFG = {"target_chat_id": -100777, "farm": {
+            "min_delay_sec": 0,
+            "max_delay_sec": 0,
+            "typing_simulation": False,
+        }}
+        try:
+            with patch.object(farm, "generate_reply", new=AsyncMock(return_value="Короткий личный ответ")) as generate:
+                sent = await account._answer_direct_message(message, "Как это работает?")
+        finally:
+            farm.FARM_CFG = old_cfg
+
+        self.assertTrue(sent)
+        account.client.send_message.assert_awaited_once_with(
+            chat_id=1234, text="Короткий личный ответ"
+        )
+        self.assertEqual(generate.await_args.args[4], "Как это работает?")
+        self.assertFalse(account.client.send_chat_action.await_count)
+        self.assertEqual(
+            account._dm_states[1234].chat_history[-1]["direction"], "outgoing"
+        )
+
+    def test_reply_filters_include_exclude_and_question_only(self):
+        self.assertTrue(farm.reply_message_passes_filters(
+            "Как настроить доставку? У вас доставка?", True,
+            {"reply_filter_include": "доставка, настройка", "reply_filter_exclude": "реклама", "reply_only_questions": True},
+        ))
+        self.assertFalse(farm.reply_message_passes_filters(
+            "Как настроить доставку? реклама", True,
+            {"reply_filter_include": "доставка", "reply_filter_exclude": "реклама", "reply_only_questions": False},
+        ))
+        self.assertFalse(farm.reply_message_passes_filters(
+            "доставка есть", False,
+            {"reply_filter_include": "доставка", "reply_filter_exclude": "", "reply_only_questions": True},
+        ))
+        self.assertTrue(farm.reply_message_passes_filters("обычный текст", False, {}))
+
+    def test_telegram_message_links_are_parsed_without_accepting_other_hosts(self):
+        self.assertEqual(farm.parse_telegram_message_link("https://t.me/news_room/42"), ("@news_room", 42))
+        self.assertEqual(farm.parse_telegram_message_link("https://t.me/c/123456789/88"), (-100123456789, 88))
+        self.assertEqual(farm.parse_telegram_message_link("https://t.me/c/123456789/10/88"), (-100123456789, 88))
+        self.assertEqual(farm.parse_telegram_message_link("https://t.me/s/news_room/42"), ("@news_room", 42))
+        self.assertEqual(farm.parse_telegram_message_link("https://t.me/news_room/10/42"), ("@news_room", 42))
+        with self.assertRaises(ValueError):
+            farm.parse_telegram_message_link("https://example.com/news_room/42")
+        with self.assertRaises(ValueError):
+            farm.parse_telegram_message_link("https://t.me/+invitehash")
+
 
 if __name__ == "__main__":
     unittest.main()
