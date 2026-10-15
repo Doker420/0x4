@@ -64,41 +64,47 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         await db.upsert_account(
             "preview", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
+        await db.set_setting("farm_settings", json.dumps({
+            "comment_post_include_filter": "question",
+            "comment_post_exclude_filter": "spam",
+        }))
         chatfarm = await self.client.get("/chatfarm")
         self.assertEqual(chatfarm.status_code, 200)
-        self.assertIn("Диалог аккаунтов по общей теме", chatfarm.text)
+        self.assertIn("Запуск только без сценариев", chatfarm.text)
         self.assertIn("шанс ответа 25%", chatfarm.text)
-        self.assertIn("Диалог и ответы участникам", chatfarm.text)
-        self.assertIn('value="history_dialogue">Диалог по истории чата', chatfarm.text)
-        self.assertIn('value="reactive" selected', chatfarm.text)
-        self.assertIn("Без сценария — работать по настройкам поведения", chatfarm.text)
         self.assertIn("▶ Запустить без сценария", chatfarm.text)
         self.assertIn("Автоматизируйте только чат, где у вас есть разрешение", chatfarm.text)
-        self.assertIn('name="automation_ack" required', chatfarm.text)
-        self.assertIn("По умолчанию — бесконечная цепочка", chatfarm.text)
-        self.assertIn("Группа-источник", chatfarm.text)
-        self.assertIn('name="auto_join_live_source" checked', chatfarm.text)
-        self.assertIn("по числовому id", chatfarm.text.lower())
-        self.assertIn("ai подготовит фиксированный план", chatfarm.text.lower())
-        self.assertIn("явное согласие автора", chatfarm.text.lower())
-        self.assertIn("не пересылая сообщение", chatfarm.text.lower())
-        self.assertIn("права администратора не требуются", chatfarm.text)
-        self.assertIn("Перед запуском взять последние сообщения как контекст", chatfarm.text)
+        self.assertIn('name="automation_ack"', chatfarm.text)
+        self.assertIn("Перед запуском собрать последние сообщения", chatfarm.text)
+        self.assertIn("архив используется только как контекст", chatfarm.text)
+        self.assertIn('name="reply_destination"', chatfarm.text)
+        self.assertIn("Подтверждаю уведомление участников и их согласие на личные сообщения", chatfarm.text)
+        self.assertIn("Управление без остановки", chatfarm.text)
+        self.assertIn("Сообщения целевого чата", chatfarm.text)
+        self.assertIn("только сообщения людей — без ботов и аккаунтов фермы", chatfarm.text)
+        self.assertIn("Ответить выбранным аккаунтом", chatfarm.text)
+        self.assertIn("Настройки выбранного аккаунта", chatfarm.text)
+        self.assertIn("runtime_account_reply_probability", chatfarm.text)
+        self.assertIn("name=\"auto_replies_enabled\"", chatfarm.text)
+        self.assertIn("toggleAutoReplies", chatfarm.text)
+        self.assertIn("GIF", chatfarm.text)
+        self.assertIn("Видео", chatfarm.text)
+        self.assertIn("Музыка", chatfarm.text)
+        self.assertIn("Бросить", chatfarm.text)
+        self.assertIn("Вступить или выйти из группы", chatfarm.text)
+        self.assertIn("Комментарий по ссылке", chatfarm.text)
+        self.assertIn('id="runtime_comment_include" maxlength="1000" rows="2" placeholder="например: вопрос, запуск" disabled>question</textarea>', chatfarm.text)
+        self.assertIn('id="runtime_comment_exclude" maxlength="1000" rows="2" placeholder="например: реклама, спам" disabled>spam</textarea>', chatfarm.text)
+        self.assertIn("Эти фильтры относятся только к посту по ссылке", chatfarm.text)
         self.assertIn('name="history_source"', chatfarm.text)
         self.assertIn("ID целевого чата", chatfarm.text)
-        self.assertIn("ID чата-источника истории", chatfarm.text)
-        self.assertIn("historySource.required = historyDialogue;", chatfarm.text)
-        self.assertIn("document.getElementById('scenario_topic_field').hidden = historyDialogue;", chatfarm.text)
-        self.assertIn("document.getElementById('history_context_options').hidden = !useHistory;", chatfarm.text)
-        self.assertIn("Общая тема и стартовая публикация отключены", chatfarm.text)
-        self.assertIn("бот 1 получает только сообщения обезличенного участника 1", chatfarm.text)
-        self.assertIn('name="auto_join_history"', chatfarm.text)
-        self.assertIn("Глубина истории, сообщений", chatfarm.text)
-        self.assertIn("0 — вся доступная история", chatfarm.text)
-        self.assertIn("30 аккаунтов — минимум 30 разных участников", chatfarm.text)
-        self.assertNotIn('max="300"', chatfarm.text)
-        self.assertIn("Рулетка — случайные числа", chatfarm.text)
-        self.assertIn("Отдыхать после N ходов", chatfarm.text)
+        self.assertIn("Автоматически вступить в источник", chatfarm.text)
+        self.assertNotIn('id="scenario_mode"', chatfarm.text)
+        self.assertNotIn("live_source_enabled", chatfarm.text)
+        self.assertNotIn("scenario_topic", chatfarm.text)
+        self.assertNotIn("reply_filter_include", chatfarm.text)
+        self.assertNotIn("reply_filter_exclude", chatfarm.text)
+        self.assertNotIn("AI не вернул корректный JSON-сценарий", chatfarm.text)
 
     async def test_shared_session_credentials_are_saved_and_trigger_auto_scan(self):
         scan_results = [{"name": "alice", "source": "sessions/", "status": "authorized", "username": "alice_tg"}]
@@ -282,7 +288,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.status_code, 409)
         get_client.assert_not_awaited()
 
-    async def test_chatfarm_accepts_sequential_topic_scenario(self):
+    async def test_chatfarm_start_rejects_legacy_scenario_api_requests(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(
                 name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
@@ -290,33 +296,24 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "accounts": "alpha,beta",
             "target_id": "-1001234567890",
-            "topic_id": "0",
-            "min_delay": "20",
-            "max_delay": "45",
             "scenario_mode": "discussion",
             "scenario_topic": "Почему важно отдыхать? Обсуждайте по очереди.",
-            "scenario_turns": "8",
-            "joke_every": "4",
-            "rest_every": "3",
-            "rest_min_sec": "30",
-            "rest_max_sec": "60",
-            "post_opening": "on",
             "automation_ack": "on",
         }
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=71) as submit:
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock) as submit:
             response = await self.client.post("/api/chatfarm/start", data=payload)
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["task_id"], 71)
-        submitted = submit.await_args.args[1]
-        self.assertEqual(submitted["scenario_mode"], "discussion")
-        self.assertEqual(submitted["scenario_turns"], 8)
-        self.assertTrue(submitted["post_opening"])
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("только без сценариев", response.json()["detail"])
+        submit.assert_not_awaited()
 
     async def test_chatfarm_behavior_only_launch_needs_no_scenario_or_history_settings(self):
         await db.upsert_account(
             "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
-        # Hidden stale form values must not turn a behavior-only launch into a scenario.
+        await db.set_setting("farm_settings", json.dumps({
+            "scenario_mode": "discussion", "scenario_topic": "obsolete saved topic",
+        }))
+        # Hidden stale form/config values must not turn a behavior-only launch into a scenario.
         payload = {
             "accounts": "alpha",
             "target_id": "-1001234567890",
@@ -327,13 +324,18 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "rest_min_sec": "15",
             "rest_max_sec": "25",
             "roulette_numbers": "1-7",
-            "collect_context_history": "on",
             "history_limit": "0",
             "post_opening": "on",
+            "auto_replies_enabled": "false",
+            "reply_probability_override": "0.65",
         }
         missing_consent = await self.client.post("/api/chatfarm/start", data=payload)
         self.assertEqual(missing_consent.status_code, 422)
         self.assertIn("разрешение", missing_consent.json()["detail"].lower())
+        unchecked_consent = await self.client.post(
+            "/api/chatfarm/start", data={**payload, "automation_ack": ""}
+        )
+        self.assertEqual(unchecked_consent.status_code, 422)
 
         with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=75) as submit:
             response = await self.client.post(
@@ -353,8 +355,277 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["roulette_numbers"], "0-36")
         self.assertFalse(submitted["post_opening"])
         self.assertTrue(submitted["automation_acknowledged"])
+        self.assertFalse(submitted["auto_replies_enabled"])
+        self.assertEqual(submitted["reply_probability_override"], 0.65)
+        saved_settings = json.loads(await db.get_setting("farm_settings"))
+        self.assertFalse(saved_settings["auto_replies_enabled"])
+        self.assertEqual(saved_settings["reply_probability_override"], 0.65)
+        self.assertEqual(saved_settings["scenario_mode"], "reactive")
+        self.assertEqual(saved_settings["scenario_topic"], "")
 
-    async def test_chatfarm_live_source_requires_slow_queue_and_explicit_voice_consent(self):
+    async def test_reactive_mode_can_collect_history_as_reply_context_without_a_scenario(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        payload = {
+            "accounts": "alpha",
+            "target_id": "-1001234567890",
+            "scenario_mode": "reactive",
+            "collect_context_history": "on",
+            "context_reader": "alpha",
+            "history_source": "https://t.me/history_room",
+            "history_limit": "25",
+            "history_topic_id": "0",
+            "automation_ack": "on",
+        }
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=89) as submit:
+            response = await self.client.post("/api/chatfarm/start", data=payload)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["collecting_history"])
+        submitted = submit.await_args.args[1]
+        self.assertEqual(submitted["scenario_mode"], "reactive")
+        self.assertEqual(submitted["scenario_topic"], "")
+        self.assertTrue(submitted["collect_history"])
+        self.assertEqual(submitted["history_limit"], 25)
+        self.assertEqual(submitted["context_reader"], "alpha")
+        self.assertEqual(submitted["history_reference"]["chat_ref"], "history_room")
+        self.assertFalse(submitted["live_source_enabled"])
+
+    async def test_direct_reply_destination_requires_separate_consent(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        payload = {
+            "accounts": "alpha",
+            "target_id": "-1001234567890",
+            "reply_destination": "direct",
+            "automation_ack": "on",
+        }
+        missing = await self.client.post("/api/chatfarm/start", data=payload)
+        self.assertEqual(missing.status_code, 422)
+        self.assertIn("личных сообщений", missing.json()["detail"].lower())
+        unchecked = await self.client.post(
+            "/api/chatfarm/start", data={**payload, "direct_message_ack": ""}
+        )
+        self.assertEqual(unchecked.status_code, 422)
+
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=90) as submit:
+            response = await self.client.post(
+                "/api/chatfarm/start", data={**payload, "direct_message_ack": "on"}
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(submit.await_args.args[1]["reply_destination"], "direct")
+        self.assertTrue(submit.await_args.args[1]["direct_message_acknowledged"])
+
+    async def test_runtime_panel_lists_available_accounts_and_applies_live_settings(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        await db.upsert_account(
+            "beta", api_id=456, api_hash="secret2", enabled=1, session_status="authorized"
+        )
+        process = SimpleNamespace(pid=4321, returncode=None)
+        status = {
+            "pid": 4321,
+            "ready": True,
+            "supports_hot_control": True,
+            "mode": "reactive",
+            "target_chat_id": -1001234567890,
+            "accounts": [{"name": "alpha", "reply_probability": 0.25}],
+            "messages": [{"author": "human", "user_id": 200, "message_id": 77, "chat_id": -1001234567890, "text": "Hi", "kind": "text", "ts": "2026-10-15T12:00:00"}],
+            "settings": {
+                "min_delay_sec": 2,
+                "max_delay_sec": 8,
+                "reply_destination": "group",
+                "reply_probability_override": None,
+            },
+        }
+        with (
+            patch("web.app.FARM_PROCESS", process),
+            patch("web.app.farm_control.read_status", return_value=status),
+        ):
+            runtime = await self.client.get("/api/chatfarm/runtime")
+            self.assertEqual(runtime.status_code, 200, runtime.text)
+            self.assertEqual([row["name"] for row in runtime.json()["available_accounts"]], ["beta"])
+            self.assertEqual(runtime.json()["messages"][0]["message_id"], 77)
+
+            with (
+                patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"updated": ["min_delay_sec"]}) as send,
+                patch("web.app._persist_farm_switches", new_callable=AsyncMock) as persist,
+            ):
+                missing_dm_consent = await self.client.post("/api/chatfarm/control", json={
+                    "action": "update_settings",
+                    "reply_destination": "direct",
+                    "direct_message_ack": False,
+                })
+                self.assertEqual(missing_dm_consent.status_code, 422)
+                send.assert_not_awaited()
+
+                response = await self.client.post("/api/chatfarm/control", json={
+                    "action": "update_settings",
+                    "min_delay_sec": 4,
+                    "max_delay_sec": 12,
+                    "reply_destination": "direct",
+                    "direct_message_ack": True,
+                    "reply_filter_include": "support",
+                    "comment_post_include_filter": "question, setup",
+                    "comment_post_exclude_filter": "spam",
+                    "reaction_probability": 0.2,
+                    "proactive_interval_sec": 600,
+                    "music_share_percent": 25,
+                    "gif_share_percent": 30,
+                    "dice_enabled": True,
+                    "dice_share_percent": 12,
+                    "dice_emoji": "🎯",
+                    "auto_replies_enabled": False,
+                })
+        self.assertEqual(response.status_code, 200, response.text)
+        sent_action, sent_payload = send.await_args.args
+        self.assertEqual(sent_action, "update_settings")
+        self.assertEqual(sent_payload["min_delay_sec"], 4)
+        self.assertEqual(sent_payload["reply_destination"], "direct")
+        self.assertTrue(sent_payload["direct_message_ack"])
+        self.assertEqual(sent_payload["reaction_probability"], 0.2)
+        self.assertEqual(sent_payload["proactive_interval_sec"], 600)
+        self.assertEqual(sent_payload["music_share_percent"], 25)
+        self.assertEqual(sent_payload["gif_share_percent"], 30)
+        self.assertTrue(sent_payload["dice_enabled"])
+        self.assertEqual(sent_payload["dice_share_percent"], 12)
+        self.assertEqual(sent_payload["dice_emoji"], "🎯")
+        self.assertEqual(sent_payload["comment_post_include_filter"], "question, setup")
+        self.assertEqual(sent_payload["comment_post_exclude_filter"], "spam")
+        self.assertFalse(sent_payload["auto_replies_enabled"])
+        persist.assert_awaited_once()
+
+    async def test_runtime_control_validates_manual_dice_action(self):
+        status = {
+            "ready": True, "supports_hot_control": True,
+            "accounts": [{"name": "alpha"}], "settings": {},
+        }
+        with (
+            patch("web.app.FARM_PROCESS", SimpleNamespace(pid=4321, returncode=None)),
+            patch("web.app.farm_control.read_status", return_value=status),
+            patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"sent": True}) as send,
+        ):
+            invalid = await self.client.post("/api/chatfarm/control", json={
+                "action": "send_media", "account": "alpha", "kind": "dice", "emoji": "💩",
+            })
+            valid = await self.client.post("/api/chatfarm/control", json={
+                "action": "send_media", "account": "alpha", "kind": "dice", "emoji": "🎯",
+            })
+
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(valid.status_code, 200, valid.text)
+        self.assertEqual(send.await_args.args, (
+            "send_media", {"account": "alpha", "kind": "dice", "emoji": "🎯"}
+        ))
+
+    async def test_runtime_control_updates_an_active_account_and_persists_its_settings(self):
+        status = {
+            "ready": True,
+            "supports_hot_control": True,
+            "accounts": [{"name": "alpha"}],
+            "settings": {},
+        }
+        with (
+            patch("web.app.FARM_PROCESS", SimpleNamespace(pid=4321, returncode=None)),
+            patch("web.app.farm_control.read_status", return_value=status),
+            patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"account": "alpha"}) as send,
+            patch("web.app.db.upsert_account", new_callable=AsyncMock) as persist,
+        ):
+            response = await self.client.post("/api/chatfarm/control", json={
+                "action": "update_account", "name": "alpha", "reply_probability": 0.8,
+                "persona": "A concise role",
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(send.await_args.args, (
+            "update_account", {"name": "alpha", "reply_probability": 0.8, "persona": "A concise role"}
+        ))
+        persist.assert_awaited_once_with(
+            "alpha", reply_probability=0.8, behavior_customized=1, persona="A concise role"
+        )
+
+    async def test_runtime_link_comment_keeps_its_separate_post_filters(self):
+        status = {
+            "ready": True, "supports_hot_control": True,
+            "accounts": [{"name": "alpha"}], "settings": {},
+        }
+        with (
+            patch("web.app.FARM_PROCESS", SimpleNamespace(pid=4321, returncode=None)),
+            patch("web.app.farm_control.read_status", return_value=status),
+            patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"sent": True}) as send,
+        ):
+            response = await self.client.post("/api/chatfarm/control", json={
+                "action": "comment_post", "account": "alpha", "url": "https://t.me/room/123",
+                "comment": "My comment", "include_filter": "question", "exclude_filter": "spam",
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(send.await_args.args[0], "comment_post")
+        self.assertEqual(send.await_args.args[1]["include_filter"], "question")
+        self.assertEqual(send.await_args.args[1]["exclude_filter"], "spam")
+        saved = json.loads(await db.get_setting("farm_settings", "{}"))
+        self.assertEqual(saved["comment_post_include_filter"], "question")
+        self.assertEqual(saved["comment_post_exclude_filter"], "spam")
+
+    async def test_runtime_control_sends_manual_text_as_a_reply_to_a_human_inbox_message(self):
+        status = {
+            "ready": True,
+            "supports_hot_control": True,
+            "target_chat_id": -1001234567890,
+            "accounts": [{"name": "alpha"}],
+            "messages": [{
+                "author": "human", "user_id": 200, "message_id": 77,
+                "chat_id": -1001234567890, "text": "A question", "kind": "text",
+            }],
+            "settings": {"reply_destination": "group"},
+        }
+        with (
+            patch("web.app.FARM_PROCESS", SimpleNamespace(pid=4321, returncode=None)),
+            patch("web.app.farm_control.read_status", return_value=status),
+            patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"sent": True}) as send,
+        ):
+            response = await self.client.post("/api/chatfarm/control", json={
+                "action": "send_text", "account": "alpha", "message_id": 77, "text": "My reply",
+            })
+            stale = await self.client.post("/api/chatfarm/control", json={
+                "action": "send_text", "account": "alpha", "message_id": 999, "text": "My reply",
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(send.await_args.args, (
+            "send_text", {"account": "alpha", "message_id": 77, "text": "My reply"}
+        ))
+        self.assertEqual(stale.status_code, 409)
+
+    async def test_runtime_control_can_hot_add_an_authorized_session(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
+        )
+        await db.upsert_account(
+            "beta", api_id=456, api_hash="secret2", enabled=1, session_status="authorized"
+        )
+        status = {
+            "ready": True,
+            "supports_hot_control": True,
+            "accounts": [{"name": "alpha"}],
+            "settings": {},
+        }
+        with (
+            patch("web.app.FARM_PROCESS", SimpleNamespace(pid=4321, returncode=None)),
+            patch("web.app.farm_control.read_status", return_value=status),
+            patch("web.app._send_farm_control_command", new_callable=AsyncMock, return_value={"account": "beta"}) as send,
+        ):
+            response = await self.client.post("/api/chatfarm/control", json={
+                "action": "add_account",
+                "name": "beta",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        send.assert_awaited_once_with("add_account", {"name": "beta"}, timeout=150.0)
+
+    async def test_chatfarm_start_rejects_legacy_live_source_api_requests(self):
         await db.upsert_account(
             "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
@@ -365,74 +636,42 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "live_source_enabled": "on",
             "live_source": "-1001234567899",
             "live_source_reader": "alpha",
-            "live_source_limit": "50",
-            "source_plan_turns": "6",
-            "auto_join_live_source": "on",
-            "min_delay": "15",
-            "max_delay": "45",
             "automation_ack": "on",
         }
-        same_chat = await self.client.post(
-            "/api/chatfarm/start", data={**base, "live_source": base["target_id"]}
-        )
-        self.assertEqual(same_chat.status_code, 422)
-        self.assertIn("должна отличаться", same_chat.json()["detail"])
-
-        too_fast = await self.client.post(
-            "/api/chatfarm/start", data={**base, "min_delay": "5"}
-        )
-        self.assertEqual(too_fast.status_code, 422)
-        self.assertIn("15 секунд", too_fast.json()["detail"])
-
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=76) as submit:
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock) as submit:
             response = await self.client.post("/api/chatfarm/start", data=base)
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(response.json()["collecting_history"])
-        self.assertTrue(response.json()["preparing_source_scenario"])
-        submitted = submit.await_args.args[1]
-        self.assertTrue(submitted["live_source_enabled"])
-        self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
-        self.assertFalse(submitted["history_auto_join"])
-        self.assertFalse(submitted["source_voice_consent"])
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Live-source отключён", response.json()["detail"])
+        submit.assert_not_awaited()
 
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=77) as submit:
-            response = await self.client.post(
-                "/api/chatfarm/start", data={**base, "source_voice_consent": "on"}
-            )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(submit.await_args.args[1]["source_voice_consent"])
+        # Legacy clients sometimes submit the explicit string "false". It must not
+        # be treated as an enabled checkbox or open the old scenario path.
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=79) as submit:
+            disabled = await self.client.post("/api/chatfarm/start", data={
+                **base, "live_source_enabled": "false",
+                "live_source": "", "live_source_reader": "", "automation_ack": "on",
+            })
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+        self.assertFalse(submit.await_args.args[1]["live_source_enabled"])
+        self.assertEqual(submit.await_args.args[1]["scenario_mode"], "reactive")
 
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=78) as submit:
-            response = await self.client.post(
-                "/api/chatfarm/start", data={**base, "live_source": "@source_room"}
-            )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(submit.await_args.args[1]["history_auto_join"])
-
-    async def test_chatfarm_accepts_combined_dialogue_and_incoming_replies(self):
+    async def test_chatfarm_start_rejects_legacy_combined_scenario_api_requests(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(
                 name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
             )
-        payload = {
-            "accounts": "alpha,beta",
-            "target_id": "-1001234567890",
-            "min_delay": "20",
-            "max_delay": "45",
-            "scenario_mode": "combined",
-            "scenario_topic": "Обсудите тему и отвечайте участникам.",
-            "scenario_turns": "4",
-            "automation_ack": "on",
-        }
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=72) as submit:
-            response = await self.client.post("/api/chatfarm/start", data=payload)
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock) as submit:
+            response = await self.client.post("/api/chatfarm/start", data={
+                "accounts": "alpha,beta", "target_id": "-1001234567890",
+                "scenario_mode": "combined", "scenario_topic": "Обсудите тему.",
+                "automation_ack": "on",
+            })
 
-        self.assertEqual(response.status_code, 200, response.text)
-        submitted = submit.await_args.args[1]
-        self.assertEqual(submitted["scenario_mode"], "combined")
-        self.assertEqual(submitted["scenario_turns"], 4)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("только без сценариев", response.json()["detail"])
+        submit.assert_not_awaited()
 
-    async def test_chatfarm_can_collect_anonymized_history_before_starting_dialogue(self):
+    async def test_chatfarm_can_collect_anonymized_history_for_behavior_mode(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(
                 name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
@@ -443,7 +682,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "topic_id": "42",
             "min_delay": "5",
             "max_delay": "15",
-            "scenario_mode": "combined",
+            "scenario_mode": "reactive",
             "scenario_topic": "",
             "collect_context_history": "on",
             "context_reader": "alpha",
@@ -466,7 +705,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted["history_reference"]["topic_id"], 77)
         self.assertEqual(submitted["history_topic_id"], 77)
         self.assertTrue(submitted["history_auto_join"])
-        self.assertEqual(submitted["scenario_topic"], "Прозрачный сценарный диалог по общим идеям из недавней истории чата; без имитации участников.")
+        self.assertEqual(submitted["scenario_topic"], "")
 
     async def test_chatfarm_accepts_a_separate_numeric_history_source_id(self):
         for name in ("alpha", "beta"):
@@ -477,7 +716,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post("/api/chatfarm/start", data={
                 "accounts": "alpha,beta",
                 "target_id": "-1001234567890",
-                "scenario_mode": "combined",
+                "scenario_mode": "reactive",
                 "collect_context_history": "on",
                 "context_reader": "alpha",
                 "history_limit": "50",
@@ -504,7 +743,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "target_id": "-1001234567890",
             "min_delay": "5",
             "max_delay": "15",
-            "scenario_mode": "combined",
+            "scenario_mode": "reactive",
             "collect_context_history": "on",
             "context_reader": "alpha",
             "history_limit": "50",
@@ -523,58 +762,31 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         reference = web_app._take_invite_reference(submitted["history_invite_token"])
         self.assertEqual(reference["invite_hash"], "Abcdefghijkl")
 
-        invalid_id = await self.client.post("/api/chatfarm/start", data={
-            **base,
-            "history_source": "-1001234567891",
-            "auto_join_history": "on",
-        })
-        self.assertEqual(invalid_id.status_code, 422)
-        self.assertIn("числового ID", invalid_id.json()["detail"])
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=732) as numeric_submit:
+            numeric_source = await self.client.post("/api/chatfarm/start", data={
+                **base,
+                "history_source": "-1001234567891",
+                "auto_join_history": "on",
+            })
+        self.assertEqual(numeric_source.status_code, 200, numeric_source.text)
+        numeric_settings = numeric_submit.await_args.args[1]
+        self.assertFalse(numeric_settings["history_auto_join"])
 
-    async def test_dedicated_history_dialogue_requires_source_but_no_common_topic(self):
+    async def test_chatfarm_start_rejects_legacy_history_dialogue_mode(self):
         for name in ("alpha", "beta"):
             await db.upsert_account(
                 name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
             )
-        base = {
-            "accounts": "alpha,beta",
-            "target_id": "-1001234567890",
-            "min_delay": "5",
-            "max_delay": "15",
-            "scenario_mode": "history_dialogue",
-            "scenario_topic": "stale topic must be ignored",
-            "context_reader": "alpha",
-            "history_limit": "5000",
-            "post_opening": "on",
-            "automation_ack": "on",
-        }
-        missing_source = await self.client.post("/api/chatfarm/start", data=base)
-        self.assertEqual(missing_source.status_code, 422)
-        self.assertIn("источника истории отдельно", missing_source.json()["detail"])
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock) as submit:
+            response = await self.client.post("/api/chatfarm/start", data={
+                "accounts": "alpha,beta", "target_id": "-1001234567890",
+                "scenario_mode": "history_dialogue", "history_source": "-1001234567899",
+                "automation_ack": "on",
+            })
 
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=74) as submit:
-            response = await self.client.post(
-                "/api/chatfarm/start", data={**base, "history_source": "-1001234567899"}
-            )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(response.json()["collecting_history"])
-        submitted = submit.await_args.args[1]
-        self.assertEqual(submitted["scenario_mode"], "history_dialogue")
-        self.assertTrue(submitted["collect_history"])
-        self.assertEqual(submitted["history_limit"], 5000)
-        self.assertEqual(submitted["target_id"], -1001234567890)
-        self.assertEqual(submitted["history_reference"]["chat_ref"], -1001234567899)
-        self.assertEqual(submitted["scenario_topic"], "")
-        self.assertFalse(submitted["post_opening"])
-
-        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock, return_value=75) as submit_all:
-            all_history = await self.client.post(
-                "/api/chatfarm/start",
-                data={**base, "history_source": "-1001234567899", "history_limit": "0"},
-            )
-        self.assertEqual(all_history.status_code, 200, all_history.text)
-        self.assertEqual(submit_all.await_args.args[1]["history_limit"], 0)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("только без сценариев", response.json()["detail"])
+        submit.assert_not_awaited()
 
     async def test_chatfarm_history_reader_must_be_a_selected_account(self):
         for name in ("alpha", "beta"):
@@ -586,7 +798,7 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
             "target_id": "-1001234567890",
             "min_delay": "5",
             "max_delay": "15",
-            "scenario_mode": "combined",
+            "scenario_mode": "reactive",
             "collect_context_history": "on",
             "context_reader": "not_selected",
             "history_limit": "50",
@@ -971,28 +1183,39 @@ class WebAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_SCENARIO_TOPIC"], "")
         self.assertEqual(spawn.await_args.kwargs["env"]["FARM_OVERRIDE_POST_OPENING"], "0")
 
-    async def test_chatfarm_scenario_requires_multiple_accounts_and_valid_numbers(self):
-        for name in ("alpha", "beta"):
-            await db.upsert_account(
-                name, api_id=123, api_hash="secret", enabled=1, session_status="authorized"
-            )
-        base = {
-            "accounts": "alpha,beta",
-            "target_id": "-1001234567890",
-            "min_delay": "20",
-            "max_delay": "45",
-            "scenario_mode": "roulette",
-            "scenario_topic": "Выберите число.",
-            "roulette_numbers": "0-1001",
-            "automation_ack": "on",
-        }
-        invalid_numbers = await self.client.post("/api/chatfarm/start", data=base)
-        self.assertEqual(invalid_numbers.status_code, 422)
-
-        one_account = await self.client.post(
-            "/api/chatfarm/start", data={**base, "accounts": "alpha", "roulette_numbers": "0-36"}
+    async def test_chatfarm_start_rejects_legacy_roulette_scenario(self):
+        await db.upsert_account(
+            "alpha", api_id=123, api_hash="secret", enabled=1, session_status="authorized"
         )
-        self.assertEqual(one_account.status_code, 422)
+        with patch("web.app.tasks.runner.submit", new_callable=AsyncMock) as submit:
+            response = await self.client.post("/api/chatfarm/start", data={
+                "accounts": "alpha", "target_id": "-1001234567890",
+                "scenario_mode": "roulette", "roulette_numbers": "0-1001",
+                "automation_ack": "on",
+            })
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("только без сценариев", response.json()["detail"])
+        submit.assert_not_awaited()
+
+    async def test_settings_save_preserves_chat_reply_filters_and_destination(self):
+        await db.set_setting("farm_settings", json.dumps({
+            "reply_destination": "direct",
+            "reply_filter_include": "support",
+            "reply_filter_exclude": "spam",
+            "reply_only_questions": True,
+            "reply_probability_override": 0.55,
+        }))
+        response = await self.client.post("/api/settings/save", data={
+            "min_delay_sec": "1",
+            "max_delay_sec": "4",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        settings = response.json()["settings"]
+        self.assertEqual(settings["reply_destination"], "direct")
+        self.assertEqual(settings["reply_filter_include"], "support")
+        self.assertEqual(settings["reply_filter_exclude"], "spam")
+        self.assertTrue(settings["reply_only_questions"])
+        self.assertEqual(settings["reply_probability_override"], 0.55)
 
     async def test_settings_save_and_secret_masking(self):
         response = await self.client.post("/api/settings/save", data={

@@ -51,6 +51,16 @@ DEFAULT_FARM_SETTINGS: dict[str, Any] = {
     "min_delay_sec": 2.0,
     "max_delay_sec": 8.0,
     "default_reply_probability": 0.25,
+    # None preserves per-account probabilities; a number overrides every active account.
+    "reply_probability_override": None,
+    "reply_destination": "group",
+    "auto_replies_enabled": True,
+    "direct_message_acknowledged": False,
+    "reply_filter_include": "",
+    "reply_filter_exclude": "",
+    "reply_only_questions": False,
+    "comment_post_include_filter": "",
+    "comment_post_exclude_filter": "",
     "reaction_probability": 0.35,
     "qa_probability": 0.25,
     "clone_probability": 0.25,
@@ -223,6 +233,27 @@ def load_farm_settings(
         except (TypeError, ValueError):
             value = float(DEFAULT_FARM_SETTINGS[key])
         settings[key] = max(0.0, min(1.0, value)) if math.isfinite(value) else float(DEFAULT_FARM_SETTINGS[key])
+
+    raw_override = settings.get("reply_probability_override")
+    if raw_override in (None, ""):
+        settings["reply_probability_override"] = None
+    else:
+        try:
+            override = float(raw_override)
+        except (TypeError, ValueError, OverflowError):
+            override = float("nan")
+        settings["reply_probability_override"] = (
+            max(0.0, min(1.0, override)) if math.isfinite(override) else None
+        )
+    destination = str(settings.get("reply_destination") or "group").strip().lower()
+    settings["reply_destination"] = destination if destination in {"group", "direct"} else "group"
+    settings["auto_replies_enabled"] = _as_bool(settings.get("auto_replies_enabled"))
+    settings["direct_message_acknowledged"] = _as_bool(settings.get("direct_message_acknowledged"))
+    settings["reply_filter_include"] = str(settings.get("reply_filter_include") or "").strip()[:1000]
+    settings["reply_filter_exclude"] = str(settings.get("reply_filter_exclude") or "").strip()[:1000]
+    settings["reply_only_questions"] = _as_bool(settings.get("reply_only_questions"))
+    settings["comment_post_include_filter"] = str(settings.get("comment_post_include_filter") or "").strip()[:1000]
+    settings["comment_post_exclude_filter"] = str(settings.get("comment_post_exclude_filter") or "").strip()[:1000]
 
     settings["agent_prompt"] = str(settings.get("agent_prompt") or DEFAULT_FARM_SETTINGS["agent_prompt"]).strip()[:5000]
     settings["proactive_enabled"] = _as_bool(settings.get("proactive_enabled"))
