@@ -111,6 +111,91 @@ class SessionScanTests(unittest.IsolatedAsyncioTestCase):
         cached_client.get_me.assert_awaited_once()
         self.assertEqual((await db.get_account("alice"))["session_status"], "authorized")
 
+    async def test_unavailable_proxy_without_backup_keeps_session_and_account(self):
+        (self.sessions_dir / "alice.session").write_bytes(b"valid session stub")
+        await db.upsert_account(
+            "alice", api_id=12345, api_hash="valid-app-hash",
+            proxy="socks5://dead.example:1080", enabled=1, session_status="authorized",
+        )
+        fake_client = SimpleNamespace(is_initialized=False, is_connected=False)
+        account_manager = manager_module.AccountManager()
+        with (
+            patch.object(manager_module, "Client", return_value=fake_client),
+            patch.object(
+                manager_module,
+                "connect_client_with_timeout",
+                new=AsyncMock(side_effect=ConnectionError("[Errno 111] Connection refused")),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "запасные прокси других аккаунтов не найдены"):
+                await account_manager.get_client("alice")
+
+        self.assertEqual((await db.get_account("alice"))["session_status"], "authorized")
+        self.assertTrue((self.sessions_dir / "alice.session").exists())
+
+    async def test_get_client_retries_another_accounts_proxy_and_persists_the_working_one(self):
+        original_proxy = "socks5://dead.example:1080"
+        replacement_proxy = "socks5://working.example:1080"
+        await db.upsert_account(
+            "alice", api_id=12345, api_hash="valid-app-hash", proxy=original_proxy,
+            enabled=1, session_status="authorized",
+        )
+        await db.upsert_account("bob", proxy=replacement_proxy, enabled=1)
+        user = SimpleNamespace(id=77, username="alice_tg", first_name="Alice", phone_number="+10000000000")
+        clients = [
+            SimpleNamespace(is_initialized=False, is_connected=False, get_me=AsyncMock(return_value=user)),
+            SimpleNamespace(is_initialized=False, is_connected=False, get_me=AsyncMock(return_value=user)),
+        ]
+        account_manager = manager_module.AccountManager()
+        with (
+            patch.object(manager_module, "Client", side_effect=clients) as client_factory,
+            patch.object(
+                manager_module,
+                "connect_client_with_timeout",
+                new=AsyncMock(side_effect=[ConnectionError("[Errno 111] Connection refused"), True]),
+            ) as connect,
+        ):
+            client = await account_manager.get_client("alice")
+
+        self.assertIs(client, clients[1])
+        self.assertEqual(connect.await_count, 2)
+        self.assertEqual(connect.await_args_list[0].args[1], original_proxy)
+        self.assertEqual(connect.await_args_list[1].args[1], manager_module.parse_proxy(replacement_proxy))
+        self.assertEqual(client_factory.call_count, 2)
+        self.assertEqual(client_factory.call_args.kwargs["proxy"], manager_module.parse_proxy(replacement_proxy))
+        self.assertEqual((await db.get_account("alice"))["proxy"], replacement_proxy)
+
+    async def test_verify_session_retries_another_accounts_proxy(self):
+        original_proxy = "socks5://dead.example:1080"
+        replacement_proxy = "socks5://working.example:1080"
+        (self.sessions_dir / "alice.session").write_bytes(b"test session stub")
+        await db.upsert_account(
+            "alice", api_id=12345, api_hash="valid-app-hash", proxy=original_proxy,
+            enabled=1, session_status="authorized",
+        )
+        await db.upsert_account("bob", proxy=replacement_proxy, enabled=1)
+        user = SimpleNamespace(id=77, username="alice_tg", first_name="Alice", phone_number="+10000000000")
+        clients = [
+            SimpleNamespace(is_initialized=False, is_connected=False, get_me=AsyncMock(return_value=user)),
+            SimpleNamespace(is_initialized=False, is_connected=False, get_me=AsyncMock(return_value=user)),
+        ]
+        account_manager = manager_module.AccountManager()
+        with (
+            patch.object(manager_module, "Client", side_effect=clients),
+            patch.object(
+                manager_module,
+                "connect_client_with_timeout",
+                new=AsyncMock(side_effect=[ConnectionError("[Errno 111] Connection refused"), True]),
+            ) as connect,
+        ):
+            result = await account_manager.verify_session(
+                "alice", 12345, "valid-app-hash", "+10000000000", original_proxy
+            )
+
+        self.assertEqual(connect.await_count, 2)
+        self.assertEqual(result["proxy"], replacement_proxy)
+        self.assertEqual((await db.get_account("alice"))["proxy"], replacement_proxy)
+
     async def test_prepare_for_farm_releases_panel_clients_and_blocks_reconnects(self):
         client = SimpleNamespace(
             is_connected=True,

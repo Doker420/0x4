@@ -2,7 +2,8 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from pyrogram.errors import SessionPasswordNeeded
 
@@ -58,6 +59,48 @@ class SessionAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         await manager.manager.close()
         self.patcher.stop()
         self.tempdir.cleanup()
+
+    async def test_auth_flow_retries_a_proxy_from_another_account(self):
+        original_proxy = "socks5://dead.example:1080"
+        replacement_proxy = "socks5://working.example:1080"
+        await db.upsert_account("existing", proxy=replacement_proxy, enabled=1)
+        account_manager = manager.AccountManager()
+        auth_flow = manager.SessionAuthFlow(account_manager)
+        clients = [
+            SimpleNamespace(is_initialized=False, is_connected=False),
+            SimpleNamespace(
+                is_initialized=False,
+                is_connected=False,
+                send_code=AsyncMock(return_value=SimpleNamespace(phone_code_hash="auth-code-hash")),
+            ),
+        ]
+        try:
+            with (
+                patch.object(manager, "Client", side_effect=clients),
+                patch.object(
+                    manager,
+                    "connect_client_with_timeout",
+                    new=AsyncMock(side_effect=[ConnectionError("[Errno 111] Connection refused"), False]),
+                ) as connect,
+            ):
+                started = await auth_flow.start(
+                    name="new_account",
+                    api_id=12345,
+                    api_hash="hash-for-tests",
+                    phone="+10000000000",
+                    proxy=original_proxy,
+                )
+
+            self.assertEqual(started["status"], "code_required")
+            self.assertEqual(connect.await_count, 2)
+            self.assertEqual(connect.await_args_list[0].args[1], original_proxy)
+            self.assertEqual(
+                connect.await_args_list[1].args[1], manager.parse_proxy(replacement_proxy)
+            )
+            self.assertEqual(auth_flow._pending["new_account"]["proxy"], replacement_proxy)
+            self.assertIs(auth_flow._pending["new_account"]["client"], clients[1])
+        finally:
+            await auth_flow.cancel("new_account")
 
     async def test_phone_code_and_two_factor_flow_saves_authorized_account(self):
         with patch.object(manager, "Client", FakeTelegramClient):

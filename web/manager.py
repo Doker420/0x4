@@ -9,7 +9,7 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
@@ -23,6 +23,7 @@ SESSIONS_DIR = ROOT / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 AUTH_TTL_SECONDS = 10 * 60
+MAX_PROXY_FALLBACK_ATTEMPTS = 8
 
 
 class SessionNotAuthorizedError(RuntimeError):
@@ -198,6 +199,20 @@ def _validate_proxy(proxy: Dict[str, Any]) -> Dict[str, Any]:
     return proxy
 
 
+def _proxy_storage_value(proxy: str | Dict[str, Any]) -> str:
+    return proxy.strip() if isinstance(proxy, str) else json.dumps(proxy, ensure_ascii=False)
+
+
+def _proxy_identity(proxy: Dict[str, Any]) -> tuple[str, str, int, str, str]:
+    return (
+        str(proxy.get("scheme") or "socks5").casefold(),
+        str(proxy.get("hostname") or "").casefold(),
+        int(proxy.get("port") or 0),
+        str(proxy.get("username") or ""),
+        str(proxy.get("password") or ""),
+    )
+
+
 async def test_proxy_connection(proxy_val: str | Dict[str, Any]) -> Dict[str, Any]:
     """Check that a proxy TCP endpoint can be reached (does not test credentials)."""
     try:
@@ -290,6 +305,111 @@ class AccountManager:
         self._lock = asyncio.Lock()
         self._scan_lock = asyncio.Lock()
 
+    async def _other_proxy_candidates(
+        self,
+        account_name: str,
+        current_proxy: str | Dict[str, Any] | None,
+    ) -> List[tuple[str, str, Dict[str, Any]]]:
+        configured: list[tuple[str, Any]] = []
+        for row in await db.list_accounts():
+            name = str(row.get("name") or "")
+            if name and name != account_name and row.get("proxy"):
+                configured.append((name, row["proxy"]))
+
+        config_path = ROOT / "farm_config.json"
+        if config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(config, dict):
+                    entries = config.get("accounts", [])
+                    if not isinstance(entries, list):
+                        entries = []
+                    for entry in entries:
+                        source_name = str(entry.get("name") or "").strip() if isinstance(entry, dict) else ""
+                        if source_name and source_name != account_name and entry.get("proxy"):
+                            configured.append((source_name, entry["proxy"]))
+            except Exception as exc:
+                log.warning("Не удалось прочитать запасные прокси из farm_config.json (%s)", type(exc).__name__)
+
+        seen: set[tuple[str, str, int, str, str]] = set()
+        if current_proxy:
+            try:
+                current_text = _proxy_storage_value(current_proxy)
+                current = parse_proxy(current_text)
+                if current:
+                    seen.add(_proxy_identity(current))
+            except (TypeError, ValueError):
+                pass
+
+        candidates: List[tuple[str, str, Dict[str, Any]]] = []
+        for source_name, raw_proxy in configured:
+            try:
+                stored = _proxy_storage_value(raw_proxy)
+                parsed = parse_proxy(stored)
+                if not parsed:
+                    continue
+                identity = _proxy_identity(parsed)
+            except (TypeError, ValueError):
+                continue
+            if identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append((source_name, stored, parsed))
+            if len(candidates) >= MAX_PROXY_FALLBACK_ATTEMPTS:
+                break
+        return candidates
+
+    async def _connect_with_proxy_fallback(
+        self,
+        client: Client,
+        account_name: str,
+        current_proxy: str | Dict[str, Any] | None,
+        client_factory: Callable[[str], Client],
+        *,
+        timeout: float = 20.0,
+    ) -> tuple[Client, bool, str | Dict[str, Any] | None]:
+        try:
+            authorized = await connect_client_with_timeout(client, current_proxy, timeout=timeout)
+            return client, authorized, current_proxy
+        except (ConnectionError, TimeoutError) as first_error:
+            candidates = await self._other_proxy_candidates(account_name, current_proxy)
+            await self._disconnect(client)
+            if not candidates:
+                connection_label = "прокси" if current_proxy else "прямое подключение"
+                raise RuntimeError(
+                    f"{connection_label.capitalize()} аккаунта {account_name} недоступно; "
+                    f"запасные прокси других аккаунтов не найдены: {first_error}"
+                ) from first_error
+
+            last_error: BaseException = first_error
+            log.warning("[%s] подключение через исходный прокси не удалось; перебираю прокси других аккаунтов", account_name)
+            for source_name, replacement_proxy, parsed_proxy in candidates:
+                candidate_client = client_factory(replacement_proxy)
+                try:
+                    authorized = await connect_client_with_timeout(
+                        candidate_client, parsed_proxy, timeout=timeout
+                    )
+                except OSError as exc:
+                    last_error = exc
+                    await self._disconnect(candidate_client)
+                    log.info("[%s] прокси аккаунта %s не подошёл", account_name, source_name)
+                    continue
+
+                try:
+                    replacement_proxy = await persist_account_proxy(account_name, replacement_proxy)
+                except Exception as exc:
+                    log.warning(
+                        "[%s] запасной прокси применён, но не сохранён в настройках (%s)",
+                        account_name,
+                        type(exc).__name__,
+                    )
+                log.warning("[%s] переключился на рабочий прокси аккаунта %s", account_name, source_name)
+                return candidate_client, authorized, replacement_proxy
+
+            raise RuntimeError(
+                f"Исходное подключение аккаунта {account_name} и прокси других аккаунтов недоступны: {last_error}"
+            ) from last_error
+
     def farm_sessions_busy(self) -> bool:
         return self._farm_reserved or farm_process_running()
 
@@ -333,18 +453,22 @@ class AccountManager:
             if not account.get("api_id") or not account.get("api_hash"):
                 raise RuntimeError(f"Для аккаунта {name} не заданы API ID/API Hash")
 
-            client = Client(**_client_kwargs(
+            current_proxy = account.get("proxy") or ""
+            make_client = lambda proxy_value: Client(**_client_kwargs(
                 name,
                 int(account["api_id"]),
                 str(account["api_hash"]),
                 account.get("phone") or "",
-                account.get("proxy") or "",
+                proxy_value,
             ))
+            client = make_client(current_proxy)
             previously_authorized = account.get("session_status") == "authorized"
             try:
                 # Do not call start() on an unregistered session: start() may wait for
                 # terminal input. Web workers must fail fast and never prompt in logs.
-                authorized = await connect_client_with_timeout(client, account.get("proxy") or "")
+                client, authorized, _ = await self._connect_with_proxy_fallback(
+                    client, name, current_proxy, make_client
+                )
                 if not authorized:
                     if previously_authorized:
                         raise SessionVerificationError(
@@ -494,7 +618,12 @@ class AccountManager:
                 self._clients.pop(name, None)
                 await self._disconnect(cached)
 
-            client = cached if use_cached else Client(**_client_kwargs(name, api_id, api_hash, phone, proxy))
+            current_proxy = proxy or ""
+            effective_proxy = current_proxy
+            make_client = lambda proxy_value: Client(**_client_kwargs(
+                name, api_id, api_hash, phone, proxy_value
+            ))
+            client = cached if use_cached else make_client(current_proxy)
             try:
                 if use_cached:
                     # Never open a second Pyrogram SQLite connection to the same
@@ -503,7 +632,9 @@ class AccountManager:
                 else:
                     # Do not call start() on an unregistered session: start() may
                     # wait for terminal input in a headless web worker.
-                    authorized = await connect_client_with_timeout(client, proxy)
+                    client, authorized, effective_proxy = await self._connect_with_proxy_fallback(
+                        client, name, current_proxy, make_client
+                    )
                     if not authorized:
                         if previously_authorized:
                             raise SessionVerificationError(
@@ -523,13 +654,14 @@ class AccountManager:
                         "Сессия не авторизована; войдите по номеру телефона и коду"
                     )
 
-                result = _user_info(user, name, proxy)
+                effective_proxy_text = _proxy_storage_value(effective_proxy) if effective_proxy else ""
+                result = _user_info(user, name, effective_proxy_text)
                 await db.upsert_account(
                     name,
                     api_id=int(api_id),
                     api_hash=str(api_hash),
                     phone=phone or result.get("phone", ""),
-                    proxy=proxy.strip() if proxy else "",
+                    proxy=effective_proxy_text,
                     tg_id=result["tg_id"],
                     username=result["username"],
                     first_name=result["first_name"],
@@ -719,13 +851,19 @@ class SessionAuthFlow:
             await self.account_manager.reserve_for_auth(name)
             client: Optional[Client] = None
             try:
-                client = Client(**_client_kwargs(name, int(api_id), str(api_hash).strip(), phone, proxy))
-                authorized = await connect_client_with_timeout(client, proxy)
+                make_client = lambda proxy_value: Client(**_client_kwargs(
+                    name, int(api_id), str(api_hash).strip(), phone, proxy_value
+                ))
+                client = make_client(proxy)
+                client, authorized, effective_proxy = await self.account_manager._connect_with_proxy_fallback(
+                    client, name, proxy, make_client
+                )
+                effective_proxy_text = _proxy_storage_value(effective_proxy) if effective_proxy else ""
                 credentials = {
                     "api_id": int(api_id),
                     "api_hash": str(api_hash).strip(),
                     "phone": phone,
-                    "proxy": proxy,
+                    "proxy": effective_proxy_text,
                     "persona": persona.strip(),
                     "reply_probability": probability,
                     "media_bias": normalize_media_bias(media_bias),
@@ -734,7 +872,7 @@ class SessionAuthFlow:
                 if authorized:
                     me = await client.get_me()
                     await self._finish(name, client, me, credentials)
-                    return {"status": "authorized", "info": _user_info(me, name, proxy)}
+                    return {"status": "authorized", "info": _user_info(me, name, effective_proxy_text)}
 
                 sent_code = await client.send_code(phone)
                 self._pending[name] = {
@@ -742,7 +880,7 @@ class SessionAuthFlow:
                     "api_id": int(api_id),
                     "api_hash": str(api_hash).strip(),
                     "phone": phone,
-                    "proxy": proxy,
+                    "proxy": effective_proxy_text,
                     "persona": persona.strip(),
                     "reply_probability": probability,
                     "media_bias": normalize_media_bias(media_bias),
