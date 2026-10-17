@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Создать профиль · 0x4{% endblock %}
+{% block content %}
+<div class="card" style="max-width:440px;margin:clamp(40px,10vh,100px) auto;padding:clamp(24px,5vw,38px)">
+  <p class="eyebrow">Первый запуск</p><h1 style="font-size:28px">Профиль владельца</h1>
+  <p class="subtle" style="margin-bottom:24px">Создайте единственный профиль для доступа к панели.</p>
+  <form method="post" action="/register">
+    <div class="field"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required></div>
+    <div class="field"><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="10" required><span class="help">Минимум 10 символов.</span></div>
+    <button type="submit" style="width:100%;margin-top:6px">Создать профиль</button>
+  </form>
+  <p class="help" style="margin-top:18px"><a href="/login">← Вернуться ко входу</a></p>
+</div>
+{% endblock %}

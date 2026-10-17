@@ -1,0 +1,4 @@
+-r requirements-web.txt
+aiogram>=3.13,<4
+playwright>=1.44
+wasmtime>=21.0

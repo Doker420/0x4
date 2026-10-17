@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Задачи · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div><p class="eyebrow">Фоновые операции</p><h1>Очередь задач</h1><p class="subtle">История вступлений, комментариев, парсинга и фоновых запусков.</p></div>
+  <button class="secondary" type="button" onclick="location.reload()">⟳ Обновить</button>
+</section>
+<div class="card">
+  {% if tasks %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Операция</th><th>Статус</th><th>Создано</th><th>Результат / ошибка</th></tr></thead>
+    <tbody>
+    {% for task in tasks %}
+      <tr>
+        <td><strong>#{{ task.id }}</strong></td>
+        <td>{{ task.kind }}</td>
+        <td><span class="badge badge-{{ task.status }}">{{ task.status }}</span></td>
+        <td><small>{{ task.created_at|round(0)|int }}</small></td>
+        <td><pre style="margin:0;max-height:150px">{{ task.result or task.error or 'Ожидает выполнения' }}</pre></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<div class="empty">Задач пока нет.</div>{% endif %}
+</div>
+{% endblock %}

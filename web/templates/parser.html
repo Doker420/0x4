@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Парсер · 0x4{% endblock %}
+{% block content %}
+<section class="page-head"><div><p class="eyebrow">Экспорт данных</p><h1>Участники чата</h1><p class="subtle">Сохранить список участников в JSON. Учитывайте настройки приватности и правила Telegram.</p></div></section>
+<div class="card" style="max-width:680px">
+  <form onsubmit="startParser(event)">
+    <div class="field"><label>Аккаунт-читатель</label><select name="reader" required>{% for a in accounts %}<option value="{{ a.name }}">{{ a.name }} · {{ a.phone or 'аккаунт' }}</option>{% endfor %}</select></div>
+    <div class="field"><label>ID чата</label><input name="chat_id" type="number" placeholder="-1001234567890" required></div>
+    <div class="field"><label>Лимит участников</label><input name="limit" type="number" min="1" max="10000" value="1000"></div>
+    <button type="submit">Добавить задачу</button>
+  </form>
+</div>
+<div id="parser_output" class="notice" hidden></div>
+<script>
+async function startParser(event){event.preventDefault();const output=document.getElementById('parser_output');try{const data=await postForm('/api/parser/users',event.target);showMessage(output,`Задача №${data.task_id} добавлена. Результат появится в разделе «Задачи».`,'success');}catch(error){showMessage(output,error.message,'error');}}
+</script>
+{% endblock %}

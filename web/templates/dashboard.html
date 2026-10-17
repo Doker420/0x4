@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Обзор · 0x4{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div><p class="eyebrow">Панель управления</p><h1>Добро пожаловать</h1><p class="subtle">Состояние Telegram-сессий, чат-агентов и последних операций.</p></div>
+  <div class="actions"><a class="button secondary" href="/accounts">Управлять сессиями</a><a class="button" href="/chatfarm">Открыть чат</a></div>
+</section>
+<div class="stat-grid">
+  <div class="stat-card"><div class="stat-label">АККАУНТЫ В ПАНЕЛИ</div><div class="stat-value">{{ accounts|length }}</div><span class="help">{{ accounts|selectattr('enabled')|list|length }} включено</span></div>
+  <div class="stat-card"><div class="stat-label">АВТОРИЗОВАННЫЕ СЕССИИ</div><div class="stat-value">{{ accounts|selectattr('session_status', 'equalto', 'authorized')|list|length }}</div><span class="help">Проверить сессии можно в разделе «Аккаунты»</span></div>
+  <div class="stat-card"><div class="stat-label">ПОСЛЕДНИЕ ЗАДАЧИ</div><div class="stat-value">{{ tasks|length }}</div><span class="help">Полная очередь — в разделе «Задачи»</span></div>
+</div>
+<div class="grid" style="grid-template-columns:minmax(280px,.85fr) minmax(350px,1.15fr)">
+  <section class="card">
+    <div class="card-head"><div><h2>Сессии</h2><p class="subtle">Профиль и состояние Telegram.</p></div><a href="/accounts">Все →</a></div>
+    {% if accounts %}
+      {% for a in accounts[:6] %}
+      <div class="check-row" style="padding:8px 0;border-bottom:1px solid rgba(112,141,176,.12)">
+        <span class="brand-mark" style="width:30px;height:30px;font-size:12px">{{ (a.first_name or a.name)[0]|upper }}</span>
+        <span style="flex:1"><strong>{{ a.name }}</strong><small style="display:block">{{ a.phone or (('@' + a.username) if a.username else 'Телефон не указан') }}</small></span>
+        <span class="badge {{ 'badge-authorized' if a.session_status == 'authorized' else 'badge-unknown' }}">{{ 'готова' if a.session_status == 'authorized' else 'не проверена' }}</span>
+      </div>
+      {% endfor %}
+    {% else %}<div class="empty">Подключённых аккаунтов пока нет.</div>{% endif %}
+  </section>
+  <section class="card">
+    <div class="card-head"><div><h2>Последние задачи</h2><p class="subtle">Статус очереди в фоновом режиме.</p></div><a href="/tasks">Все →</a></div>
+    {% if tasks %}<div class="table-wrap"><table style="min-width:520px"><thead><tr><th>Задача</th><th>Статус</th><th>Результат</th></tr></thead><tbody>
+      {% for task in tasks[:8] %}<tr><td><strong>#{{ task.id }}</strong> · {{ task.kind }}</td><td><span class="badge badge-{{ task.status }}">{{ task.status }}</span></td><td><small>{{ (task.result or task.error or 'В очереди')[:120] }}</small></td></tr>{% endfor %}
+    </tbody></table></div>{% else %}<div class="empty">Задач пока нет.</div>{% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Комментарии · 0x4{% endblock %}
+{% block content %}
+<section class="page-head"><div><p class="eyebrow">Публикации</p><h1>Комментарии</h1><p class="subtle">Подготовьте текст, проверьте его и отправьте от выбранного Telegram-аккаунта.</p></div></section>
+<div class="grid">
+  <section class="card">
+    <h2>1 · Подготовить текст</h2>
+    <p class="subtle">DeepSeek bridge нужен для генерации; текст можно ввести вручную.</p>
+    <form onsubmit="generateComment(event)">
+      <div class="field"><label for="gen_url">Ссылка на публикацию</label><input id="gen_url" name="url" placeholder="https://t.me/channel/123" required></div>
+      <div class="field"><label>Контекст / тональность</label><input name="topic" placeholder="Например: поздравить автора, без лишнего пафоса"></div>
+      <button type="submit" class="secondary">✦ Сгенерировать</button>
+    </form>
+  </section>
+  <section class="card">
+    <h2>2 · Отправить</h2>
+    {% if accounts %}
+    <form onsubmit="postComment(event)">
+      <div class="field"><label>Аккаунт</label><select name="account" required>{% for account in accounts %}<option value="{{ account.name }}">{{ account.name }} · {{ account.phone or 'без телефона' }}</option>{% endfor %}</select></div>
+      <div class="field"><label for="post_url">Ссылка на публикацию</label><input id="post_url" name="url" placeholder="https://t.me/channel/123" required></div>
+      <div class="field"><label for="post_comment">Текст</label><textarea id="post_comment" name="comment" placeholder="Ваш комментарий" required></textarea></div>
+      <button type="submit">Добавить в очередь</button>
+    </form>
+    {% else %}<div class="empty">Сначала подключите аккаунт Telegram.</div>{% endif %}
+  </section>
+</div>
+<div id="comments_output" class="notice" hidden></div>
+<script>
+async function generateComment(event) {
+  event.preventDefault(); const output = document.getElementById('comments_output'); showMessage(output, 'Генерирую…');
+  try { const data = await postForm('/api/comments/generate', event.target); document.getElementById('post_comment').value = data.text || ''; document.getElementById('post_url').value = document.getElementById('gen_url').value; showMessage(output, 'Текст готов. Проверьте и отправьте вручную.', 'success'); }
+  catch (error) { showMessage(output, error.message, 'error'); }
+}
+async function postComment(event) {
+  event.preventDefault(); const output = document.getElementById('comments_output');
+  try { const data = await postForm('/api/comments/post', event.target); showMessage(output, `Задача №${data.task_id} добавлена в очередь.`, 'success'); }
+  catch (error) { showMessage(output, error.message, 'error'); }
+}
+</script>
+{% endblock %}

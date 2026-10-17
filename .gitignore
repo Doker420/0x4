@@ -1,0 +1,30 @@
+# Local configuration / credentials
+.env
+farm_config.json
+system_prompt.txt
+
+# Telegram sessions and user data
+sessions/
+*.session
+*.session-journal
+data/*
+!data/.gitkeep
+!data/donor/.gitkeep
+
+# Unbundled local DeepSeek bridge
+vendor/
+
+# Runtime and Python artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.coverage
+
+# Uploaded archives / local databases
+Fix1.zip*
+/0x4-telegram-control-panel.zip
+*.db
+*.db-shm
+*.db-wal
