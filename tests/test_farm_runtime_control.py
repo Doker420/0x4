@@ -7,6 +7,20 @@ import farm
 
 
 class FarmRuntimeControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_account_start_checks_proxy_before_connecting(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "alpha"
+        account.proxy_config = {"scheme": "socks5", "hostname": "proxy.example", "port": 1080}
+        account.client = SimpleNamespace(is_initialized=False, is_connected=False)
+        with patch(
+            "web.manager.connect_client_with_timeout",
+            new=AsyncMock(side_effect=ConnectionError("Прокси недоступен")),
+        ) as connect:
+            with self.assertRaisesRegex(ConnectionError, "Прокси недоступен"):
+                await account.start()
+
+        connect.assert_awaited_once_with(account.client, account.proxy_config, timeout=20.0)
+
     async def test_update_settings_changes_live_account_probability_and_filters(self):
         settings = load_farm_settings({"scenario_mode": "reactive"})
         account = SimpleNamespace(

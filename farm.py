@@ -2352,27 +2352,31 @@ class FarmAccount:
                 from web.manager import parse_proxy
                 client_kwargs["proxy"] = parse_proxy(proxy)
             elif isinstance(proxy, dict):
-                client_kwargs["proxy"] = proxy
+                client_kwargs["proxy"] = dict(proxy)
             else:
                 raise ValueError(f"Неверный прокси для аккаунта {self.name}")
+        self.proxy_config = client_kwargs.get("proxy")
 
         self.client = Client(**client_kwargs)
         self._running = False
         self._task: asyncio.Task | None = None
 
-    async def start(self, timeout: float = 90.0) -> None:
+    async def start(self, timeout: float = 20.0) -> None:
         log.info("[%s] start()", self.name)
         try:
-            authorized = await asyncio.wait_for(self.client.connect(), timeout=timeout)
+            from web.manager import connect_client_with_timeout
+            authorized = await connect_client_with_timeout(
+                self.client, getattr(self, "proxy_config", None), timeout=timeout
+            )
             if not authorized:
                 raise RuntimeError("Сессия не авторизована — подключите её в веб-панели")
             await self.client.invoke(raw.functions.updates.GetState())
             me = await self.client.get_me()
             self.client.me = me
             await self.client.initialize()
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             await self._close_client_connection()
-            raise RuntimeError(f"[{self.name}] start timeout") from exc
+            raise RuntimeError(f"[{self.name}] тайм-аут подключения к Telegram после {timeout:g} сек.") from exc
         except Exception:
             await self._close_client_connection()
             raise
@@ -2468,6 +2472,10 @@ class FarmAccount:
         if not self._is_in_configured_topic(message):
             return
 
+        message_kind = self._message_kind(message)
+        description = str(
+            getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        ).strip()
         text = self._message_text(message)
         is_question = self._looks_like_question(text)
         # A message that answers one of our own lines is an invitation to keep talking.
@@ -2491,13 +2499,23 @@ class FarmAccount:
                 "message_id": int(message.id),
                 "chat_id": chat_id,
                 "text": text,
-                "kind": self._message_kind(message),
+                "kind": message_kind,
                 "direction": "incoming",
                 "is_bot": bool(getattr(sender, "is_bot", False)),
                 "is_question": is_question,
                 "ts": datetime.now().isoformat(timespec="seconds"),
             })
             self.state.mark_activity()
+
+        if message_kind in {"audio", "voice", "video"} or (message_kind == "gif" and not description):
+            if message_kind in {"audio", "voice"}:
+                reason = "аудио/музыка"
+            elif message_kind == "video":
+                reason = "видео"
+            else:
+                reason = "GIF без описания"
+            log.info("[%s] %s %s сохранено в ленте без AI-ответа", self.name, reason, message.id)
+            return
 
         if not farm_cfg.get("auto_replies_enabled", True):
             log.info("[%s] автоматические AI-ответы выключены; сообщение %s осталось в ленте", self.name, message.id)
@@ -2719,10 +2737,21 @@ class FarmAccount:
             ("voice", "voice"),
             ("audio", "audio"),
             ("video", "video"),
-            ("document", "file"),
+            ("video_note", "video"),
         ):
             if getattr(message, attr, None):
                 return kind
+        document = getattr(message, "document", None)
+        if document:
+            mime_type = str(getattr(document, "mime_type", "") or "").casefold()
+            file_name = str(getattr(document, "file_name", "") or "").casefold()
+            if mime_type == "image/gif" or file_name.endswith(".gif"):
+                return "gif"
+            if mime_type.startswith("audio/"):
+                return "audio"
+            if mime_type.startswith("video/"):
+                return "video"
+            return "file"
         return "text"
 
     @classmethod
@@ -4693,7 +4722,7 @@ async def _apply_runtime_control(
         cfg = await _load_runtime_account_config(name, farm_settings)
         account = FarmAccount(cfg, bridge, state, donor, accounts)
         try:
-            await account.start(timeout=90.0)
+            await account.start(timeout=20.0)
         except Exception:
             await account.stop()
             raise
@@ -5263,7 +5292,7 @@ async def run_farm() -> None:
             log.info("→ Запускаю аккаунт %s", name)
             account = FarmAccount(account_cfg, bridge, state, donor, accounts)
             try:
-                await account.start(timeout=90.0)
+                await account.start(timeout=20.0)
                 accounts.append(account)
                 log.info("   ✅ %s", name)
             except Exception as exc:

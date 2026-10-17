@@ -182,6 +182,71 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         await account._on_incoming(None, message)
         self.assertEqual(account._answer_incoming.await_count, 1)
 
+    async def test_unhelpful_gif_audio_and_video_are_kept_in_feed_without_auto_reply(self):
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        sender = types.SimpleNamespace(id=200, is_bot=False, username="human", first_name="Human")
+        media_messages = [
+            types.SimpleNamespace(id=81, animation=object(), caption=None, text=None),
+            types.SimpleNamespace(id=82, audio=object(), caption="Что это?", text=None),
+            types.SimpleNamespace(id=83, video=object(), caption="Как думаешь?", text=None),
+            types.SimpleNamespace(
+                id=84, document=types.SimpleNamespace(mime_type="audio/mpeg"), caption=None, text=None,
+            ),
+            types.SimpleNamespace(id=85, video_note=object(), caption=None, text=None),
+            types.SimpleNamespace(id=86, voice=object(), caption=None, text=None),
+            types.SimpleNamespace(
+                id=87,
+                document=types.SimpleNamespace(mime_type="image/gif", file_name="clip.gif"),
+                caption=None,
+                text=None,
+            ),
+        ]
+        for item in media_messages:
+            item.empty = False
+            item.service = None
+            item.chat = types.SimpleNamespace(id=-1001234567890)
+            item.from_user = sender
+            await account._on_incoming(None, item)
+
+        self.assertEqual(
+            [item["kind"] for item in state.chat_history],
+            ["gif", "audio", "video", "audio", "video", "voice", "gif"],
+        )
+        self.assertFalse(account._background_tasks)
+        account._answer_incoming.assert_not_awaited()
+
+    async def test_gif_with_a_caption_can_receive_a_reply(self):
+        state = farm.FarmState()
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "unit"
+        account.user_id = 100
+        account.state = state
+        account._running = True
+        account.reply_probability = 1.0
+        account.farm_accounts = [account]
+        account._background_tasks = set()
+        account._answer_incoming = AsyncMock()
+        message = types.SimpleNamespace(
+            id=86, empty=False, service=None, animation=object(), caption="Как тебе идея?", text=None,
+            chat=types.SimpleNamespace(id=-1001234567890),
+            from_user=types.SimpleNamespace(id=201, is_bot=False, username="human", first_name="Human"),
+        )
+
+        await account._on_incoming(None, message)
+        await asyncio.gather(*list(account._background_tasks))
+
+        account._answer_incoming.assert_awaited_once_with(message, "Как тебе идея?")
+        self.assertEqual(state.chat_history[0]["kind"], "gif")
+
     async def test_pending_ai_reply_is_cancelled_when_live_switch_turns_off(self):
         farm.FARM_CFG["farm"].update({
             "auto_replies_enabled": True,

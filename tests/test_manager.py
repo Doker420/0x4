@@ -1,6 +1,16 @@
+import asyncio
 import unittest
 
-from web.manager import parse_proxy, test_proxy_connection, validate_session_name
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from web import manager as manager_module
+from web.manager import (
+    connect_client_with_timeout,
+    parse_proxy,
+    test_proxy_connection,
+    validate_session_name,
+)
 
 
 class ManagerInputTests(unittest.IsolatedAsyncioTestCase):
@@ -32,6 +42,34 @@ class ManagerInputTests(unittest.IsolatedAsyncioTestCase):
         result = await test_proxy_connection("")
         self.assertFalse(result["ok"])
         self.assertIn("прокси", result["error"].lower())
+
+    async def test_refused_proxy_fails_before_pyrogram_connect_retry_loop(self):
+        client = SimpleNamespace(connect=AsyncMock())
+        with patch.object(manager_module, "test_proxy_connection", new=AsyncMock(return_value={
+            "ok": False, "host": "127.0.0.1", "port": 9971, "error": "[Errno 111] Connection refused",
+        })) as check:
+            with self.assertRaisesRegex(ConnectionError, "127.0.0.1:9971.*Connection refused"):
+                await connect_client_with_timeout(
+                    client,
+                    {"scheme": "socks5", "hostname": "127.0.0.1", "port": 9971},
+                    timeout=1,
+                )
+
+        check.assert_awaited_once()
+        client.connect.assert_not_awaited()
+
+    async def test_silent_proxy_or_network_timeout_is_bounded(self):
+        async def hang_forever():
+            await asyncio.Event().wait()
+
+        client = SimpleNamespace(connect=AsyncMock(side_effect=hang_forever))
+        with patch.object(manager_module, "test_proxy_connection", new=AsyncMock(return_value={"ok": True})):
+            with self.assertRaisesRegex(TimeoutError, "не завершилось за 0.01 сек"):
+                await connect_client_with_timeout(
+                    client,
+                    {"scheme": "socks5", "hostname": "proxy.example", "port": 1080},
+                    timeout=0.01,
+                )
 
 
 if __name__ == "__main__":

@@ -223,6 +223,27 @@ async def test_proxy_connection(proxy_val: str | Dict[str, Any]) -> Dict[str, An
         return {"ok": False, "host": host, "port": port, "error": str(exc)[:200]}
 
 
+async def connect_client_with_timeout(
+    client: Client,
+    proxy: str | Dict[str, Any] | None = None,
+    *,
+    timeout: float = 20.0,
+) -> bool:
+    """Fail fast on dead proxies and bound Pyrogram's reconnect loop."""
+    if proxy:
+        proxy_check = await test_proxy_connection(proxy)
+        if not proxy_check.get("ok"):
+            host = str(proxy_check.get("host") or "proxy")
+            port = proxy_check.get("port")
+            endpoint = f"{host}:{port}" if port else host
+            detail = str(proxy_check.get("error") or "connection refused")
+            raise ConnectionError(f"Прокси {endpoint} недоступен: {detail}")
+    try:
+        return bool(await asyncio.wait_for(client.connect(), timeout=max(0.1, float(timeout))))
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"Подключение к Telegram не завершилось за {timeout:g} сек.") from exc
+
+
 def _client_kwargs(
     name: str,
     api_id: int,
@@ -318,7 +339,7 @@ class AccountManager:
             try:
                 # Do not call start() on an unregistered session: start() may wait for
                 # terminal input. Web workers must fail fast and never prompt in logs.
-                authorized = await client.connect()
+                authorized = await connect_client_with_timeout(client, account.get("proxy") or "")
                 if not authorized:
                     if previously_authorized:
                         raise SessionVerificationError(
@@ -475,7 +496,7 @@ class AccountManager:
                 else:
                     # Do not call start() on an unregistered session: start() may
                     # wait for terminal input in a headless web worker.
-                    authorized = await client.connect()
+                    authorized = await connect_client_with_timeout(client, proxy)
                     if not authorized:
                         if previously_authorized:
                             raise SessionVerificationError(
@@ -689,7 +710,7 @@ class SessionAuthFlow:
             client: Optional[Client] = None
             try:
                 client = Client(**_client_kwargs(name, int(api_id), str(api_hash).strip(), phone, proxy))
-                authorized = await client.connect()
+                authorized = await connect_client_with_timeout(client, proxy)
                 credentials = {
                     "api_id": int(api_id),
                     "api_hash": str(api_hash).strip(),
