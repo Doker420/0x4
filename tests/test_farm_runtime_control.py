@@ -11,15 +11,81 @@ class FarmRuntimeControlTests(unittest.IsolatedAsyncioTestCase):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "alpha"
         account.proxy_config = {"scheme": "socks5", "hostname": "proxy.example", "port": 1080}
+        account.proxy_value = "socks5://proxy.example:1080"
+        account.cfg = {"name": "alpha"}
+        account._client_base_kwargs = {"name": "alpha"}
         account.client = SimpleNamespace(is_initialized=False, is_connected=False)
-        with patch(
-            "web.manager.connect_client_with_timeout",
-            new=AsyncMock(side_effect=ConnectionError("Прокси недоступен")),
-        ) as connect:
-            with self.assertRaisesRegex(ConnectionError, "Прокси недоступен"):
+        with (
+            patch.object(farm, "FARM_CFG", {"accounts": [], "_proxy_pool": []}),
+            patch(
+                "web.manager.connect_client_with_timeout",
+                new=AsyncMock(side_effect=ConnectionError("Прокси недоступен")),
+            ) as connect,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "прокси недоступен"):
                 await account.start()
 
         connect.assert_awaited_once_with(account.client, account.proxy_config, timeout=20.0)
+
+    async def test_account_start_purges_a_session_telegram_confirms_unauthorized(self):
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "revoked"
+        account.cfg = {"name": "revoked"}
+        account.proxy_config = None
+        account.proxy_value = None
+        account._client_base_kwargs = {"name": "revoked"}
+        account.client = SimpleNamespace(is_initialized=False, is_connected=False)
+        with (
+            patch.object(farm, "FARM_CFG", {"accounts": [], "_proxy_pool": []}),
+            patch("web.manager.connect_client_with_timeout", new=AsyncMock(return_value=False)),
+            patch("web.manager.purge_invalid_account", new=AsyncMock()) as purge,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "не авторизована"):
+                await account.start()
+
+        purge.assert_awaited_once_with("revoked", root=farm.ROOT, sessions_dir=farm.SESSIONS_DIR)
+
+    async def test_account_start_reuses_and_persists_another_account_proxy(self):
+        original_proxy = "socks5://dead.example:1080"
+        replacement_proxy = "socks5://working.example:1080"
+        from web.manager import parse_proxy
+
+        account = farm.FarmAccount.__new__(farm.FarmAccount)
+        account.name = "alpha"
+        account.cfg = {"name": "alpha", "proxy": original_proxy}
+        account.proxy_value = original_proxy
+        account.proxy_config = parse_proxy(original_proxy)
+        account._client_base_kwargs = {"name": "alpha", "api_id": 123, "api_hash": "hash"}
+        account.client = SimpleNamespace(is_initialized=False, is_connected=False)
+        replacement_client = SimpleNamespace(is_initialized=False, is_connected=False)
+        runtime_config = {
+            "_proxy_pool": [
+                {"name": "alpha", "proxy": original_proxy},
+                {"name": "beta", "proxy": replacement_proxy},
+            ],
+            "accounts": [
+                {"name": "alpha", "proxy": original_proxy},
+                {"name": "beta", "proxy": replacement_proxy},
+            ],
+        }
+        with (
+            patch.object(farm, "FARM_CFG", runtime_config),
+            patch.object(farm, "Client", return_value=replacement_client) as client_factory,
+            patch(
+                "web.manager.connect_client_with_timeout",
+                new=AsyncMock(side_effect=[ConnectionError("refused"), True]),
+            ) as connect,
+            patch("web.manager.persist_account_proxy", new=AsyncMock(return_value=replacement_proxy)) as persist,
+        ):
+            await account._connect_with_proxy_fallback(timeout=20.0)
+
+        self.assertEqual(connect.await_count, 2)
+        self.assertEqual(connect.await_args.args[1], parse_proxy(replacement_proxy))
+        self.assertEqual(client_factory.call_args.kwargs["proxy"], parse_proxy(replacement_proxy))
+        self.assertEqual(account.proxy_value, replacement_proxy)
+        self.assertEqual(account.cfg["proxy"], replacement_proxy)
+        self.assertEqual(runtime_config["accounts"][0]["proxy"], replacement_proxy)
+        persist.assert_awaited_once_with("alpha", replacement_proxy)
 
     async def test_update_settings_changes_live_account_probability_and_filters(self):
         settings = load_farm_settings({"scenario_mode": "reactive"})

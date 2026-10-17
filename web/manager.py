@@ -103,6 +103,11 @@ _SESSION_UNAUTHORIZED_ERROR_NAMES = {
     "authkeyinvalid",
     "sessionrevoked",
     "sessionexpired",
+    "authkeypermempty",
+    "activeuserrequired",
+    "userdeactivated",
+    "userdeactivatedban",
+    "phonenumberbanned",
 }
 
 
@@ -357,13 +362,15 @@ class AccountManager:
                 await self._disconnect(client)
                 raise
             except SessionNotAuthorizedError:
+                self._clients.pop(name, None)
                 await self._disconnect(client)
-                await db.upsert_account(name, session_status="unauthorized", last_checked_at=time.time())
+                await purge_invalid_account(name)
                 raise
             except Exception as exc:
                 await self._disconnect(client)
                 if _is_explicitly_unauthorized(exc):
-                    await db.upsert_account(name, session_status="unauthorized", last_checked_at=time.time())
+                    self._clients.pop(name, None)
+                    await purge_invalid_account(name)
                     raise SessionNotAuthorizedError(
                         "Telegram сообщил, что сессия больше не авторизована"
                     ) from exc
@@ -539,17 +546,15 @@ class AccountManager:
             except SessionNotAuthorizedError:
                 if use_cached:
                     self._clients.pop(name, None)
-                    await self._disconnect(client)
-                if await db.get_account(name):
-                    await db.upsert_account(name, session_status="unauthorized", last_checked_at=time.time())
+                await self._disconnect(client)
+                await purge_invalid_account(name)
                 raise
             except Exception as exc:
                 if _is_explicitly_unauthorized(exc):
                     if use_cached:
                         self._clients.pop(name, None)
-                        await self._disconnect(client)
-                    if await db.get_account(name):
-                        await db.upsert_account(name, session_status="unauthorized", last_checked_at=time.time())
+                    await self._disconnect(client)
+                    await purge_invalid_account(name)
                     raise SessionNotAuthorizedError(
                         "Telegram сообщил, что сессия больше не авторизована"
                     ) from exc
@@ -641,10 +646,15 @@ class AccountManager:
                     "first_name": info.get("first_name"),
                 })
             except SessionNotAuthorizedError as exc:
-                log.info("Session is logged out for %s", name)
-                if await db.get_account(name):
-                    await db.upsert_account(name, session_status="unauthorized", last_checked_at=time.time())
-                results.append({"name": name, "source": "sessions/", "status": "unauthorized", "error": str(exc)[:200]})
+                log.info("Removing logged-out session for %s", name)
+                if await db.get_account(name) or path.exists():
+                    await purge_invalid_account(name)
+                results.append({
+                    "name": name,
+                    "source": "sessions/",
+                    "status": "deleted",
+                    "error": str(exc)[:200],
+                })
             except Exception as exc:
                 log.info("Session check temporarily failed for %s (%s)", name, type(exc).__name__)
                 results.append({
@@ -741,10 +751,12 @@ class SessionAuthFlow:
                     "expires_at": time.monotonic() + AUTH_TTL_SECONDS,
                 }
                 return {"status": "code_required", "phone": _mask_phone(phone)}
-            except Exception:
+            except Exception as exc:
                 if client is not None:
                     await self.account_manager._disconnect(client)
                 await self.account_manager.release_auth_reservation(name)
+                if _is_explicitly_unauthorized(exc):
+                    await purge_invalid_account(name)
                 raise
 
     async def submit_code(self, name: str, code: str) -> Dict[str, Any]:
@@ -757,7 +769,10 @@ class SessionAuthFlow:
                 )
             except SessionPasswordNeeded:
                 return {"status": "password_required"}
-            except Exception:
+            except Exception as exc:
+                if _is_explicitly_unauthorized(exc):
+                    await self._cancel_locked(name)
+                    await purge_invalid_account(name)
                 raise
             await self._finish(name, pending["client"], user, pending)
             return {"status": "authorized", "info": _user_info(user, name, pending["proxy"])}
@@ -766,7 +781,13 @@ class SessionAuthFlow:
         name = validate_session_name(name)
         async with self._lock:
             pending = await self._require_pending(name)
-            user = await pending["client"].check_password(password)
+            try:
+                user = await pending["client"].check_password(password)
+            except Exception as exc:
+                if _is_explicitly_unauthorized(exc):
+                    await self._cancel_locked(name)
+                    await purge_invalid_account(name)
+                raise
             await self._finish(name, pending["client"], user, pending)
             return {"status": "authorized", "info": _user_info(user, name, pending["proxy"])}
 
@@ -828,6 +849,74 @@ def _mask_phone(phone: str) -> str:
     if len(digits) < 5:
         return "номер телефона"
     return f"+{'*' * max(0, len(digits) - 4)}{digits[-4:]}"
+
+
+def _rewrite_legacy_account(
+    name: str,
+    *,
+    proxy: str | None = None,
+    remove: bool = False,
+    root: Path | None = None,
+) -> None:
+    config_path = Path(root or ROOT) / "farm_config.json"
+    if not config_path.is_file():
+        return
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not isinstance(config.get("accounts"), list):
+            return
+        changed = False
+        accounts = []
+        for entry in config["accounts"]:
+            if not isinstance(entry, dict) or str(entry.get("name") or "") != name:
+                accounts.append(entry)
+                continue
+            if remove:
+                changed = True
+                continue
+            if proxy is not None and entry.get("proxy") != proxy:
+                entry["proxy"] = proxy
+                changed = True
+            accounts.append(entry)
+        if not changed:
+            return
+        config["accounts"] = accounts
+        temporary = config_path.with_name(config_path.name + ".tmp")
+        temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(config_path)
+    except Exception as exc:
+        log.warning("Не удалось обновить farm_config.json для %s (%s)", name, type(exc).__name__)
+
+
+async def persist_account_proxy(name: str, proxy: str | Dict[str, Any]) -> str:
+    """Persist a working replacement proxy without logging its credentials."""
+    name = validate_session_name(name)
+    stored = proxy.strip() if isinstance(proxy, str) else json.dumps(proxy, ensure_ascii=False)
+    parse_proxy(stored)
+    if await db.get_account(name):
+        await db.upsert_account(name, proxy=stored)
+    _rewrite_legacy_account(name, proxy=stored)
+    return stored
+
+
+async def purge_invalid_account(
+    name: str,
+    *,
+    root: Path | None = None,
+    sessions_dir: Path | None = None,
+) -> None:
+    """Remove an account confirmed unauthorized, including its local session file."""
+    name = validate_session_name(name)
+    await db.delete_account(name)
+    directory = Path(sessions_dir or SESSIONS_DIR)
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        path = directory / f"{name}{suffix}"
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Не удалось удалить файл сессии %s (%s)", path.name, type(exc).__name__)
+    _rewrite_legacy_account(name, remove=True, root=root)
+    log.warning("Неавторизованный аккаунт %s удалён из панели и локальная сессия очищена", name)
 
 
 async def import_session_file(

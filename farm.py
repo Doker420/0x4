@@ -2347,29 +2347,151 @@ class FarmAccount:
         else:
             client_kwargs["phone_number"] = cfg.get("phone")
         proxy = cfg.get("proxy") or FARM_CFG.get("proxy")
+        self.proxy_error: Exception | None = None
         if proxy:
-            if isinstance(proxy, str):
-                from web.manager import parse_proxy
-                client_kwargs["proxy"] = parse_proxy(proxy)
-            elif isinstance(proxy, dict):
-                client_kwargs["proxy"] = dict(proxy)
-            else:
-                raise ValueError(f"Неверный прокси для аккаунта {self.name}")
+            from web.manager import parse_proxy
+            try:
+                if isinstance(proxy, str):
+                    client_kwargs["proxy"] = parse_proxy(proxy)
+                elif isinstance(proxy, dict):
+                    client_kwargs["proxy"] = parse_proxy(json.dumps(proxy, ensure_ascii=False))
+                else:
+                    raise ValueError("Неверный формат прокси")
+            except (TypeError, ValueError) as exc:
+                self.proxy_error = exc
+                log.warning("[%s] задан некорректный прокси; попробую прокси других аккаунтов", self.name)
+        self.proxy_value = proxy
         self.proxy_config = client_kwargs.get("proxy")
+        self._client_base_kwargs = dict(client_kwargs)
+        self._client_base_kwargs.pop("proxy", None)
 
         self.client = Client(**client_kwargs)
         self._running = False
         self._task: asyncio.Task | None = None
 
-    async def start(self, timeout: float = 20.0) -> None:
-        log.info("[%s] start()", self.name)
+    @staticmethod
+    def _proxy_identity(proxy: dict[str, Any]) -> tuple[str, str, int, str, str]:
+        return (
+            str(proxy.get("scheme") or "socks5").casefold(),
+            str(proxy.get("hostname") or "").casefold(),
+            int(proxy.get("port") or 0),
+            str(proxy.get("username") or ""),
+            str(proxy.get("password") or ""),
+        )
+
+    def _fallback_proxy_candidates(self) -> list[tuple[str, Any, dict[str, Any]]]:
+        from web.manager import parse_proxy
+
+        pool = FARM_CFG.get("_proxy_pool")
+        if not isinstance(pool, list) or not pool:
+            pool = []
+            for account in FARM_CFG.get("accounts", []):
+                if isinstance(account, dict) and account.get("proxy"):
+                    pool.append({"name": account.get("name"), "proxy": account["proxy"]})
+            if FARM_CFG.get("proxy"):
+                pool.append({"name": "farm_config", "proxy": FARM_CFG["proxy"]})
+
         try:
-            from web.manager import connect_client_with_timeout
+            proxy_config = getattr(self, "proxy_config", None)
+            current_identity = self._proxy_identity(proxy_config) if proxy_config else None
+        except (TypeError, ValueError):
+            current_identity = None
+        seen = {current_identity} if current_identity else set()
+        candidates: list[tuple[str, Any, dict[str, Any]]] = []
+        for entry in pool:
+            if not isinstance(entry, dict):
+                continue
+            source_name = str(entry.get("name") or "другой аккаунт")
+            if source_name == self.name:
+                continue
+            raw_proxy = entry.get("proxy")
+            if not raw_proxy:
+                continue
+            try:
+                proxy_text = raw_proxy if isinstance(raw_proxy, str) else json.dumps(raw_proxy, ensure_ascii=False)
+                parsed = parse_proxy(proxy_text)
+                if not parsed:
+                    continue
+                identity = self._proxy_identity(parsed)
+            except (TypeError, ValueError):
+                continue
+            if identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append((source_name, raw_proxy, parsed))
+        return candidates
+
+    def _replace_client_proxy(self, raw_proxy: Any, parsed_proxy: dict[str, Any]) -> None:
+        kwargs = dict(self._client_base_kwargs)
+        kwargs["proxy"] = parsed_proxy
+        self.client = Client(**kwargs)
+        self.proxy_value = raw_proxy
+        self.proxy_config = parsed_proxy
+
+    async def _persist_replacement_proxy(self, raw_proxy: Any) -> None:
+        stored = raw_proxy if isinstance(raw_proxy, str) else json.dumps(raw_proxy, ensure_ascii=False)
+        self.cfg["proxy"] = stored
+        for account in FARM_CFG.get("accounts", []):
+            if isinstance(account, dict) and str(account.get("name") or "") == self.name:
+                account["proxy"] = stored
+        try:
+            from web.manager import persist_account_proxy
+            await persist_account_proxy(self.name, stored)
+        except Exception as exc:
+            log.warning("[%s] рабочий прокси применён, но не сохранён в конфиге (%s)", self.name, type(exc).__name__)
+
+    async def _connect_with_proxy_fallback(self, timeout: float) -> None:
+        from web.manager import SessionNotAuthorizedError, connect_client_with_timeout
+
+        try:
+            proxy_error = getattr(self, "proxy_error", None)
+            if proxy_error is not None:
+                raise ConnectionError(f"Некорректный прокси: {proxy_error}")
             authorized = await connect_client_with_timeout(
                 self.client, getattr(self, "proxy_config", None), timeout=timeout
             )
-            if not authorized:
-                raise RuntimeError("Сессия не авторизована — подключите её в веб-панели")
+        except OSError as first_error:
+            candidates = self._fallback_proxy_candidates()
+            if not candidates:
+                if getattr(self, "proxy_value", None) or getattr(self, "proxy_error", None):
+                    reason = "прокси недоступен"
+                else:
+                    reason = "подключение к Telegram не удалось"
+                raise RuntimeError(
+                    f"[{self.name}] {reason}; рабочего прокси среди других аккаунтов нет: {first_error}"
+                ) from first_error
+            log.warning("[%s] исходное соединение недоступно; проверяю прокси других аккаунтов", self.name)
+            last_error: BaseException = first_error
+            for source_name, raw_proxy, parsed_proxy in candidates:
+                await self._close_client_connection()
+                self._replace_client_proxy(raw_proxy, parsed_proxy)
+                try:
+                    authorized = await connect_client_with_timeout(
+                        self.client, parsed_proxy, timeout=timeout
+                    )
+                except OSError as exc:
+                    last_error = exc
+                    log.info("[%s] прокси аккаунта %s не подошёл", self.name, source_name)
+                    await self._close_client_connection()
+                    continue
+                if not authorized:
+                    raise SessionNotAuthorizedError(
+                        f"Сессия аккаунта {self.name} не авторизована"
+                    )
+                await self._persist_replacement_proxy(raw_proxy)
+                log.warning("[%s] заменил прокси на рабочий прокси аккаунта %s", self.name, source_name)
+                return
+            raise RuntimeError(
+                f"[{self.name}] исходное соединение и прокси других аккаунтов недоступны: {last_error}"
+            ) from last_error
+
+        if not authorized:
+            raise SessionNotAuthorizedError(f"Сессия аккаунта {self.name} не авторизована")
+
+    async def start(self, timeout: float = 20.0) -> None:
+        log.info("[%s] start()", self.name)
+        try:
+            await self._connect_with_proxy_fallback(timeout)
             await self.client.invoke(raw.functions.updates.GetState())
             me = await self.client.get_me()
             self.client.me = me
@@ -2377,9 +2499,23 @@ class FarmAccount:
         except TimeoutError as exc:
             await self._close_client_connection()
             raise RuntimeError(f"[{self.name}] тайм-аут подключения к Telegram после {timeout:g} сек.") from exc
-        except Exception:
+        except Exception as exc:
             await self._close_client_connection()
+            from web.manager import SessionNotAuthorizedError, _is_explicitly_unauthorized, purge_invalid_account
+            if isinstance(exc, SessionNotAuthorizedError) or _is_explicitly_unauthorized(exc):
+                await purge_invalid_account(self.name, root=ROOT, sessions_dir=SESSIONS_DIR)
+                if not isinstance(exc, SessionNotAuthorizedError):
+                    raise SessionNotAuthorizedError(
+                        f"Сессия аккаунта {self.name} больше не авторизована; аккаунт и файл сессии удалены"
+                    ) from exc
             raise
+        if me is None or getattr(me, "id", None) is None:
+            from web.manager import SessionNotAuthorizedError, purge_invalid_account
+            await self._close_client_connection()
+            await purge_invalid_account(self.name, root=ROOT, sessions_dir=SESSIONS_DIR)
+            raise SessionNotAuthorizedError(
+                f"Telegram не подтвердил сессию аккаунта {self.name}; аккаунт и файл сессии удалены"
+            )
         self.user_id = me.id
         log.info("Аккаунт %s вошёл как @%s (id=%s)", self.name, me.username, me.id)
 
@@ -2440,13 +2576,30 @@ class FarmAccount:
         await self._close_client_connection()
 
     async def _close_client_connection(self) -> None:
+        client = getattr(self, "client", None)
+        if client is None:
+            return
         try:
-            if getattr(self.client, "is_initialized", False):
-                await asyncio.wait_for(self.client.stop(), timeout=15.0)
-            elif getattr(self.client, "is_connected", False):
-                await asyncio.wait_for(self.client.disconnect(), timeout=15.0)
+            if getattr(client, "is_initialized", False):
+                await asyncio.wait_for(client.stop(), timeout=15.0)
+                return
+            if getattr(client, "is_connected", False):
+                await asyncio.wait_for(client.disconnect(), timeout=15.0)
+                return
         except Exception:
             log.debug("client cleanup failed for %s", self.name, exc_info=True)
+        session = getattr(client, "session", None)
+        if session is not None and getattr(session, "connection", None) is not None:
+            try:
+                await asyncio.wait_for(session.stop(), timeout=15.0)
+            except Exception:
+                log.debug("partial session cleanup failed for %s", self.name, exc_info=True)
+        storage = getattr(client, "storage", None)
+        if getattr(storage, "conn", None) is not None:
+            try:
+                await asyncio.wait_for(storage.close(), timeout=15.0)
+            except Exception:
+                log.debug("session storage cleanup failed for %s", self.name, exc_info=True)
 
     async def _on_incoming(self, client: Client, message: TGMessage) -> None:
         del client
@@ -4175,6 +4328,34 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
     local_farm.update(farm_settings)
     local_cfg["farm"] = local_farm
 
+    legacy_accounts = {
+        str(item.get("name")): dict(item)
+        for item in (local_cfg.get("accounts") or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    proxy_pool: list[dict[str, Any]] = []
+    for row in account_rows:
+        if row.get("proxy"):
+            proxy_pool.append({"name": str(row.get("name") or ""), "proxy": row["proxy"]})
+    for name, entry in legacy_accounts.items():
+        if entry.get("proxy"):
+            proxy_pool.append({"name": name, "proxy": entry["proxy"]})
+    if local_cfg.get("proxy"):
+        proxy_pool.append({"name": "farm_config", "proxy": local_cfg["proxy"]})
+    local_cfg["_proxy_pool"] = proxy_pool
+
+    from web.manager import purge_invalid_account
+
+    invalid_names = {
+        str(row["name"])
+        for row in account_rows
+        if str(row.get("session_status") or "").casefold() == "unauthorized"
+    }
+    for name in sorted(invalid_names):
+        await purge_invalid_account(name, root=ROOT, sessions_dir=SESSIONS_DIR)
+        legacy_accounts.pop(name, None)
+    account_rows = [row for row in account_rows if str(row.get("name")) not in invalid_names]
+
     db_by_name: dict[str, dict[str, Any]] = {}
     for row in account_rows:
         converted = dict(row)
@@ -4187,11 +4368,6 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
         converted["enabled"] = bool(converted.get("enabled", 1))
         db_by_name[str(converted["name"])] = converted
 
-    legacy_accounts = {
-        str(item.get("name")): dict(item)
-        for item in (local_cfg.get("accounts") or [])
-        if isinstance(item, dict) and item.get("name")
-    }
     requested_names = [
         name.strip() for name in os.getenv("FARM_OVERRIDE_ACCOUNTS", "").split(",") if name.strip()
     ]
@@ -4230,11 +4406,17 @@ async def _load_runtime_config() -> tuple[dict[str, Any], dict[str, Any]]:
         accounts.append(account)
 
     if missing:
-        raise RuntimeError("Для аккаунтов не заполнены API ID/API Hash: " + ", ".join(missing))
+        log.warning("Пропускаю аккаунты без API ID/API Hash: %s", ", ".join(missing))
     if needs_auth:
-        raise RuntimeError("Проверьте авторизацию сессий в разделе «Аккаунты»: " + ", ".join(needs_auth))
+        log.warning("Пропускаю аккаунты с неподтверждённой сессией: %s", ", ".join(needs_auth))
     if not accounts:
-        raise RuntimeError("Нет активных авторизованных аккаунтов. Добавьте сессию в разделе «Аккаунты».")
+        details = []
+        if missing:
+            details.append("без API ID/Hash: " + ", ".join(missing))
+        if needs_auth:
+            details.append("сессия не проверена: " + ", ".join(needs_auth))
+        suffix = ("; " + "; ".join(details)) if details else ""
+        raise RuntimeError("Нет активных авторизованных аккаунтов. Добавьте или проверьте сессию в разделе «Аккаунты»" + suffix)
 
     reply_override = farm_settings.get("reply_probability_override")
     for account in accounts:

@@ -171,6 +171,36 @@ class FarmRuntimeConfigTests(unittest.IsolatedAsyncioTestCase):
                     with patch.dict(os.environ, {"FARM_OVERRIDE_SOURCE_CHAT_ID": "-1001234567890"}):
                         await farm._load_runtime_config()
 
+    async def test_revoked_accounts_are_deleted_without_blocking_other_farm_accounts(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sessions_dir = root / "sessions"
+            sessions_dir.mkdir()
+            revoked_session = sessions_dir / "revoked.session"
+            revoked_session.write_bytes(b"revoked")
+            (root / "farm_config.json").write_text(json.dumps({
+                "target_chat_id": -1001234567890,
+                "accounts": [{
+                    "name": "revoked", "api_id": 999, "api_hash": "revoked-hash",
+                    "proxy": "socks5://dead.example:1080",
+                }],
+            }), encoding="utf-8")
+            await db.upsert_account(
+                "revoked", api_id=999, api_hash="revoked-hash", enabled=1,
+                session_status="unauthorized", proxy="socks5://dead.example:1080",
+            )
+            with patch.object(farm, "ROOT", root), patch.object(farm, "SESSIONS_DIR", sessions_dir):
+                config, _settings = await farm._load_runtime_config()
+
+            self.assertEqual([item["name"] for item in config["accounts"]], ["reply_agent", "global_agent"])
+            self.assertIsNone(await db.get_account("revoked"))
+            self.assertFalse(revoked_session.exists())
+            self.assertEqual(json.loads((root / "farm_config.json").read_text(encoding="utf-8"))["accounts"], [])
+            self.assertIn(
+                {"name": "revoked", "proxy": "socks5://dead.example:1080"},
+                config["_proxy_pool"],
+            )
+
     async def test_panel_settings_and_account_edits_feed_farm_runtime(self):
         config, settings = await farm._load_runtime_config()
         self.assertEqual(config["target_chat_id"], -1001234567890)

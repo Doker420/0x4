@@ -287,6 +287,7 @@ function renderSessionResults(output, rows) {
   const labels = {
     authorized: 'авторизован',
     unauthorized: 'Telegram сообщил, что сессия не авторизована',
+    deleted: 'сессия не авторизована — запись и файл удалены',
     needs_credentials: 'нужны API ID/Hash',
     verification_failed: 'не удалось проверить (сессия не помечена как разлогиненная)',
   };
@@ -310,7 +311,7 @@ async function saveSessionDefaults(event) {
     form.elements.api_hash.value = '';
     form.elements.api_hash.placeholder = 'Сохранён — оставьте пустым, чтобы не менять';
     form.elements.api_hash.required = false;
-    if ((data.sessions || []).length && (data.sessions || []).every(row => ['authorized', 'unauthorized', 'needs_credentials'].includes(row.status))) {
+    if ((data.sessions || []).length && (data.sessions || []).every(row => ['authorized', 'unauthorized', 'deleted', 'needs_credentials'].includes(row.status))) {
       setTimeout(() => location.reload(), 1200);
     }
   } catch (error) {
@@ -328,7 +329,7 @@ async function scanSessions() {
     if (!response.ok) throw new Error(data.detail || 'Не удалось проверить сессии');
     const rows = data.sessions || [];
     renderSessionResults(output, rows);
-    if (rows.length && rows.every(row => ['authorized', 'unauthorized', 'needs_credentials'].includes(row.status))) {
+    if (rows.length && rows.every(row => ['authorized', 'unauthorized', 'deleted', 'needs_credentials'].includes(row.status))) {
       setTimeout(() => location.reload(), 900);
     }
   } catch (error) { showMessage(output, error.message, 'error'); }

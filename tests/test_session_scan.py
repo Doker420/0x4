@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -143,10 +144,11 @@ class SessionScanTests(unittest.IsolatedAsyncioTestCase):
         client_factory.assert_not_called()
         self.assertEqual((await db.get_account("alice"))["session_status"], "authorized")
 
-    async def test_get_client_marks_only_explicit_telegram_logout_as_unauthorized(self):
+    async def test_get_client_deletes_only_explicitly_revoked_sessions(self):
         class AuthKeyUnregistered(Exception):
             pass
 
+        (self.sessions_dir / "alice.session").write_bytes(b"revoked session")
         await db.upsert_account(
             "alice", api_id=12345, api_hash="valid-app-hash", enabled=1, session_status="authorized"
         )
@@ -161,7 +163,8 @@ class SessionScanTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(manager_module.SessionNotAuthorizedError):
                 await account_manager.get_client("alice")
 
-        self.assertEqual((await db.get_account("alice"))["session_status"], "unauthorized")
+        self.assertIsNone(await db.get_account("alice"))
+        self.assertFalse((self.sessions_dir / "alice.session").exists())
 
     async def test_false_verify_result_preserves_the_last_known_authorized_status(self):
         (self.sessions_dir / "alice.session").write_bytes(b"test session stub")
@@ -214,7 +217,7 @@ class SessionScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("database is locked", results[0]["error"])
         self.assertEqual((await db.get_account("alice"))["session_status"], "authorized")
 
-    async def test_explicit_logout_is_reported_separately_from_transient_failure(self):
+    async def test_explicit_logout_is_reported_as_deleted_during_scan(self):
         (self.sessions_dir / "alice.session").write_bytes(b"test session stub")
         await db.upsert_account(
             "alice", api_id=12345, api_hash="valid-app-hash", enabled=1, session_status="authorized"
@@ -226,8 +229,37 @@ class SessionScanTests(unittest.IsolatedAsyncioTestCase):
         ):
             results = await manager_module.manager.scan_sessions_dir()
 
-        self.assertEqual(results[0]["status"], "unauthorized")
-        self.assertEqual((await db.get_account("alice"))["session_status"], "unauthorized")
+        self.assertEqual(results[0]["status"], "deleted")
+        self.assertIsNone(await db.get_account("alice"))
+        self.assertFalse((self.sessions_dir / "alice.session").exists())
+
+    async def test_working_proxy_replacement_is_saved_for_database_and_legacy_config(self):
+        await db.upsert_account("alice", proxy="socks5://dead.example:1080")
+        config_path = Path(self.tempdir.name) / "farm_config.json"
+        config_path.write_text(json.dumps({"accounts": [{"name": "alice", "proxy": "socks5://dead.example:1080"}]}), encoding="utf-8")
+
+        saved = await manager_module.persist_account_proxy("alice", "socks5://working.example:1080")
+
+        self.assertEqual(saved, "socks5://working.example:1080")
+        self.assertEqual((await db.get_account("alice"))["proxy"], saved)
+        self.assertEqual(
+            json.loads(config_path.read_text(encoding="utf-8"))["accounts"][0]["proxy"],
+            saved,
+        )
+
+    async def test_purge_removes_legacy_config_entry_and_session_sidecars(self):
+        (self.sessions_dir / "alice.session").write_bytes(b"revoked session")
+        (self.sessions_dir / "alice.session-journal").write_bytes(b"journal")
+        await db.upsert_account("alice", api_id=12345, api_hash="hash", session_status="unauthorized")
+        config_path = Path(self.tempdir.name) / "farm_config.json"
+        config_path.write_text(json.dumps({"accounts": [{"name": "alice"}, {"name": "bob"}]}), encoding="utf-8")
+
+        await manager_module.purge_invalid_account("alice")
+
+        self.assertIsNone(await db.get_account("alice"))
+        self.assertFalse((self.sessions_dir / "alice.session").exists())
+        self.assertFalse((self.sessions_dir / "alice.session-journal").exists())
+        self.assertEqual([row["name"] for row in json.loads(config_path.read_text(encoding="utf-8"))["accounts"]], ["bob"])
 
 
 if __name__ == "__main__":
