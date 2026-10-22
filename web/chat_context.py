@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from . import db, mass_actions
+from .author_keys import author_key, new_author_salt
 from .manager import manager, validate_session_name
 
 log = logging.getLogger("web.chat_context")
@@ -263,6 +264,7 @@ async def _serialize_message(
     download_media: bool,
     allow_voice_download: bool,
     download_count: int,
+    author_salt: str = "",
 ) -> tuple[dict[str, Any], int]:
     sender = getattr(message, "from_user", None)
     sender_chat = getattr(message, "sender_chat", None)
@@ -288,6 +290,7 @@ async def _serialize_message(
         "date": getattr(message, "date", None).isoformat() if getattr(message, "date", None) else None,
         "author": author,
         "participant_id": participant_id,
+        "author_key": author_key(sender_id, author_salt) if sender_id is not None else "",
         "text": text,
         "kind": media["kind"] if media else "text",
         "media": media,
@@ -382,6 +385,7 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
                 break
 
         author_labels: dict[int, str] = {}
+        author_salt = new_author_salt()
         messages: list[dict[str, Any]] = []
         download_count = 0
         media_counts: dict[str, int] = {}
@@ -393,6 +397,7 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
                 download_media=download_media,
                 allow_voice_download=allow_voice_download,
                 download_count=download_count,
+                author_salt=author_salt,
             )
             messages.append(serialized)
             if serialized.get("media"):
@@ -421,8 +426,11 @@ async def collect_chat_context(payload: dict[str, Any]) -> dict[str, Any]:
             for name in account_names
         }
         context = {
-            "schema_version": 2,
+            "schema_version": 3,
             "chat_id": chat_id,
+            # HMAC pseudonyms let the running farm append a person's live text
+            # to the same account's history without saving a raw-id mapping.
+            "author_salt": author_salt,
             "title": title,
             "username": username,
             "chat_type": chat_type,

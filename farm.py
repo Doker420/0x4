@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from web import farm_control, source_scenario
+from web.author_keys import author_key as make_author_key, stable_account_name
 from web.config import (
     DICE_EMOJI,
     POPULAR_EMOJI,
@@ -363,6 +364,17 @@ def _repetition_hint(lines: Any, limit: int = 6) -> str:
     )
 
 
+def _media_key(value: Any) -> str:
+    """Canonical media identity: provider tracking parameters do not make a GIF fresh."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme.casefold() in {"http", "https"} and parsed.netloc:
+        return parsed._replace(query="", fragment="").geturl()
+    return text
+
+
 class FarmState:
     def __init__(self) -> None:
         self.chat_history: deque[dict[str, Any]] = deque(maxlen=60)
@@ -372,6 +384,12 @@ class FarmState:
         # Full anonymized donor history grouped by the one participant assigned to each account.
         # Kept separate from the bounded live-chat buffer and reloaded from chat_contexts on start.
         self.account_contexts: dict[str, list[dict[str, Any]]] = {}
+        # New target-chat messages are appended to exactly one account's live
+        # history.  The bounded global feed remains separate for the web panel.
+        self.account_live_contexts: dict[str, deque[dict[str, Any]]] = {}
+        self.context_author_salt = ""
+        self.author_accounts: dict[str, str] = {}
+        self.live_author_accounts: dict[str, str] = {}
         # Archive messages already spoken by each account, so no line repeats twice.
         self.used_archive_ids: dict[str, set[int]] = {}
         self.last_activity: datetime | None = None
@@ -418,11 +436,26 @@ class FarmState:
             return True
 
     def media_seen(self, key: str) -> bool:
-        return bool(key) and key in self.recent_media
+        normalized = _media_key(key)
+        return bool(normalized) and normalized in self.recent_media
 
     def mark_media(self, key: str) -> None:
-        if key:
-            self.recent_media.append(key)
+        normalized = _media_key(key)
+        if normalized:
+            self.recent_media.append(normalized)
+
+    def _rebuild_live_contexts(self) -> None:
+        """Restore per-account live history from the persisted bounded feed."""
+        self.account_live_contexts = {}
+        for item in self.chat_history:
+            owner = str(item.get("history_account") or "")
+            if item.get("direction") != "incoming" or not owner:
+                continue
+            history = self.account_live_contexts.get(owner)
+            if history is None:
+                history = deque(maxlen=200)
+                self.account_live_contexts[owner] = history
+            history.append(dict(item))
 
     def text_seen(self, text: str) -> bool:
         """True when this exact line (ignoring punctuation) was sent recently."""
@@ -452,13 +485,31 @@ class FarmState:
             "topic": self.topic,
             "last_outgoing_message_id": self.last_outgoing_message_id,
             "account_participant_ids": self.account_participant_ids,
+            "context_author_salt": self.context_author_salt,
+            "author_accounts": self.author_accounts,
+            "live_author_accounts": self.live_author_accounts,
             "used_archive_ids": {account: sorted(ids) for account, ids in self.used_archive_ids.items()},
             "recent_texts": list(self.recent_texts),
+            "recent_media": list(self.recent_media),
         }
 
     def load(self, data: dict[str, Any]) -> None:
         self.chat_history = deque(data.get("chat_history", []), maxlen=60)
         self.account_contexts = {}
+        self.account_live_contexts = {}
+        self.context_author_salt = str(data.get("context_author_salt") or "")
+        self.author_accounts = {}
+        self.live_author_accounts = {}
+        for field, destination in (
+            ("author_accounts", self.author_accounts),
+            ("live_author_accounts", self.live_author_accounts),
+        ):
+            raw_accounts = data.get(field)
+            if not isinstance(raw_accounts, dict):
+                continue
+            for key, account in raw_accounts.items():
+                if str(key) and str(account):
+                    destination[str(key)] = str(account)
         self.used_archive_ids = {}
         raw_used = data.get("used_archive_ids")
         if isinstance(raw_used, dict):
@@ -470,6 +521,13 @@ class FarmState:
                     continue
         self.recent_texts = deque(
             (str(item) for item in (data.get("recent_texts") or []) if str(item).strip()), maxlen=40
+        )
+        self.recent_media = deque(
+            (
+                _media_key(item) for item in (data.get("recent_media") or [])
+                if _media_key(item)
+            ),
+            maxlen=200,
         )
         self.topic = data.get("topic", "общее общение")
         message_id = data.get("last_outgoing_message_id")
@@ -489,6 +547,7 @@ class FarmState:
         for item in self.chat_history:
             if item.get("chat_id") is not None and item.get("message_id") is not None:
                 self.remember_message(int(item["chat_id"]), int(item["message_id"]))
+        self._rebuild_live_contexts()
 
     def reset_for_behavior_only(self) -> None:
         """Drop scenario/archive state but retain recent real incoming chat messages."""
@@ -498,6 +557,10 @@ class FarmState:
         self.last_outgoing_message_id = None
         self.account_participant_ids = None
         self.account_contexts = {}
+        self.account_live_contexts = {}
+        self.context_author_salt = ""
+        self.author_accounts = {}
+        self.live_author_accounts = {}
         self._seen_order.clear()
         self._seen_ids.clear()
         for item in self.chat_history:
@@ -1416,6 +1479,31 @@ def _context_participant_id(item: dict[str, Any]) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _assign_live_history_account(
+    state: FarmState,
+    sender_id: int,
+    account_names: list[str],
+) -> tuple[str, str]:
+    """Pin one live author to one account, including authors absent from the archive.
+
+    Call with ``state.lock`` held.  New-context HMAC keys are preferred; the
+    raw-id fallback keeps older collected contexts compatible without changing
+    their files.  Assignment is stable across handlers and process restarts.
+    """
+    names = [str(name) for name in account_names if str(name)]
+    if not names:
+        return "", ""
+    key = make_author_key(sender_id, state.context_author_salt)
+    mapping = state.author_accounts if key else state.live_author_accounts
+    mapping_key = key or str(int(sender_id))
+    assigned = mapping.get(mapping_key, "")
+    if assigned not in names:
+        seed = key or f"legacy-author:{state.context_author_salt}:{int(sender_id)}"
+        assigned = stable_account_name(seed, names)
+        mapping[mapping_key] = assigned
+    return assigned, key
+
+
 def _history_for_account(
     history: list[dict[str, Any]],
     account_name: str | None,
@@ -1438,9 +1526,25 @@ def _state_history_parts(
     """Return this account's full donor archive separately from the bounded live window."""
     live_history = list(state.chat_history)
     account_contexts = getattr(state, "account_contexts", {})
-    if account_name is not None and account_name in account_contexts:
-        donor_history = account_contexts[account_name]
-        live_history = [item for item in live_history if item.get("direction") != "context"]
+    account_live_contexts = getattr(state, "account_live_contexts", {})
+    if account_name is not None and (
+        account_name in account_contexts or account_name in account_live_contexts
+    ):
+        # Live text joins the same account's source history immediately.  Remove
+        # assigned incoming rows from the second window to avoid showing them twice;
+        # outgoing rows stay shared so the reply chain remains coherent.
+        donor_history = [
+            *account_contexts.get(account_name, []),
+            *account_live_contexts.get(account_name, ()),
+        ]
+        live_history = [
+            item for item in live_history
+            if item.get("direction") != "context"
+            and (
+                item.get("direction") == "outgoing"
+                or not item.get("history_account")
+            )
+        ]
         return donor_history, live_history
     filtered = _history_for_account(live_history, account_name, state.account_participant_ids)
     return (
@@ -2026,15 +2130,25 @@ DUPLICATE_SAFE_LINES = (
     "Ладно, обсудим ещё раз позже 🙂",
 )
 
+# Idle messages must add something to talk about.  Never comment on the silence
+# itself: rotating eight versions of «тут тихо» across accounts is still spam.
 IDLE_LINES = (
-    "тихо стало 🙂",
-    "все пропали, да? 😄",
-    "ну что, кто живой 👀",
-    "тишина, только я тут 🙂",
-    "а че все молчат 😄",
-    "ну и тишина тут 👀",
-    "кто-нибудь ещё в сети? 🙂",
-    "вот это затишье 😄",
+    "Какая песня сейчас чаще всего играет у вас?",
+    "Что бы выбрали на вечер: фильм, игру или прогулку?",
+    "Поделитесь находкой дня — песней, фильмом или полезной штукой.",
+    "Какой фильм можете пересматривать сколько угодно?",
+    "Что недавно попробовали и теперь можете посоветовать?",
+    "Если бы завтра был полностью свободный день, куда бы поехали?",
+    "Какая еда у вас сейчас в фаворитах?",
+    "Что помогает вам переключиться после тяжёлого дня?",
+    "Подкиньте интересную идею для выходных.",
+    "Какое маленькое дело сегодня всё-таки порадовало?",
+    "Что смотрели или слушали недавно и зашло больше ожидаемого?",
+    "Какая привычка реально делает день лучше?",
+    "Какое место хотелось бы показать друзьям?",
+    "Что из старого снова стало вам интересно?",
+    "Какой простой рецепт стоит попробовать каждому?",
+    "Какую игру не стыдно посоветовать даже тем, кто редко играет?",
 )
 
 
@@ -2066,6 +2180,8 @@ MEDIA_SOURCE_LABELS = {"music": "Музыка", "video": "Видео"}
 
 
 MAX_SOURCE_MEDIA_BYTES = 512 * 1024 * 1024
+SOURCE_HISTORY_SCAN_LIMIT = 500
+SOURCE_MEDIA_POOL_LIMIT = 200
 
 
 class MediaSender:
@@ -2076,18 +2192,23 @@ class MediaSender:
         self.kind = kind if kind in MEDIA_SOURCE_MATCHERS else "music"
         self.message_ids: list[int] = []
         self.cursor = 0
+        self.used_message_ids: set[int] = set()
+        self.last_message_id: int | None = None
         self.failed = False
         self.source_client: Any | None = None
 
     async def _collect(self, client: Any) -> list[int]:
         matches = MEDIA_SOURCE_MATCHERS[self.kind]
         found: list[int] = []
-        async for message in client.get_chat_history(self.source, limit=60):
+        async for message in client.get_chat_history(self.source, limit=SOURCE_HISTORY_SCAN_LIMIT):
             if matches(message):
                 found.append(int(message.id))
-            if len(found) >= 25:
+            if len(found) >= SOURCE_MEDIA_POOL_LIMIT:
                 break
         return found
+
+    def media_key(self, message_id: int) -> str:
+        return f"source:{self.kind}:{self.source}:{int(message_id)}"
 
     async def _join_source(self, client: Any) -> bool:
         """Subscribe the account to the configured source, then retry reading it."""
@@ -2129,15 +2250,30 @@ class MediaSender:
         """Return the number of source files available for upload."""
         return len(self.message_ids)
 
-    def next_id(self) -> int | None:
+    def next_id(self, avoid: set[int] | None = None) -> int | None:
+        """Pick without replacement; a new pass never starts with the previous item."""
         if not self.message_ids:
             return None
-        if self.cursor >= len(self.message_ids):
-            random.shuffle(self.message_ids)
-            self.cursor = 0
-        message_id = self.message_ids[self.cursor]
-        self.cursor += 1
-        return message_id
+        skipped = avoid or set()
+        # With an avoid-list, inspect one whole pass so recently sent source
+        # items are skipped rather than selected again by another account.
+        attempts = len(self.message_ids) if skipped else 1
+        for _ in range(attempts):
+            if self.cursor >= len(self.message_ids):
+                random.shuffle(self.message_ids)
+                self.cursor = 0
+                if len(self.message_ids) > 1 and self.message_ids[0] == self.last_message_id:
+                    swap_index = random.randrange(1, len(self.message_ids))
+                    self.message_ids[0], self.message_ids[swap_index] = (
+                        self.message_ids[swap_index], self.message_ids[0]
+                    )
+            message_id = self.message_ids[self.cursor]
+            self.cursor += 1
+            if message_id in skipped:
+                continue
+            self.last_message_id = message_id
+            return message_id
+        return None
 
     @staticmethod
     def _file_suffix(message: Any, kind: str) -> str:
@@ -2169,7 +2305,31 @@ class MediaSender:
         return "send_video", "video", "video"
 
     async def send(self, account: Any, reply_to: Any = None) -> bool:
-        message_id = self.next_id()
+        state = getattr(account, "state", None)
+        if state is not None:
+            # Restore the source rotation after a farm restart as well as share
+            # it between accounts in this process.
+            self.used_message_ids.update(
+                message_id for message_id in self.message_ids
+                if state.media_seen(self.media_key(message_id))
+            )
+            if self.last_message_id is None:
+                ids_by_key = {self.media_key(item): item for item in self.message_ids}
+                for used_key in reversed(state.recent_media):
+                    if used_key in ids_by_key:
+                        self.last_message_id = ids_by_key[used_key]
+                        break
+        message_id = self.next_id(avoid=self.used_message_ids)
+        if message_id is None and self.message_ids:
+            # A finite channel must eventually start a new pass.  Do it only
+            # after every known item was used, never after every few sends.
+            self.used_message_ids.clear()
+            avoid_last = (
+                {self.last_message_id}
+                if len(self.message_ids) > 1 and self.last_message_id is not None
+                else set()
+            )
+            message_id = self.next_id(avoid=avoid_last)
         if message_id is None:
             return False
         source_client = self.source_client or account.client
@@ -2225,6 +2385,9 @@ class MediaSender:
                 message = await sender(**kwargs)
                 await account._record(message, "", record_kind)
 
+            self.used_message_ids.add(message_id)
+            if state is not None:
+                state.mark_media(self.media_key(message_id))
             log.info("[%s] %s: файл %s загружен в чат от аккаунта", account.name, label, message_id)
             return True
         except Exception:
@@ -2646,7 +2809,17 @@ class FarmAccount:
         async with self.state.lock:
             if not self.state.remember_message(chat_id, int(message.id)):
                 return
-            self.state.chat_history.append({
+            history_account = ""
+            live_author_key = ""
+            if scenario_mode == "history_dialogue" or self.state.account_participant_ids is not None:
+                active_names = [
+                    account.name for account in self.farm_accounts
+                    if getattr(account, "_running", False)
+                ] or [self.name]
+                history_account, live_author_key = _assign_live_history_account(
+                    self.state, int(sender.id), active_names
+                )
+            event = {
                 "author": getattr(sender, "username", None) or getattr(sender, "first_name", None) or "участник",
                 "user_id": int(sender.id),
                 "message_id": int(message.id),
@@ -2656,8 +2829,17 @@ class FarmAccount:
                 "direction": "incoming",
                 "is_bot": bool(getattr(sender, "is_bot", False)),
                 "is_question": is_question,
+                "history_account": history_account or None,
+                "author_key": live_author_key or None,
                 "ts": datetime.now().isoformat(timespec="seconds"),
-            })
+            }
+            self.state.chat_history.append(event)
+            if history_account:
+                live_history = self.state.account_live_contexts.get(history_account)
+                if live_history is None:
+                    live_history = deque(maxlen=200)
+                    self.state.account_live_contexts[history_account] = live_history
+                live_history.append(dict(event))
             self.state.mark_activity()
 
         if message_kind in {"audio", "voice", "video"} or (message_kind == "gif" and not description):
@@ -2690,7 +2872,12 @@ class FarmAccount:
         candidates = [account for account in self.farm_accounts if account._running]
         if not candidates:
             candidates = [self]
-        responder = random.choice(candidates)
+        # With collected history, the same human stays with the same account.
+        # Without history routing the original random one-responder behavior remains.
+        responder = next(
+            (account for account in candidates if account.name == history_account),
+            None,
+        ) or random.choice(candidates)
         response_probability = 1.0 if is_question else responder.reply_probability
         log.info(
             "[%s] входящее сообщение %s: %s; шанс ответа %.0f%%",
@@ -3699,11 +3886,32 @@ class FarmAccount:
         search_text: str = "",
         caption: str = "",
     ) -> bool:
-        """Send a gif picked at random from every available source, not the first one."""
+        """Prefer a fresh API GIF; local/configured items are the fallback pool."""
         send_kwargs = self._send_kwargs(reply_to)
         if caption:
             send_kwargs["caption"] = caption[:1000]
         sources = self._media_files("gif", FARM_CFG.get("gifs"))
+        downloaded: Path | None = None
+        try:
+            from web.giphy import download_gif, random_gif
+
+            query = self._gif_query(search_text)
+            # The API must be tried even when old configured GIFs exist: otherwise
+            # a small local pool hides the provider and repeats forever.
+            url = await random_gif(query, avoid=list(self.state.recent_media))
+            if url:
+                downloaded = await download_gif(url, DATA_DIR / "gif_cache")
+                msg = await self.client.send_animation(animation=str(downloaded), **send_kwargs)
+                await self._record(msg, caption, "gif")
+                self.state.mark_media(url)
+                log.info("[%s] GIF sent from provider (%s)", self.name, query)
+                return True
+        except Exception:
+            log.exception("[%s] provider GIF failed; trying local/configured pool", self.name)
+        finally:
+            if downloaded:
+                downloaded.unlink(missing_ok=True)
+
         for source in self._ordered_media(sources):
             try:
                 msg = await self.client.send_animation(animation=source, **send_kwargs)
@@ -3713,29 +3921,8 @@ class FarmAccount:
                 return True
             except Exception:
                 log.warning("[%s] GIF %s не отправилась; пробую следующую", self.name, source[:60], exc_info=True)
-
-        downloaded: Path | None = None
-        try:
-            from web.giphy import download_gif, random_gif
-
-            query = self._gif_query(search_text)
-            # Ask the provider for a random gif and skip the ones the farm just used.
-            url = await random_gif(query, avoid=list(self.state.recent_media))
-            if not url:
-                log.warning("[%s] GIF not sent: configure a GIPHY/Tenor key or add donor GIFs", self.name)
-                return False
-            downloaded = await download_gif(url, DATA_DIR / "gif_cache")
-            msg = await self.client.send_animation(animation=str(downloaded), **send_kwargs)
-            await self._record(msg, caption, "gif")
-            self.state.mark_media(url)
-            log.info("[%s] GIF sent from provider (%s)", self.name, query)
-            return True
-        except Exception:
-            log.exception("[%s] provider GIF failed", self.name)
-            return False
-        finally:
-            if downloaded:
-                downloaded.unlink(missing_ok=True)
+        log.warning("[%s] GIF not sent: provider returned no fresh item and local pool is unavailable", self.name)
+        return False
 
     def _ordered_media(self, keys: list[str]) -> list[str]:
         """Randomised send order that avoids media another account has just used."""
@@ -4648,6 +4835,10 @@ def _assign_archive_context_to_account(account_name: str, state: FarmState) -> N
         participant_id = available[0]
         participant_mapping[account_name] = participant_id
         state.account_contexts[account_name] = by_participant[participant_id]
+        for row in by_participant[participant_id]:
+            key = str(row.get("author_key") or "")
+            if key:
+                state.author_accounts[key] = account_name
     else:
         state.account_contexts[account_name] = []
 
@@ -4928,6 +5119,13 @@ async def _apply_runtime_control(
         await account.stop()
         accounts.remove(account)
         state.account_contexts.pop(name, None)
+        state.account_live_contexts.pop(name, None)
+        state.author_accounts = {
+            key: owner for key, owner in state.author_accounts.items() if owner != name
+        }
+        state.live_author_accounts = {
+            key: owner for key, owner in state.live_author_accounts.items() if owner != name
+        }
         state.used_archive_ids.pop(name, None)
         if isinstance(state.account_participant_ids, dict):
             state.account_participant_ids.pop(name, None)
@@ -5116,21 +5314,21 @@ async def idle_activity_tick(
         return False
     idle_after = int(settings.get("idle_after_sec") or 900)
     cooldown = int(settings.get("idle_cooldown_sec") or 600)
+    # Reserve the idle slot atomically: even concurrent ticks cannot make
+    # several accounts revive the same quiet window together.
     async with state.lock:
         last_seen = state.last_activity or state.started_at
-    silence = (moment - last_seen).total_seconds()
-    if silence < idle_after:
-        return False
-    if state.last_idle_post is not None:
-        since_last_idle = (moment - state.last_idle_post).total_seconds()
-        if since_last_idle < cooldown:
+        silence = (moment - last_seen).total_seconds()
+        if silence < idle_after:
             return False
-    state.last_idle_post = moment
-    account = accounts[state.idle_cursor % len(accounts)]
-    state.idle_cursor = (state.idle_cursor + 1) % len(accounts)
-    async with state.lock:
+        if state.last_idle_post is not None:
+            since_last_idle = (moment - state.last_idle_post).total_seconds()
+            if since_last_idle < cooldown:
+                return False
+        state.last_idle_post = moment
+        account = accounts[state.idle_cursor % len(accounts)]
+        state.idle_cursor = (state.idle_cursor + 1) % len(accounts)
         recent = list(state.chat_history)
-    async with state.lock:
         recent_lines = list(state.recent_texts)
     text = _choose_fresh_fallback(
         IDLE_LINES,
@@ -5275,6 +5473,8 @@ async def run_farm() -> None:
         scenario_mode, live_source_enabled, context_refresh
     ) else {}
     context_rows = collected.get("messages", []) if isinstance(collected, dict) else []
+    state.context_author_salt = str(collected.get("author_salt") or "") if isinstance(collected, dict) else ""
+    state.author_accounts = {}
     raw_participant_mapping = collected.get("account_participant_ids") if isinstance(collected, dict) else None
     if isinstance(raw_participant_mapping, dict):
         normalized_mapping: dict[str, int] = {}
@@ -5323,6 +5523,7 @@ async def run_farm() -> None:
             context_event = {
                 "author": str(item.get("author") or "участник"),
                 "participant_id": _context_participant_id(item),
+                "author_key": str(item.get("author_key") or "") or None,
                 "user_id": 0,
                 "message_id": message_id,
                 "chat_id": context_chat_id,
@@ -5348,6 +5549,11 @@ async def run_farm() -> None:
                 account_name: context_by_participant.get(participant_id, [])
                 for account_name, participant_id in state.account_participant_ids.items()
             }
+            for account_name, rows in state.account_contexts.items():
+                for row in rows:
+                    key = str(row.get("author_key") or "")
+                    if key:
+                        state.author_accounts[key] = account_name
         ordered = sorted(
             [*merged.values(), *unkeyed],
             key=lambda item: str(item.get("ts") or ""),
@@ -5363,6 +5569,7 @@ async def run_farm() -> None:
         log.info("   добавлено сообщений контекста=%d, всего в истории=%d", added, len(state.chat_history))
     else:
         log.info("   тема=%r, история=%d", state.topic, len(state.chat_history))
+    state._rebuild_live_contexts()
 
     source_plan_path: Path | None = None
     if live_source_enabled:

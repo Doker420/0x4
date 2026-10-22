@@ -129,6 +129,14 @@ class ChatContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["messages"][1]["author"], "участник 2")
             self.assertEqual([item["participant_id"] for item in saved["messages"]], [1, 2])
             self.assertEqual(saved["account_participant_ids"], {"reader": 1, "agent_b": 2})
+            self.assertRegex(saved["author_salt"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                [item["author_key"] for item in saved["messages"]],
+                [
+                    chat_context.author_key(600, saved["author_salt"]),
+                    chat_context.author_key(500, saved["author_salt"]),
+                ],
+            )
             self.assertEqual(saved["history_limit"], 5000)
             self.assertEqual(result["account_participant_ids"], {"reader": 1, "agent_b": 2})
             self.assertNotIn("private_500", json.dumps(saved, ensure_ascii=False))

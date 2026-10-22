@@ -59,7 +59,7 @@
         <div class="field"><label for="idle_cooldown_sec">Пауза между оживлениями, сек</label><input id="idle_cooldown_sec" name="idle_cooldown_sec" type="number" min="60" max="86400" step="10" value="{{ settings.idle_cooldown_sec }}"><span class="help">Минимальный интервал между такими сообщениями: не даёт всем аккаунтам заговорить разом.</span></div>
       </div>
       <div class="field"><label for="idle_gif_percent">Доля гифок при простое, %</label><input id="idle_gif_percent" name="idle_gif_percent" type="number" min="0" max="100" step="1" value="{{ settings.idle_gif_percent }}"><span class="help">С какой вероятностью вместо короткой фразы аккаунт отправит гифку. Аккаунты чередуются по кругу, так что одновременно пишет один.</span></div>
-      <span class="help">Оживление не срабатывает в ночном окне и не мешает живым диалогам: любой входящий сдвигает таймер простоя. Изменения применятся при следующем запуске чат-фермы.</span>
+      <span class="help">Оживление не срабатывает в ночном окне и не мешает живым диалогам: любой входящий сдвигает таймер простоя. Вместо надоедливых «тут тихо» используются разные темы для разговора; даже при одновременных проверках слот получает только один аккаунт. Изменения применятся при следующем запуске чат-фермы.</span>
     </section>
 
     <section class="card">
@@ -70,7 +70,7 @@
         <div class="field"><label for="music_source">Источник музыки</label><input id="music_source" name="music_source" type="text" value="{{ settings.music_source }}" placeholder="@sad_tracky"><span class="help">Например @sad_tracky или числовой ID канала. Аккаунт должен быть подписан или иметь доступ к истории.</span></div>
         <div class="field"><label for="music_share_percent">Доля музыки в отправках, %</label><input id="music_share_percent" name="music_share_percent" type="number" min="0" max="100" step="1" value="{{ settings.music_share_percent }}"><span class="help">В обычном ответе файл загружается отдельным сообщением после текста и отправляется самим аккаунтом; временный файл удаляется. Самостоятельная публикация без входящего сообщения возможна только при включённых «Автономных сообщениях».</span></div>
       </div>
-      <span class="help">Треки берутся из последних сообщений источника и не повторяются, пока не закончатся. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
+      <span class="help">Сканируются до 500 последних постов и собирается пул до 200 треков. Они не повторяются между аккаунтами и после перезапуска, пока весь пул не использован. Если источник недоступен или музыки нет, ход уходит как обычно без ошибки.</span>
 
       <div class="check-row" style="margin-top:14px"><input id="video_enabled" name="video_enabled" type="checkbox" {% if settings.video_enabled %}checked{% endif %}><label for="video_enabled">Загружать видео из канала и отправлять от аккаунта</label></div>
       <div class="grid-2">
@@ -89,7 +89,7 @@
         <div class="field"><label for="emoji_only_percent">Доля таких ответов, %</label><input id="emoji_only_percent" name="emoji_only_percent" type="number" min="0" max="100" step="1" value="{{ settings.emoji_only_percent }}"><span class="help">Ответ на вопрос иногда уходит одним популярным эмодзи вместо фразы.</span></div>
         <div class="field"><label for="emoji_set">Набор эмодзи</label><input id="emoji_set" name="emoji_set" type="text" value="{{ settings.emoji_set }}" placeholder="😂 ❤️ 🔥 👍 🤔"><span class="help">Пусто — популярный набор (😂 ❤️ 🔥 👍 😍 🎉 🙌 😉 🤔 👀 💯 ✨ 😄 🙏 😎 🤣 😅 😊 🥰 😘). Можно вписать свои через пробел.</span></div>
       </div>
-      <span class="help">Гифки каждый раз запрашиваются случайные у провайдера (GIPHY/Tenor) и не повторяются между аккаунтами, пока есть свежие.</span>
+      <span class="help">Свежие гифки запрашиваются у GIPHY/Tenor в первую очередь, даже если задан старый локальный список. Повторный ответ API запрашивается заново; отправленные URL и файлы из источников не повторяются между аккаунтами и после перезапуска, пока есть неиспользованные варианты.</span>
     </section>
 
     <section class="card">

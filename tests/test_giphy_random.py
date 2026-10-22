@@ -98,6 +98,18 @@ class GiphyRandomTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await giphy.random_gif("пусто"), "https://cdn/fallback.gif")
         self.assertTrue(fallback.awaited)
 
+    async def test_duplicate_with_new_tracking_parameters_is_not_returned_as_fresh(self):
+        _FakeClient.giphy_url = "https://cdn/used.gif?cid=random"
+        with patch.object(
+            giphy, "search_gif", new=_async_return(["https://cdn/used.gif?cid=search"])
+        ) as fallback:
+            chosen = await giphy.random_gif(
+                "", avoid=["https://cdn/used.gif?cid=previous"]
+            )
+
+        self.assertIsNone(chosen)
+        self.assertTrue(fallback.awaited)
+
 
 def _async_return(value):
     from unittest.mock import AsyncMock

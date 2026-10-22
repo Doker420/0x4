@@ -106,51 +106,73 @@ async def _giphy_random_url(client: httpx.AsyncClient, key: str, tag: str) -> Op
         return None
 
 
-async def random_gif(query: str = "", avoid: Optional[List[str]] = None) -> Optional[str]:
-    """Return a random gif, trying hard not to repeat one that was just used.
+def _url_key(url: Any) -> str:
+    """Ignore changing provider tracking parameters when comparing GIF identity."""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme.casefold() in {"http", "https"} and parsed.netloc:
+        return parsed._replace(query="", fragment="").geturl()
+    return text
 
-    Uses the provider's random endpoint plus a randomised search offset, so two
-    accounts reacting to the same line still get different gifs.
-    """
-    tag = (query or "").strip()[:120] or random.choice(RANDOM_GIF_TAGS)
-    skipped = {str(url) for url in (avoid or ()) if url}
+
+async def random_gif(query: str = "", avoid: Optional[List[str]] = None) -> Optional[str]:
+    """Return a fresh provider GIF, retrying duplicates instead of accepting them."""
+    requested_tag = (query or "").strip()[:120]
+    skipped = {_url_key(url) for url in (avoid or ()) if _url_key(url)}
     giphy_key, tenor_key = await _get_keys()
+    if not giphy_key and not tenor_key:
+        return None
+
+    candidates: List[str] = []
+    seen_candidates: set[str] = set()
+
+    def add_candidate(value: Any) -> None:
+        url = str(value or "").strip()
+        key = _url_key(url)
+        if url and key and key not in seen_candidates:
+            seen_candidates.add(key)
+            candidates.append(url)
 
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        candidates: List[str] = []
-        if giphy_key:
-            url = await _giphy_random_url(client, giphy_key, tag)
-            if url:
-                candidates.append(url)
-            if tag in RANDOM_GIF_TAGS:
-                # A neutral tag means "anything funny works": widen the pool.
-                url = await _giphy_random_url(client, giphy_key, random.choice(RANDOM_GIF_TAGS))
-                if url:
-                    candidates.append(url)
-        if tenor_key:
-            offset = random.randint(0, 60)
-            try:
-                response = await client.get(
-                    "https://tenor.googleapis.com/v2/search",
-                    params={
-                        "key": tenor_key, "q": tag, "limit": 10,
-                        "pos": offset, "media_filter": "gif",
-                    },
-                )
-                response.raise_for_status()
-                for item in response.json().get("results", []):
-                    formats = item.get("media_formats", {})
-                    media = formats.get("gif") or formats.get("mediumgif") or formats.get("tinygif")
-                    url = media.get("url") if isinstance(media, dict) else None
-                    if url:
-                        candidates.append(str(url))
-            except Exception as exc:
-                log.warning("Tenor random search failed (%s)", type(exc).__name__)
-        if not candidates:
-            candidates = await search_gif(tag, limit=25, offset=random.randint(0, 60))
+        # A provider's random endpoint may return the same item twice.  Never
+        # solve that by returning an explicitly avoided GIF: try a fresh draw.
+        for attempt in range(3):
+            tag = requested_tag or random.choice(RANDOM_GIF_TAGS)
+            if giphy_key:
+                add_candidate(await _giphy_random_url(client, giphy_key, tag))
+                if not requested_tag:
+                    add_candidate(await _giphy_random_url(
+                        client, giphy_key, random.choice(RANDOM_GIF_TAGS)
+                    ))
+            if tenor_key:
+                try:
+                    response = await client.get(
+                        "https://tenor.googleapis.com/v2/search",
+                        params={
+                            "key": tenor_key, "q": tag, "limit": 10,
+                            "pos": random.randint(0, 60), "media_filter": "gif",
+                        },
+                    )
+                    response.raise_for_status()
+                    for item in response.json().get("results", []):
+                        formats = item.get("media_formats", {})
+                        media = formats.get("gif") or formats.get("mediumgif") or formats.get("tinygif")
+                        add_candidate(media.get("url") if isinstance(media, dict) else None)
+                except Exception as exc:
+                    log.warning("Tenor random search failed (%s)", type(exc).__name__)
+            fresh = [url for url in candidates if _url_key(url) not in skipped]
+            if fresh:
+                return random.choice(fresh)
 
-        fresh = [url for url in dict.fromkeys(candidates) if url not in skipped]
-        return random.choice(fresh or list(dict.fromkeys(candidates))) if (fresh or candidates) else None
+        # Search with another offset is the last attempt, not a source of the
+        # same first result on every call.
+        tag = requested_tag or random.choice(RANDOM_GIF_TAGS)
+        for url in await search_gif(tag, limit=25, offset=random.randint(0, 60)):
+            add_candidate(url)
+        fresh = [url for url in candidates if _url_key(url) not in skipped]
+        return random.choice(fresh) if fresh else None
 
 
 async def download_gif(url: str, directory: Path) -> Path:

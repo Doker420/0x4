@@ -673,6 +673,32 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             line_words = set(re.findall(r"[а-яёa-z]{4,}", line.casefold()))
             self.assertGreaterEqual(len(source_words & line_words), 2)
 
+    def test_idle_lines_never_comment_that_the_chat_is_quiet(self):
+        forbidden = re.compile(r"тихо|тишин|молч|пропал|затиш|кто живой", re.IGNORECASE)
+        for line in farm.IDLE_LINES:
+            with self.subTest(line=line):
+                self.assertIsNone(forbidden.search(line))
+
+    async def test_concurrent_idle_ticks_still_allow_only_one_account(self):
+        state = farm.FarmState()
+        state.last_activity = datetime.datetime.now() - datetime.timedelta(seconds=600)
+        accounts = [FakeIdleAccount(name, state) for name in ("a", "b", "c")]
+        settings = {
+            "idle_enabled": True,
+            "idle_after_sec": 60,
+            "idle_cooldown_sec": 60,
+            "idle_gif_percent": 0,
+        }
+
+        results = await asyncio.gather(*[
+            farm.idle_activity_tick(accounts, state, settings) for _ in range(9)
+        ])
+
+        self.assertEqual(sum(results), 1)
+        self.assertEqual(sum(len(account.sent) for account in accounts), 1)
+        sent_text = next(account.sent[0]["text"] for account in accounts if account.sent)
+        self.assertNotRegex(sent_text, r"тихо|тишин|молч|пропал|затиш")
+
     async def test_idle_activity_revives_the_chat_with_one_account_at_a_time(self):
         from datetime import datetime, timedelta
 
@@ -818,6 +844,30 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
         account.client.copy_message.assert_not_awaited()
         self.assertEqual(account.recorded, [(555, "", "audio")])
 
+    async def test_source_media_rotation_survives_accounts_and_state_restore(self):
+        source_client = FakeMediaSourceClient([11, 12], kind="audio")
+        sender = farm.MediaSender("@sad_tracky", "music")
+        await sender.refresh([source_client])
+        state = farm.FarmState()
+        first_account = FakeMusicAccount()
+        first_account.state = state
+        state.mark_media(sender.media_key(11))
+
+        self.assertTrue(await sender.send(first_account))
+        self.assertEqual(source_client.downloads[-1][0], 12)
+
+        # A new sender (as after a process restart) sees both persisted ids and
+        # starts a new pass only now; it also avoids the immediately previous id.
+        restored = farm.FarmState()
+        restored.load(state.to_dict())
+        second_account = FakeMusicAccount()
+        second_account.state = restored
+        new_sender = farm.MediaSender("@sad_tracky", "music")
+        await new_sender.refresh([source_client])
+        self.assertTrue(await new_sender.send(second_account))
+        self.assertEqual(source_client.downloads[-1][0], 11)
+        self.assertTrue(restored.media_seen(new_sender.media_key(11)))
+
     async def test_video_sender_downloads_file_and_uploads_from_account(self):
         source_client = FakeMediaSourceClient([21, 22, 23], kind="video")
         sender = farm.MediaSender("@funny_videos", "video")
@@ -919,6 +969,23 @@ class FarmScenarioTests(unittest.IsolatedAsyncioTestCase):
             provider.return_value = urls[1]
             self.assertTrue(await accounts[1]._send_gif(reply_to=None, search_text="привет всем"))
             self.assertEqual(provider.await_args.kwargs["avoid"], ["https://cdn/gif-1.gif"])
+
+    async def test_gif_api_is_used_before_the_old_configured_pool(self):
+        from web import giphy
+
+        state = farm.FarmState()
+        account = self._live_account("provider-first", state)
+        farm.FARM_CFG["gifs"] = ["old-local.gif"]
+        provider_url = "https://cdn/fresh.gif?cid=one"
+
+        with patch.object(giphy, "random_gif", new_callable=AsyncMock, return_value=provider_url) as provider, \
+             patch.object(giphy, "download_gif", new_callable=AsyncMock, return_value=Path("/tmp/fresh.gif")):
+            self.assertTrue(await account._send_gif(reply_to=None, search_text="смешной кот"))
+
+        provider.assert_awaited_once()
+        self.assertEqual(account.client.sent[0]["animation"], "/tmp/fresh.gif")
+        self.assertNotEqual(account.client.sent[0]["animation"], "old-local.gif")
+        self.assertTrue(state.media_seen("https://cdn/fresh.gif?cid=another"))
 
     async def test_question_answer_is_picked_up_by_other_accounts(self):
         farm.FARM_CFG["farm"].update({

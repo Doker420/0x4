@@ -872,6 +872,74 @@ class FarmReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("UNIQUE_OLD_CONTEXT_FOR_BOT_TWO", prompt)
         self.assertIn("LIVE_MESSAGE_79", prompt)
 
+    async def test_live_target_history_stays_with_one_author_account_in_real_time(self):
+        farm.FARM_CFG["farm"].update({
+            "scenario_mode": "reactive",
+            "auto_replies_enabled": True,
+            "min_delay_sec": 0,
+            "max_delay_sec": 0,
+        })
+        state = farm.FarmState()
+        state.context_author_salt = "ab" * 32
+        state.account_participant_ids = {"first": 1, "second": 2}
+        state.account_contexts = {
+            "first": [{
+                "participant_id": 1, "message_id": 101, "direction": "context",
+                "text": "Архив первого участника", "source_text": "Архив первого участника",
+            }],
+            "second": [{
+                "participant_id": 2, "message_id": 102, "direction": "context",
+                "text": "Архив второго участника", "source_text": "Архив второго участника",
+            }],
+        }
+        state.author_accounts = {
+            farm.make_author_key(900, state.context_author_salt): "first",
+        }
+        accounts = []
+        for name, user_id in (("first", 100), ("second", 101)):
+            account = farm.FarmAccount.__new__(farm.FarmAccount)
+            account.name = name
+            account.user_id = user_id
+            account.state = state
+            account._running = True
+            account.reply_probability = 1.0
+            account._background_tasks = set()
+            account._answer_with_followups = AsyncMock()
+            accounts.append(account)
+        for account in accounts:
+            account.farm_accounts = accounts
+
+        def incoming(message_id, text):
+            return types.SimpleNamespace(
+                id=message_id, empty=False, service=None,
+                chat=types.SimpleNamespace(id=-1001234567890),
+                from_user=types.SimpleNamespace(
+                    id=900, is_bot=False, username="human", first_name="Human",
+                ),
+                text=text, caption=None,
+            )
+
+        # Even when another session receives the Telegram update, the archived
+        # owner handles it and immediately gets the new source text.
+        await accounts[1]._on_incoming(None, incoming(701, "Что нового сегодня?"))
+        await accounts[0]._on_incoming(None, incoming(702, "Как продвинулся проект?"))
+        await asyncio.gather(*list(accounts[0]._background_tasks))
+
+        self.assertEqual(accounts[0]._answer_with_followups.await_count, 2)
+        accounts[1]._answer_with_followups.assert_not_awaited()
+        self.assertEqual(
+            [item["text"] for item in state.account_live_contexts["first"]],
+            ["Что нового сегодня?", "Как продвинулся проект?"],
+        )
+        self.assertNotIn("second", state.account_live_contexts)
+        second_donor, second_live = farm._state_history_parts(state, "second")
+        self.assertNotIn(
+            "Что нового сегодня?",
+            [item.get("text") for item in [*second_donor, *second_live]],
+        )
+        newest_source = await farm.next_history_turn_item(state, "first", 1)
+        self.assertEqual(newest_source["message_id"], 702)
+
     async def test_reactive_send_reply_uses_saved_instructions_without_scenario_topic(self):
         account = farm.FarmAccount.__new__(farm.FarmAccount)
         account.name = "alpha"
