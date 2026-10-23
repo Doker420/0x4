@@ -1,0 +1,23 @@
+[Unit]
+Description=0x4 Airdrop & Wallet Control Panel (:1111)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=-@INSTALL_DIR@/.env
+Environment=AIRDROP_PANEL_HOST=0.0.0.0
+Environment=AIRDROP_PANEL_PORT=1111
+ExecStart=@INSTALL_DIR@/.venv/bin/python airdrop_web.py
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airdrop-panel
+
+[Install]
+WantedBy=multi-user.target

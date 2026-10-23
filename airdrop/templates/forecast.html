@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}0x4 · Прогноз нашего проекта и 5 направлений заработка (:1111){% endblock %}
+{% block content %}
+  <h1>📈 Честный прогноз нашего проекта и План заработка (не только аирдропы)</h1>
+  <p class="subtle">
+    Без сказок про «миллион за ночь»: здесь посчитано, сколько реально можно заработать с нашей связкой
+    (Сервер <code>144.31.25.24</code> + Радар аирдропов и квестов + Панель Telegram <code>:8080</code> + Кошельки в Exodus) и откуда именно приходят деньги.
+  </p>
+
+  <!-- Главный вывод -->
+  <div class="card" style="border-color: rgba(91,214,194,.45);">
+    <span class="badge success">ВЕРДИКТ ПО НАШЕМУ ПРОЕКТУ · ГОТОВНОСТЬ {{ forecast.readiness_pct }}%</span>
+    <p style="font-size:15.5px; margin:10px 0 0;">{{ forecast.verdict }}</p>
+  </div>
+
+  <!-- Интерактивный калькулятор -->
+  <div class="card">
+    <h2>🧮 Пересчитать прогноз под твоё время и бюджет</h2>
+    <form method="get" action="/forecast" class="grid-2" style="align-items:end; margin-bottom:18px;">
+      <div>
+        <label>Сколько времени в день ты готов уделять?</label>
+        <select name="hours">
+          <option value="0.5" {% if forecast.inputs.hours_per_day <= 0.5 %}selected{% endif %}>30 минут в день (лайт-режим)</option>
+          <option value="1.0" {% if forecast.inputs.hours_per_day == 1.0 %}selected{% endif %}>1 час в день (оптимально для старта)</option>
+          <option value="2.0" {% if forecast.inputs.hours_per_day == 2.0 %}selected{% endif %}>2 часа в день (активный режим)</option>
+          <option value="4.0" {% if forecast.inputs.hours_per_day >= 3.0 %}selected{% endif %}>3–4 часа в день (максимальный фокус)</option>
+        </select>
+      </div>
+      <div>
+        <label>Стартовый баланс на кошельке (на комиссии L2 / активность)</label>
+        <select name="budget">
+          <option value="0" {% if forecast.inputs.budget_usd == 0 %}selected{% endif %}>$0 — начинаю вообще без вложений</option>
+          <option value="15" {% if forecast.inputs.budget_usd == 15 %}selected{% endif %}>$15 — есть копейки на газ в сети Base/Arbitrum</option>
+          <option value="50" {% if forecast.inputs.budget_usd == 50 %}selected{% endif %}>$50 — комфортный оборот для L2-дропов</option>
+          <option value="200" {% if forecast.inputs.budget_usd >= 100 %}selected{% endif %}>$200+ — повышенный объём</option>
+        </select>
+      </div>
+      <div>
+        <label>Включить в расчёт монетизацию панели 0x4 (мелкие заказы / фриланс)?</label>
+        <select name="services_income">
+          <option value="1" {% if forecast.inputs.include_services %}selected{% endif %}>Да (Квесты + Аирдропы + Услуги на базе нашего сервера)</option>
+          <option value="0" {% if not forecast.inputs.include_services %}selected{% endif %}>Нет (Только личное прохождение квестов и аирдропов)</option>
+        </select>
+      </div>
+      <div>
+        <button type="submit">🔄 Пересчитать мой прогноз</button>
+      </div>
+    </form>
+
+    <!-- Таблица горизонтов -->
+    <div class="grid-2">
+      {% for h in forecast.horizons %}
+        <div style="padding:16px; border:1px solid var(--border); border-radius:14px; background:rgba(12,19,29,.88);">
+          <div style="font-size:12px; color:var(--accent); font-weight:800; text-transform:uppercase;">{{ h.period }}</div>
+          <div style="font-size:26px; font-weight:800; margin:6px 0;">
+            Ожидание: <span style="color:var(--success)">${{ h.likely }}</span>
+            <small style="font-size:14px; color:var(--muted); font-weight:600;">(коридор ${{ h.min }} – ${{ h.max }})</small>
+          </div>
+          <div style="font-size:13px; color:#d2deec; margin-bottom:4px;"><b>Откуда деньги:</b> {{ h.source }}</div>
+          <div style="font-size:12.5px; color:var(--muted);"><b>Вероятность:</b> {{ h.probability }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- 5 направлений заработка (не только аирдропы!) -->
+  <h2>💡 5 легальных направлений заработка (что именно делать и почему не только аирдропы)</h2>
+  {% for s in streams %}
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+        <div>
+          <span class="badge blue">{{ s.badge }}</span>
+          <h2 style="margin:8px 0 4px;">{{ s.title }}</h2>
+        </div>
+        <div style="text-align:right; font-size:13px;">
+          <div>Вложения: <b>{{ s.capital }}</b></div>
+          <div>Первые деньги: <b style="color:var(--success);">{{ s.time_to_first_dollar }}</b></div>
+          <div>Потенциал в месяц: <b>{{ s.monthly_range }}</b></div>
+        </div>
+      </div>
+      <p style="font-size:14px; color:#cdd9e7; margin:10px 0;">{{ s.why_it_works }}</p>
+
+      {% if s.platforms %}
+        <div class="grid-2" style="margin-top:12px;">
+          {% for p in s.platforms %}
+            <div style="padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:rgba(11,17,26,.85);">
+              <div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
+                <strong>{{ p.name }}</strong>
+                <span class="badge success">{{ p.payout }}</span>
+              </div>
+              <div style="font-size:13px; color:var(--muted); margin:6px 0 8px;">{{ p.note }}</div>
+              <a class="btn btn-secondary" href="{{ p.url }}" target="_blank" style="padding:6px 11px; font-size:12.5px;">Открыть {{ p.name }} ↗</a>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  {% endfor %}
+{% endblock %}

@@ -1,0 +1,23 @@
+{
+  "_comment": "Скопируйте в config/airdrops.json и заполните. Только проекты, которые вы проверили сами: адрес контракта — с официального сайта/дока, а не из чата.",
+  "airdrops": [
+    {
+      "name": "Пример: ZkSync-style retro",
+      "chain": "zksync",
+      "category": "retro",
+      "url": "https://claim.example.com",
+      "claim_url": "https://claim.example.com",
+      "token": "TOKEN",
+      "summary": "Ретро-раздача для ранних пользователей.",
+      "deadline": "2026-12-31",
+
+      "check_kind": "json",
+      "check_url": "https://api.example.com/allocations/{address}",
+
+      "claim_contract": "0x0000000000000000000000000000000000000000",
+      "claim_amount": "0",
+      "merkle_proof": [],
+      "merkle_index": 0
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "_comment": "Allow-лист контрактов. Агент НЕ отправит ни одной транзакции на адрес, которого здесь нет (если AIRDROP_ALLOW_UNKNOWN_CONTRACTS не включён явно). Перед добавлением сверяйте адрес с официальной документацией проекта и проверяйте в эксплорере.",
+  "claim": [
+    {
+      "chain": "ethereum",
+      "address": "0x0000000000000000000000000000000000000000",
+      "label": "пример: дистрибьютор раздачи",
+      "project": "example",
+      "verified_by": "замените на себя и дату проверки"
+    }
+  ],
+  "swap": [
+    {
+      "chain": "ethereum",
+      "address": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+      "label": "Uniswap V2 Router (Ethereum mainnet)",
+      "verified_by": "известный публичный адрес — всё равно сверьте в эксплорере"
+    },
+    {
+      "chain": "ethereum",
+      "address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "label": "Uniswap SwapRouter02 (Ethereum mainnet) — для V2-ABI свопа не подходит",
+      "verified_by": "известный публичный адрес"
+    }
+  ],
+  "transfer": []
+}

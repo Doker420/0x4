@@ -1,0 +1,30 @@
+[Unit]
+Description=0x4 airdrop telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=@INSTALL_DIR@/.env
+ExecStart=@INSTALL_DIR@/.venv/bin/python bot_airdrop.py
+Restart=always
+RestartSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=@INSTALL_DIR@/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airdrop-bot
+
+[Install]
+WantedBy=multi-user.target

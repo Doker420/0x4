@@ -1,0 +1,31 @@
+[Unit]
+Description=0x4 airdrop discovery agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=@INSTALL_DIR@/.env
+ExecStart=@INSTALL_DIR@/.venv/bin/python -m airdrop.agent --loop
+Restart=always
+RestartSec=30
+
+# Песочница systemd: агенту нужны только свои данные и конфиг.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=@INSTALL_DIR@/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airdrop-agent
+
+[Install]
+WantedBy=multi-user.target

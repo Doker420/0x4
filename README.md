@@ -57,3 +57,63 @@ python -m py_compile bot.py farm.py web_run.py web/*.py
 - Не коммитьте `.env`, `farm_config.json`, `sessions/*.session`, базу и данные чатов. Используйте `.env.example` только как шаблон.
 - Загруженный архив содержал локальные секреты и Telegram session-файл. Архив исключён из текущего дерева; если он когда-либо попадал в GitHub или передавался третьим лицам, отзовите Telegram-сессии и замените связанные API/бот-ключи. Удаление файла из текущей версии не стирает его из истории Git.
 - Авторизация панели нужна даже в доверенной сети; задайте сильный пароль и ограничьте доступ к порту.
+
+---
+
+## Airdrop-агент и отдельный Telegram-бот (`airdrop/` + `bot_airdrop.py`)
+
+Самостоятельный модуль в этом же репозитории, не затрагивающий работу `bot.py` и `farm.py`:
+
+- **Поиск кандидатов (`airdrop/discovery.py`, `airdrop/sources/`)** — опрашивает публичные read-only источники: DefiLlama (`/airdrops`, протоколы с TVL без токена, свежие раунды `/raises`), CoinGecko (тренды и свежие листинги), RSS крипто-СМИ, GitHub-трекеры и ваш локальный список `config/airdrops.json`. Ранжирует находки, штрафует скам-паттерны (`giveaway`, `send 0.1 ETH`, `seed phrase`) и складывает в SQLite (`data/airdrop/airdrop.sqlite3`).
+- **Кошельки (`airdrop/wallet.py`)** — генерация и импорт ключей `eth_account`. Приватный ключ **никогда не хранится в открытом виде** и не попадает в логи: на диске лежит только JSON-конверт `AES-256-GCM` с ключом из `AIRDROP_KEY_PASSPHRASE` через `scrypt` и правами `0600`.
+- **Проверка eligibility (`airdrop/eligibility.py`)** — проверяет ваши кошельки по публичным JSON-чекерам (`check_url` с `{address}`) или по ончейн-балансу (`ERC-20` / native через Web3 RPC). Ничего не подписывает.
+- **Ончейн-действия под защитой (`airdrop/actions.py`)** — `claim()`, `swapExactETHForTokens` и перевод между собственными кошельками. По умолчанию включён `AIRDROP_DRY_RUN=1` (строится и оценивается только план без отправки в сеть). В боевом режиме действуют allow-лист контрактов (`config/contracts.json`), проверка наличия байткода на адресе, лимит на транзакцию (`AIRDROP_MAX_TX_VALUE_ETH`), суточный бюджет (`AIRDROP_DAILY_LIMIT_ETH`), потолок газа (`AIRDROP_MAX_GAS_GWEI`) и обязательная кнопка подтверждения в боте.
+- **Отдельный Telegram-бот (`bot_airdrop.py`)** — работает на своём токене `AIRDROP_BOT_TOKEN` и отвечает только `AIRDROP_ADMIN_IDS`: `/status`, `/scan`, `/drops`, `/watch`, `/check`, `/wallets`, `/newwallet`, `/claim`, `/swap`, `/actions`, `/settings`, `/logs` + inline-кнопки «В работу / Скип / Проверить кошельки / Подтвердить».
+
+### Быстрый деплой на ваш VPS (одной командой)
+
+```bash
+git clone https://github.com/Doker420/0x4.git /opt/0x4
+cd /opt/0x4
+sudo bash deploy/install.sh
+```
+
+Скрипт сам создаст `.venv`, поставит `requirements-airdrop.txt`, подготовит `.env` (права `600`) со сгенерированной `AIRDROP_KEY_PASSPHRASE`, скопирует `config/airdrops.json` и `config/contracts.json` из шаблонов, прогонит тесты и зарегистрирует systemd-сервисы `airdrop-agent` и `airdrop-bot`.
+
+Дальше останется только прописать в `/opt/0x4/.env` токен нового бота от `@BotFather` и свой Telegram ID:
+
+```ini
+AIRDROP_BOT_TOKEN=123456:ABC...
+AIRDROP_ADMIN_IDS=123456789
+```
+
+и перезапустить бота:
+
+```bash
+sudo systemctl restart airdrop-bot airdrop-agent
+sudo journalctl -u airdrop-agent -u airdrop-bot -f
+```
+
+Или через Docker Compose:
+
+```bash
+cp .env.example .env   # заполните AIRDROP_BOT_TOKEN, AIRDROP_ADMIN_IDS, AIRDROP_KEY_PASSPHRASE
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+### Полезные команды
+
+```bash
+# Разовый прогон поиска (офлайн по фикстурам / онлайн по публичным API)
+.venv/bin/python -m airdrop.agent --once --offline
+.venv/bin/python -m airdrop.agent --once
+
+# Проверка всех ваших кошельков по config/airdrops.json
+.venv/bin/python -m airdrop.agent --eligibility
+
+# Статус базы и кошельков
+.venv/bin/python -m airdrop.agent --status
+
+# Тесты модуля аирдроп-агента
+.venv/bin/python -m unittest discover -s tests -p "test_airdrop_*.py" -v
+```

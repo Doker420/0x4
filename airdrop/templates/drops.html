@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}0x4 · Находки, Квесты и Проверка кошельков (:1111){% endblock %}
+{% block content %}
+  <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:14px; margin-bottom:16px;">
+    <div>
+      <h1>🪂 Радар возможностей: Быстрые квесты ($0) + Аирдропы</h1>
+      <p class="subtle" style="margin:4px 0 0;">
+        Агент автоматически собирает сюда протоколы без токена (DefiLlama), тренды (CoinGecko), анонсы СМИ (RSS), GitHub-трекеры и стартовые площадки с быстрыми выплатами.
+      </p>
+    </div>
+    <div class="toolbar">
+      <form method="post" action="/scan/run" style="margin:0;">
+        <input type="hidden" name="mode" value="online">
+        <input type="hidden" name="return_to" value="/drops">
+        <button type="submit">🔎 Сканировать интернет сейчас</button>
+      </form>
+      <form method="post" action="/eligibility/run" style="margin:0;">
+        <input type="hidden" name="return_to" value="/drops">
+        <button type="submit" class="btn-secondary">✅ Проверить мои кошельки на выплаты</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Вкладки фильтрации -->
+  <div class="toolbar" style="margin-bottom:16px;">
+    <a class="btn {% if tab == 'all' %}{% else %}btn-secondary{% endif %}" href="/drops?tab=all">Все ({{ rows|length }})</a>
+    <a class="btn {% if tab == 'quick' %}{% else %}btn-secondary{% endif %}" href="/drops?tab=quick">⚡ Быстрые $1–$15 ($0 старт)</a>
+    <a class="btn {% if tab == 'watching' %}{% else %}btn-secondary{% endif %}" href="/drops?tab=watching">🔥 Взято в работу</a>
+    <a class="btn {% if tab == 'new' %}{% else %}btn-secondary{% endif %}" href="/drops?tab=new">🆕 Новые</a>
+  </div>
+
+  <!-- Список карточек -->
+  <div class="grid-2">
+    {% for r in rows %}
+      <div class="card" style="margin-bottom:0;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+          <div>
+            <span class="badge {% if r.category == 'quick-earn' %}success{% else %}blue{% endif %}">
+              {{ r.source }} · {{ r.category or 'drop' }}{% if r.chain %} · {{ r.chain|upper }}{% endif %}
+            </span>
+            <h3 style="margin:8px 0 4px;">{{ r.name }}</h3>
+          </div>
+          <span class="badge {% if r.score >= 8 %}success{% elif r.score >= 5 %}warning{% else %}danger{% endif %}">
+            Скор {{ "%.1f"|format(r.score) }}
+          </span>
+        </div>
+        <p style="font-size:13.5px; color:var(--muted); margin:8px 0 12px;">{{ r.summary }}</p>
+        <div class="toolbar">
+          {% if r.url %}
+            <a class="btn" href="{{ r.url }}" target="_blank">🌐 Открыть проект ↗</a>
+          {% endif %}
+          {% if r.status != 'watching' %}
+            <form method="post" action="/drops/status" style="margin:0;">
+              <input type="hidden" name="slug" value="{{ r.slug }}">
+              <input type="hidden" name="status" value="watching">
+              <input type="hidden" name="return_to" value="/drops?tab={{ tab }}">
+              <button type="submit" class="btn-secondary">✅ В работу</button>
+            </form>
+          {% else %}
+            <span class="badge success">✓ В работе</span>
+          {% endif %}
+          {% if r.status != 'skipped' %}
+            <form method="post" action="/drops/status" style="margin:0;">
+              <input type="hidden" name="slug" value="{{ r.slug }}">
+              <input type="hidden" name="status" value="skipped">
+              <input type="hidden" name="return_to" value="/drops?tab={{ tab }}">
+              <button type="submit" class="btn-secondary">🚫 Скип</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <!-- Добавление своего проекта + результаты проверок -->
+  <div class="grid-2" style="margin-top:18px;">
+    <div class="card">
+      <h2>➕ Добавить проект / квест вручную в список «В работе»</h2>
+      <form method="post" action="/drops/add">
+        <div style="margin-bottom:10px;">
+          <label>Название проекта или квеста</label>
+          <input type="text" name="name" placeholder="Например: Monad Testnet / Новый квест на Layer3" required>
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Официальная ссылка</label>
+          <input type="url" name="url" placeholder="https://...">
+        </div>
+        <div style="margin-bottom:10px;">
+          <label>Сеть (base / arbitrum / ethereum / zksync / scroll)</label>
+          <input type="text" name="chain" value="base">
+        </div>
+        <div style="margin-bottom:12px;">
+          <label>Заметка (что нужно делать)</label>
+          <input type="text" name="summary" placeholder="Раз в неделю делать 1 бесплатный чек-ин">
+        </div>
+        <button type="submit">➕ Добавить в работу</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>🔎 Результаты проверки наших кошельков (Eligibility)</h2>
+      {% if elig_rows %}
+        {% for e in elig_rows %}
+          <div style="padding:10px 12px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between;">
+              <strong>{{ e.project }}</strong>
+              <span class="badge {% if e.eligible %}success{% else %}warning{% endif %}">
+                {% if e.eligible %}✅ ELIGIBLE ({{ e.amount }} {{ e.token }}){% else %}Пока нет начислений{% endif %}
+              </span>
+            </div>
+            <div style="font-size:12px; color:var(--muted); margin-top:4px;">
+              Адрес: <code>{{ e.address }}</code>
+              {% if e.error %} · {{ e.error }}{% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="subtle">Нажмите «✅ Проверить мои кошельки на выплаты» вверху страницы, чтобы прогнать все кошельки по списку проектов.</p>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}

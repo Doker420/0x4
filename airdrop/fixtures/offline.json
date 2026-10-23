@@ -1,0 +1,52 @@
+[
+  {
+    "name": "Example L2 — points season 2",
+    "url": "https://example.com/points",
+    "source": "fixture",
+    "chain": "base",
+    "category": "no-token-protocol",
+    "summary": "Протокол без токена, TVL ~$40M, идёт вторая фаза поинтов. Снапшот анонсирован.",
+    "deadline": null,
+    "extra": {"tvl": 40000000}
+  },
+  {
+    "name": "RetroDrop Demo (retroactive airdrop claim is live)",
+    "url": "https://example.com/claim",
+    "source": "fixture",
+    "chain": "arbitrum",
+    "category": "airdrop-listing",
+    "summary": "Claim is live для ранних пользователей, проверка eligibility по адресу.",
+    "deadline": "2026-12-31",
+    "extra": {}
+  },
+  {
+    "name": "NewChain — testnet rewards",
+    "url": "https://example.com/testnet",
+    "source": "fixture",
+    "chain": "scroll",
+    "category": "funded-project",
+    "summary": "Проект поднял раунд $12M, раздаёт поинты за активность в тестнете.",
+    "deadline": null,
+    "extra": {"amount": 12}
+  },
+  {
+    "name": "Totally Free Crypto Giveaway — send 0.1 ETH",
+    "url": "https://example-scam.test/",
+    "source": "fixture",
+    "chain": "",
+    "category": "news",
+    "summary": "Giveaway! Double your ETH, connect wallet to receive. Классический скам-паттерн.",
+    "deadline": null,
+    "extra": {}
+  },
+  {
+    "name": "StableBridge — snapshot taken, eligibility checker open",
+    "url": "https://example.com/check",
+    "source": "fixture",
+    "chain": "ethereum",
+    "category": "news",
+    "summary": "Snapshot taken, открыт eligibility checker, клейм через 2 недели.",
+    "deadline": "2026-11-30",
+    "extra": {}
+  }
+]

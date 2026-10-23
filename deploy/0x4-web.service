@@ -1,0 +1,23 @@
+[Unit]
+Description=0x4 Telegram Accounts & Farm Control Panel (:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=-@INSTALL_DIR@/.env
+Environment=WEB_HOST=0.0.0.0
+Environment=WEB_PORT=8080
+ExecStart=@INSTALL_DIR@/.venv/bin/python web_run.py
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=0x4-web
+
+[Install]
+WantedBy=multi-user.target

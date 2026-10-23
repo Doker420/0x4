@@ -1,0 +1,7 @@
+# Зависимости аирдроп-агента, Telegram-бота и веб-панели на порту :1111.
+-r requirements-web.txt
+web3>=6.20,<7
+eth-account>=0.11,<0.14
+aiogram>=3.13,<4
+feedparser>=6.0.11
+cryptography>=42,<45

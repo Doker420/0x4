@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}0x4 · Кошельки и подключение в Exodus (:1111){% endblock %}
+{% block content %}
+  <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:14px; margin-bottom:16px;">
+    <div>
+      <h1>👛 Управление кошельками и подключение в Exodus</h1>
+      <p class="subtle" style="margin:4px 0 0;">
+        Здесь создаются и хранятся твои EVM-кошельки (подходят для <b>Ethereum, Base, Arbitrum, Optimism, Polygon, BSC, ZkSync</b>).
+        Любой кошелёк отсюда за 1 минуту подключается в приложение <b>Exodus</b> на телефоне или компьютере по 12 словам.
+      </p>
+    </div>
+    <a class="btn btn-secondary" href="/wallets?check_balances=1">🔄 Проверить балансы по 6 сетям</a>
+  </div>
+
+  <!-- Список наших кошельков -->
+  {% for w in wallets %}
+    <div class="card" style="border-color: {% if w.secrets %}var(--accent){% else %}var(--border){% endif %};">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
+        <div>
+          <span class="badge success">Зашифрован на сервере (AES-256-GCM)</span>
+          <h2 style="margin:8px 0 4px;">Кошелёк «{{ w.name }}»</h2>
+          <div style="margin:6px 0;">
+            Публичный адрес (его <b>можно</b> смело указывать на сайтах квестов и для получения монет):<br>
+            <code style="font-size:15px;">{{ w.address }}</code>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button type="button" onclick="copyText('{{ w.address }}', this)">📋 Скопировать адрес</button>
+          {% if w.secrets %}
+            <a class="btn btn-secondary" href="/wallets">🙈 Скрыть секретные 12 слов</a>
+          {% else %}
+            <a class="btn" href="/wallets?reveal={{ w.name }}">🔑 Подключить в Exodus (показать 12 слов и ключ)</a>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Ссылки на эксплореры -->
+      <div class="toolbar" style="margin-top:12px;">
+        <a class="btn btn-secondary" href="{{ w.debank_url }}" target="_blank">📊 DeBank (все монеты и дропы) ↗</a>
+        <a class="btn btn-secondary" href="{{ w.basescan_url }}" target="_blank">Basescan ↗</a>
+        <a class="btn btn-secondary" href="{{ w.arbiscan_url }}" target="_blank">Arbiscan ↗</a>
+        <a class="btn btn-secondary" href="{{ w.etherscan_url }}" target="_blank">Etherscan ↗</a>
+      </div>
+
+      {% if balances.get(w.name) %}
+        <div style="margin-top:14px; padding:12px; border-radius:12px; background:rgba(10,16,24,.85); border:1px solid var(--border);">
+          <strong style="font-size:13px;">Балансы нативных монет (ETH/BNB/POL):</strong>
+          <div style="display:flex; flex-wrap:wrap; gap:14px; margin-top:6px; font-size:13px;">
+            {% for ch, val in balances[w.name].items() %}
+              <span><b>{{ ch|upper }}:</b> <code>{{ val }}</code></span>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+
+      <!-- Блок экспорта 12 слов и приватного ключа для Exodus -->
+      {% if w.secrets %}
+        <div style="margin-top:18px; padding:18px; border-radius:14px; border:1px solid rgba(91,214,194,.5); background:rgba(9,19,28,.95);">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <h3 style="color:#8ef7df; margin:0;">🔐 Данные для подключения «{{ w.name }}» в Exodus / Rabby / MetaMask</h3>
+            <span class="badge warning">⚠️ НИКОМУ не отправляй эти 12 слов и приватный ключ в чатах!</span>
+          </div>
+
+          {% if w.secrets.words %}
+            <p style="margin:12px 0 6px; font-size:14px;">
+              <b>1. Секретная фраза восстановления из 12 слов (Secret Recovery Phrase / Mnemonic для Exodus):</b>
+            </p>
+            <div class="word-grid">
+              {% for idx, word in w.secrets.words %}
+                <div class="word-pill"><span>{{ idx }}.</span>{{ word }}</div>
+              {% endfor %}
+            </div>
+            <div style="margin:10px 0 16px;" class="toolbar">
+              <code id="mnem-{{ w.name }}" style="padding:8px 12px; font-size:14px;">{{ w.secrets.mnemonic }}</code>
+              <button type="button" onclick="copyText('{{ w.secrets.mnemonic }}', this)">📋 Скопировать все 12 слов</button>
+            </div>
+          {% else %}
+            <p style="color:var(--warning);">Этот кошелёк был импортирован только по приватному ключу (без 12 слов). Используй приватный ключ ниже для импорта в Exodus Desktop или Rabby/MetaMask.</p>
+          {% endif %}
+
+          <p style="margin:10px 0 6px; font-size:14px;">
+            <b>2. Приватный ключ (Private Key hex — для импорта одного адреса в Exodus на ПК / Rabby / MetaMask):</b>
+          </p>
+          <div class="toolbar">
+            <code style="padding:8px 12px; font-size:13.5px;">{{ w.secrets.private_key }}</code>
+            <button type="button" class="btn-secondary" onclick="copyText('{{ w.secrets.private_key }}', this)">📋 Скопировать приватный ключ</button>
+          </div>
+          <div style="margin-top:8px; font-size:12px; color:var(--muted);">
+            Стандартный путь деривации BIP-44: <code>{{ w.secrets.derivation_path }}</code> (совпадает с Exodus, Trust Wallet, Rabby и MetaMask).
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  {% endfor %}
+
+  <!-- Создание нового / Импорт существующего кошелька -->
+  <div class="grid-2">
+    <div class="card">
+      <h2>➕ Создать ещё один кошелёк</h2>
+      <p class="subtle">Генерирует новый адрес <code>0x…</code> и 12 английских слов (BIP-39) для Exodus.</p>
+      <form method="post" action="/wallets/create">
+        <div style="margin-bottom:12px;">
+          <label>Имя кошелька (латиницей, например: <code>exodus2</code> или <code>quests</code>)</label>
+          <input type="text" name="name" placeholder="exodus2" required>
+        </div>
+        <button type="submit">➕ Создать и показать 12 слов</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>📥 Подключить свой уже существующий кошелёк из Exodus</h2>
+      <p class="subtle">Если у тебя уже есть кошелёк в Exodus и ты хочешь, чтобы наш сервер проверял его на аирдропы — вставь его 12 слов или приватный ключ <code>0x…</code>.</p>
+      <form method="post" action="/wallets/import">
+        <div style="margin-bottom:10px;">
+          <label>Имя в панели (например: <code>my_exodus</code>)</label>
+          <input type="text" name="name" placeholder="my_exodus" required>
+        </div>
+        <div style="margin-bottom:12px;">
+          <label>12 слов через пробел ИЛИ приватный ключ <code>0x…</code></label>
+          <input type="password" name="secret_value" placeholder="word1 word2 ... word12  или  0x..." required>
+        </div>
+        <button type="submit" class="btn-secondary">📥 Импортировать и зашифровать</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Пошаговая инструкция как подключить в Exodus -->
+  <div class="card">
+    <h2>📱 Пошагово: Как подключить наш кошелёк себе в Exodus (и Rabby для сайтов)</h2>
+    <div class="grid-2" style="margin-top:12px;">
+      <div style="padding:16px; border:1px solid var(--border); border-radius:12px; background:rgba(12,19,29,.8);">
+        <h3>Вариант 1. В приложение Exodus на телефоне (iOS / Android)</h3>
+        <ol style="padding-left:18px; margin:8px 0; font-size:14px;">
+          <li>Скачай официальный <b>Exodus Crypto Bitcoin Wallet</b> из App Store или Google Play.</li>
+          <li>Выше на этой странице нажми <b>«🔑 Подключить в Exodus (показать 12 слов)»</b> напротив кошелька <code>main</code>.</li>
+          <li>В приложении Exodus на первом экране нажми <b>«I already have a wallet»</b> (У меня уже есть кошелёк) → введи по порядку <b>12 слов</b>, которые показала наша панель.</li>
+          <li>Готово! Включи в Exodus сети <b>Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain</b> — адрес в них будет точно таким же (<code>{{ wallets[0].address if wallets else '0x...' }}</code>).</li>
+        </ol>
+      </div>
+
+      <div style="padding:16px; border:1px solid var(--border); border-radius:12px; background:rgba(12,19,29,.8);">
+        <h3>Вариант 2. В Exodus на ПК + браузерный кошелёк для кнопки «Claim»</h3>
+        <ol style="padding-left:18px; margin:8px 0; font-size:14px;">
+          <li><b>В Exodus Desktop (Windows / Mac):</b> если у тебя там ещё нет кошелька — выбери <i>Restore from 12-word phrase</i>. А если в Exodus уже есть другой твой кошелёк и ты не хочешь его заменять — открой в Exodus актив <b>Ethereum</b> → нажми на <b>три точки (⋯)</b> в правом верхнем углу → <b>Move Funds (Import Private Key)</b> и вставь наш приватный ключ <code>0x…</code>.</li>
+          <li><b>Совет для заработка на квестах (Layer3 / Galxe):</b> поставь в браузер Chrome расширение <b>Rabby Wallet</b> (<code>rabby.io</code>) или <b>MetaMask</b> и импортируй туда <b>те же самые 12 слов</b>. Тогда на сайтах квестов ты нажимаешь «Connect Wallet» через браузер, а все полученные монеты сразу видишь в своём <b>Exodus</b>!</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+{% endblock %}

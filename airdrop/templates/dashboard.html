@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}0x4 · Мониторинг 4 сервисов и Дашборд (:1111){% endblock %}
+{% block content %}
+  <h1>🚀 Центр управления и мониторинга проекта 0x4</h1>
+  <p class="subtle">
+    Все 4 сервиса (эта панель <code>:1111</code>, панель Telegram-фермы <code>:8080</code>, фоновый агент 24/7 и Telegram-бот) управляются отсюда.
+    Никаких сложных команд — просто иди по шагам ниже.
+  </p>
+
+  <!-- Сводка в цифрах -->
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-label">ГОТОВНОСТЬ ПРОЕКТА</div>
+      <div class="stat-value" style="color: var(--accent)">{{ forecast.readiness_pct }}%</div>
+      <small>Шагов чек-листа: {{ forecast.done_steps }} / {{ forecast.total_steps }}</small>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">НАШИ КОШЕЛЬКИ (ДЛЯ EXODUS)</div>
+      <div class="stat-value">{{ wallets|length }}</div>
+      <small><a href="/wallets">Открыть и забрать 12 слов →</a></small>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">ВОЗМОЖНОСТЕЙ В БАЗЕ</div>
+      <div class="stat-value">{{ stats.projects }}</div>
+      <small>Новых: {{ stats.new_projects }} · В работе: {{ forecast.watching_count }}</small>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">ПРОГНОЗ НА 1 МЕСЯЦ (1 Ч/ДЕНЬ)</div>
+      <div class="stat-value" style="color: var(--success)">${{ forecast.horizons[2].min }}–${{ forecast.horizons[2].max }}</div>
+      <small><a href="/forecast">Открыть полный расчёт и 5 направлений →</a></small>
+    </div>
+  </div>
+
+  <!-- Мониторинг всех 4 сервисов -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:14px;">
+      <div>
+        <h2>🖥 Мониторинг 4 сервисов сервера</h2>
+        <div class="subtle" style="margin:0;">Панель :1111 + остальные 3 сервиса работают параллельно и не мешают друг другу</div>
+      </div>
+      <div class="toolbar">
+        <form method="post" action="/scan/run" style="display:inline;">
+          <input type="hidden" name="mode" value="online">
+          <input type="hidden" name="return_to" value="/">
+          <button type="submit">🔎 Запустить живой поиск сейчас</button>
+        </form>
+        <form method="post" action="/scan/run" style="display:inline;">
+          <input type="hidden" name="mode" value="offline">
+          <input type="hidden" name="return_to" value="/">
+          <button type="submit" class="btn-secondary">⚡ Обновить быстрые $0 квесты</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      {% for svc in services %}
+        <div style="padding:16px; border:1px solid var(--border); border-radius:14px; background:rgba(13,20,30,.85);">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+            <div>
+              <span style="color:var(--muted); font-size:12px; font-weight:700;">СЕРВИС #{{ svc.number }}</span>
+              <h3 style="margin:2px 0 6px;">{{ svc.title }}</h3>
+            </div>
+            <span class="badge {{ svc.status_color }}">{{ svc.status_label }}</span>
+          </div>
+          <p style="font-size:13px; color:var(--muted); margin:6px 0 12px;">{{ svc.detail }}</p>
+          {% if svc.pids %}
+            <div style="font-size:12px; color:#8fa4bd; margin-bottom:10px;">PID: <code>{{ svc.pids|join(', ') }}</code></div>
+          {% endif %}
+          {% if svc.controllable %}
+            <div class="toolbar">
+              <form method="post" action="/services/action">
+                <input type="hidden" name="service" value="{{ svc.id }}">
+                <input type="hidden" name="action" value="start">
+                <button type="submit" class="btn-secondary">▶️ Запустить / Перезапустить</button>
+              </form>
+              {% if svc.id == 'airdrop-agent' %}
+                <form method="post" action="/services/action">
+                  <input type="hidden" name="service" value="{{ svc.id }}">
+                  <input type="hidden" name="action" value="pause_toggle">
+                  <button type="submit" class="btn-secondary">{% if paused %}▶️ Снять с паузы{% else %}⏸ Пауза{% endif %}</button>
+                </form>
+              {% endif %}
+              {% if svc.running %}
+                <form method="post" action="/services/action">
+                  <input type="hidden" name="service" value="{{ svc.id }}">
+                  <input type="hidden" name="action" value="stop">
+                  <button type="submit" class="btn-danger">⏹ Стоп</button>
+                </form>
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Чек-лист новичка + Быстрое подключение кошелька в Exodus -->
+  <div class="grid-2">
+    <div class="card">
+      <h2>✅ Пошаговый план «Что мне делать прямо сейчас»</h2>
+      <p class="subtle">Нажимай на кнопку слева от шага, когда выполнишь его — прогресс сохраняется.</p>
+      {% for item in checklist %}
+        <div class="step-item {% if item.done %}done{% endif %}">
+          <form method="post" action="/checklist/toggle" style="margin:0;">
+            <input type="hidden" name="item_id" value="{{ item.id }}">
+            <input type="hidden" name="return_to" value="/">
+            <button type="submit" class="{% if item.done %}btn{% else %}btn-secondary{% endif %}" style="padding:6px 11px;">
+              {% if item.done %}✓ Готово{% else %}○ Отметить{% endif %}
+            </button>
+          </form>
+          <div>
+            <div style="font-weight:700; {% if item.done %}text-decoration:line-through; color:#9de8c8;{% endif %}">{{ item.title }}</div>
+            <div style="font-size:13px; color:var(--muted); margin-top:3px;">{{ item.detail }}</div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="card">
+      <h2>👛 Наши кошельки (готовы к подключению в Exodus)</h2>
+      <p class="subtle">Мы уже создали и зашифровали для тебя рабочий кошелёк. Нажми кнопку, чтобы получить 12 слов и вставить их в Exodus.</p>
+      {% for w in wallets %}
+        <div style="padding:14px; border:1px solid var(--border); border-radius:12px; background:rgba(11,18,28,.9); margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <strong>Кошелёк «{{ w.name }}»</strong>
+            <span class="badge success">AES-256-GCM</span>
+          </div>
+          <div style="margin:8px 0;">
+            <code>{{ w.address }}</code>
+          </div>
+          <div class="toolbar">
+            <button type="button" class="btn-secondary" onclick="copyText('{{ w.address }}', this)">📋 Скопировать адрес</button>
+            <a class="btn" href="/wallets?reveal={{ w.name }}">🔑 Подключить в Exodus (12 слов / ключ)</a>
+            <a class="btn btn-secondary" href="{{ w.debank_url }}" target="_blank">DeBank ↗</a>
+          </div>
+        </div>
+      {% endfor %}
+
+      <hr style="border:0; border-top:1px solid var(--border); margin:18px 0;">
+      <h3>✈️ Быстрое подключение Telegram-бота (Сервис #4)</h3>
+      <p style="font-size:13px; color:var(--muted);">
+        1. Напиши в Telegram официальному <b>@BotFather</b> команду <code>/newbot</code> и скопируй токен.<br>
+        2. Узнай свой цифровой ID у <b>@userinfobot</b> и вставь оба поля сюда:
+      </p>
+      <form method="post" action="/bot/configure">
+        <div style="margin-bottom:10px;">
+          <label>Токен бота от @BotFather (AIRDROP_BOT_TOKEN)</label>
+          <input type="password" name="bot_token" placeholder="{% if bot_token_set %}Уже сохранён (вставьте новый, чтобы заменить){% else %}123456789:AAH...{% endif %}">
+        </div>
+        <div style="margin-bottom:12px;">
+          <label>Твой числовой Telegram ID (AIRDROP_ADMIN_IDS)</label>
+          <input type="text" name="admin_ids" value="{{ bot_admin_ids }}" placeholder="Например: 512345678">
+        </div>
+        <button type="submit">💾 Сохранить и запустить Telegram-бота</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Лучшие возможности + Лог -->
+  <div class="grid-2">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <h2>🔥 Топ возможностей сейчас (Быстрые $ + Аирдропы)</h2>
+        <a href="/drops">Все находки ({{ stats.projects }}) →</a>
+      </div>
+      {% for row in top_drops %}
+        <div style="padding:12px 14px; border:1px solid var(--border); border-radius:12px; margin-bottom:10px; background:rgba(13,20,30,.75);">
+          <div style="display:flex; justify-content:space-between; gap:8px;">
+            <strong>{{ row.name }}</strong>
+            <span class="badge blue">Скор {{ "%.1f"|format(row.score) }}</span>
+          </div>
+          <div style="font-size:13px; color:var(--muted); margin:5px 0 9px;">{{ row.summary }}</div>
+          <div class="toolbar">
+            {% if row.url %}
+              <a class="btn btn-secondary" href="{{ row.url }}" target="_blank">🌐 Открыть сайт ↗</a>
+            {% endif %}
+            <form method="post" action="/drops/status" style="margin:0;">
+              <input type="hidden" name="slug" value="{{ row.slug }}">
+              <input type="hidden" name="status" value="watching">
+              <input type="hidden" name="return_to" value="/">
+              <button type="submit" class="btn-secondary">✅ В работу</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="card">
+      <h2>📜 Живой журнал агента</h2>
+      <p class="subtle">Последние события поиска и проверок на сервере:</p>
+      <pre>{{ agent_log }}</pre>
+    </div>
+  </div>
+{% endblock %}

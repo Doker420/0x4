@@ -2,6 +2,11 @@
 .env
 farm_config.json
 system_prompt.txt
+config/airdrops.json
+config/contracts.json
+*.keystore
+*.key
+*.pem
 
 # Telegram sessions and user data
 sessions/

@@ -1,0 +1,48 @@
+services:
+  panel:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: airdrop-panel
+    restart: unless-stopped
+    ports:
+      - "1111:1111"
+    env_file:
+      - ../.env
+    environment:
+      - AIRDROP_PANEL_HOST=0.0.0.0
+      - AIRDROP_PANEL_PORT=1111
+      - AIRDROP_AUTOSTART_SIBLINGS=0
+    volumes:
+      - ../config:/app/config:ro
+      - agent-data:/app/data
+    command: ["python", "airdrop_web.py"]
+
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: airdrop-agent
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../config:/app/config:ro
+      - agent-data:/app/data
+    command: ["python", "-m", "airdrop.agent", "--loop"]
+
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: airdrop-bot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../config:/app/config:ro
+      - agent-data:/app/data
+    command: ["python", "bot_airdrop.py"]
+
+volumes:
+  agent-data:
