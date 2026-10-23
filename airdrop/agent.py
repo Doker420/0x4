@@ -44,14 +44,39 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 async def discovery_pass(offline: bool = False) -> Dict[str, Any]:
     report = await run_discovery(offline=offline)
-    fresh = [item for item in report.items if item.slug in report.new_slugs]
-    await notifier.new_drops(fresh)
-    if fresh:
-        await db.mark_notified([item.slug for item in fresh])
-    log.info("discovery: %s items, %s new, errors=%s", report.total, len(report.new_slugs), report.source_errors)
+
+    # Durable notification outbox: if Telegram is not configured or temporarily
+    # unavailable, leave rows unmarked and retry on a later scheduled pass.
+    pending = await db.pending_notifications()
+    from .models import Airdrop
+    messages = [
+        Airdrop(
+            name=row.get("name", ""),
+            url=row.get("url", ""),
+            source=row.get("source", ""),
+            chain=row.get("chain", ""),
+            category=row.get("category", ""),
+            score=float(row.get("score", 0) or 0),
+            summary=row.get("summary", ""),
+            deadline=row.get("deadline"),
+        )
+        for row in pending
+    ]
+    delivered = await notifier.new_drops(messages)
+    # Only mark as notified when every pending item was delivered to at least one
+    # configured admin. With no bot token, all items remain queued for retry.
+    if messages and delivered >= len(messages):
+        await db.mark_notified([row["slug"] for row in pending])
+
+    log.info(
+        "discovery: %s items, %s new, %s pending alerts delivered, errors=%s",
+        report.total, len(report.new_slugs), delivered, report.source_errors,
+    )
     return {
         "total": report.total,
         "new": len(report.new_slugs),
+        "alerts_delivered": delivered,
+        "alerts_pending": len(pending) if delivered < len(messages) else 0,
         "errors": report.source_errors,
         "offline": report.offline,
     }

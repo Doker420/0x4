@@ -34,7 +34,7 @@ class Notifier:
             self._bot = Bot(token=self.token)
         return self._bot
 
-    async def send(self, text: str, disable_preview: bool = True) -> int:
+    async def send(self, text: str, disable_preview: bool = True, reply_markup=None) -> int:
         """Send to every admin. Returns the number of successful deliveries."""
         if not self.enabled:
             log.info("notify skipped (no token/admins): %s", text[:200])
@@ -49,6 +49,7 @@ class Notifier:
                         chunk,
                         disable_web_page_preview=disable_preview,
                         parse_mode="HTML",
+                        reply_markup=reply_markup,
                     )
                     sent += 1
                 except Exception as exc:  # noqa: BLE001
@@ -56,19 +57,33 @@ class Notifier:
         return sent
 
     async def new_drops(self, items: Iterable[Airdrop]) -> int:
-        items = list(items)
-        if not items:
-            return 0
-        lines = ["🪂 <b>Новые кандидаты на аирдроп</b>"]
+        """Send actionable, human-in-the-loop alerts with a direct source link.
+
+        The agent never joins chats or performs tasks. The admin opens the source,
+        verifies it, and completes any allowed steps manually in their own account.
+        """
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        delivered = 0
         for item in items:
             chain = f" · {escape(item.chain)}" if item.chain else ""
-            lines.append(
-                f"\n<b>{escape(item.name)}</b> — {item.score:.1f}{chain}\n"
-                f"<i>{escape((item.summary or '')[:220])}</i>\n"
-                f"{escape(item.url)}"
+            source = escape(item.source or "public source")
+            text = (
+                "🪂 <b>Найдена возможность — требуется ручная проверка</b>\n\n"
+                f"<b>{escape(item.name)}</b> · score {item.score:.1f}{chain}\n"
+                f"Источник: {source}\n"
+                f"<i>{escape((item.summary or 'Описание отсутствует')[:500])}</i>\n\n"
+                "⚠️ Это кандидат, не подтверждение награды или eligibility. Проверьте домен, "
+                "официальные правила, региональные ограничения и комиссии. Не вводите seed-фразу."
             )
-        text = "\n".join(lines)
-        return await self.send(text)
+            markup = None
+            url = (item.url or "").strip()
+            if url.startswith(("https://", "http://")):
+                markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Открыть источник для ручной проверки ↗", url=url)]
+                ])
+            delivered += await self.send(text, reply_markup=markup)
+        return delivered
 
     async def eligibility(self, results: Iterable[object]) -> int:
         rows = [row for row in results if getattr(row, "eligible", False)]
