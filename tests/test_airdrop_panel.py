@@ -88,5 +88,6 @@ class PanelTestCase(unittest.IsolatedAsyncioTestCase):
 
         resp_g = await self._get("/guide")
         self.assertEqual(resp_g.status_code, 200)
-        self.assertIn("Exodus", resp_g.text)
-        self.assertIn("Rabby", resp_g.text)
+        self.assertIn("работает автоматически", resp_g.text)
+        self.assertIn("не нужно каждый день нажимать", resp_g.text)
+        self.assertIn("может быть", resp_g.text)

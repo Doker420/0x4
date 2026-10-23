@@ -84,6 +84,12 @@ fi
 if [ "${INSTALL_SYSTEMD:-1}" = "1" ] && command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
   RUN_USER="${SUDO_USER:-root}"
   RUN_GROUP="$(id -gn "$RUN_USER")"
+  # The systemd user must be able to read the private .env, write SQLite/logs,
+  # and update the passphrase file. Keep secrets private to that account.
+  chown "$RUN_USER:$RUN_GROUP" .env
+  chown -R "$RUN_USER:$RUN_GROUP" data
+  chmod 600 .env
+  chmod 700 data/airdrop data/airdrop/keystore
   for unit in airdrop-panel.service 0x4-web.service airdrop-agent.service airdrop-bot.service; do
     sed \
       -e "s|@USER@|${RUN_USER}|g" \
