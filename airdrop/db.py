@@ -186,6 +186,31 @@ async def get_project(slug: str) -> Optional[Dict[str, Any]]:
         await conn.close()
 
 
+async def remove_demo_projects() -> int:
+    """Remove fictional sample/fixture projects from a live database.
+
+    The offline fixture corpus is for tests only. Older panel versions could seed it
+    into production; remove those rows on startup without touching real discoveries.
+    """
+    conn = await connect()
+    try:
+        cur = await conn.execute(
+            """DELETE FROM projects
+               WHERE lower(source) = 'fixture'
+                  OR lower(url) LIKE '%example.com%'
+                  OR lower(url) LIKE '%example.org%'
+                  OR lower(url) LIKE '%example.net%'
+                  OR lower(url) LIKE '%example.test%'
+                  OR lower(name) LIKE 'example:%'
+                  OR lower(name) LIKE 'newchain%'
+                  OR lower(name) LIKE 'retrodrop demo%'"""
+        )
+        await conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        await conn.close()
+
+
 async def set_project_status(slug: str, status: str) -> bool:
     conn = await connect()
     try:

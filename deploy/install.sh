@@ -71,9 +71,8 @@ else:
     print("==> Кошельки в хранилище:", [w["name"] for w in wallet.list_wallets()])
 PY
 
-echo "==> Первичное наполнение базы находок"
-.venv/bin/python -m airdrop.agent --once --offline || true
-
+# Не загружаем фиктивные offline-примеры в production-базу.
+# Агент соберёт реальные результаты при первом online-проходе.
 # Открываем порты 1111 и 8080 в ufw, если файрвол включён
 if command -v ufw >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
   if ufw status | grep -q "Status: active"; then

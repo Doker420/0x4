@@ -104,7 +104,11 @@ def _update_env_vars(updates: Dict[str, str]) -> None:
 async def _on_startup() -> None:
     ensure_panel_passphrase()
     await db.init_db()
-    await forecast.seed_starter_opportunities()
+    # Purge records from older demo/offline builds so fictional fixture URLs never
+    # appear in the live operator's panel. Offline fixtures remain for tests only.
+    await db.remove_demo_projects()
+    # Do not seed the live database with fictional projects or test fixtures.
+    # Real findings are added only by the online discovery sources or operator config.
     # Ensure at least one starter wallet exists so the user immediately has a wallet for Exodus
     if not wallet.list_wallets():
         try:

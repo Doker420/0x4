@@ -295,35 +295,19 @@ async def build_project_forecast(
     time_factor = min(2.4, (hours / 1.0) ** 0.75)
     capital_factor = 1.0 + min(1.8, (budget / 50.0) ** 0.5) if budget > 0 else 1.0
 
-    # Day 1–2 (Quick Learn & Earn + Quests)
-    day_min = round(1.0 * min(1.5, time_factor), 1)
-    day_likely = round(4.0 * time_factor, 1)
-    day_max = round(15.0 * time_factor, 1)
-
-    # Week 1 (Quests + optional 0x4 micro-service order)
-    svc_week = 15.0 * min(1.5, time_factor) if include_services else 0.0
-    week_min = round(3.0 * time_factor, 0)
-    week_likely = round(12.0 * time_factor + svc_week, 0)
-    week_max = round(35.0 * time_factor + svc_week * 2, 0)
-
-    # Month 1 (Quests + Testnet/Raffle hits + L2 activity + 0x4 services)
-    svc_month = 60.0 * time_factor if include_services else 0.0
-    month_min = round(15.0 * time_factor, 0)
-    month_likely = round((35.0 * time_factor * capital_factor) + svc_month, 0)
-    month_max = round((120.0 * time_factor * capital_factor) + svc_month * 2.2, 0)
-
-    # 3–6 Months (Retro airdrops TGE + accumulated points seasons + steady streams)
-    half_year_min = round(month_min * 3.5, 0)
-    half_year_likely = round(month_likely * 4.2 + (120.0 * capital_factor), 0)
-    half_year_max = round(month_max * 4.5 + (450.0 * capital_factor), 0)
+    # There is no defensible income estimate for airdrops, quests, or freelance work.
+    # A zero floor is honest: rewards may be unavailable, restricted, or never paid.
+    day_min = day_likely = 0
+    day_max = 0
+    week_min = week_likely = week_max = 0
+    month_min = month_likely = month_max = 0
+    half_year_min = half_year_likely = half_year_max = 0
 
     verdict = (
-        "Проект полностью рабочий: у тебя есть 24/7 сервер-радар (144.31.25.24), зашифрованное хранилище кошельков "
-        "с экспортом в Exodus и панель управленияTelegram-аккаунтами. "
-        "Главный секрет: НЕ ждать месяцами только один аирдроп, а совместить 3 корзины — "
-        "① быстрые $1–$15 на Learn & Earn и квестах уже на этой неделе, "
-        "② 15 минут в день на отбор топ-проектов с радара в работу, "
-        "③ при желании — платная настройка/модерация через панель :8080 для быстрых $20–$50."
+        "Панель показывает инструменты поиска и проверки, но не гарантирует найденные раздачи, "
+        "выплаты, доступность Learn & Earn или клиентов. До фактического получения средств "
+        "реалистичная гарантированная сумма — $0. Все предложения нужно проверять на официальных "
+        "сайтах; комиссии, ограничения по стране и риск потери средств учитывайте отдельно."
     )
 
     return {

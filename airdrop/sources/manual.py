@@ -45,6 +45,14 @@ class ManualSource(Source):
         out: List[Airdrop] = []
         for row in self._rows():
             name = clean_text(row.get("name") or row.get("project") or "", 80)
+            url = clean_text(row.get("url") or row.get("claim_url") or "", 300)
+            claim_url = clean_text(row.get("claim_url") or "", 300)
+            # Never surface documentation placeholders as live opportunities, even if
+            # an old deployment copied the example config into a real config file.
+            combined_urls = f"{url} {claim_url}".lower()
+            if any(marker in combined_urls for marker in ("example.com", "example.org", "example.net", "example.test")):
+                log.warning("skipping placeholder project URL in %s: %s", self.path, name)
+                continue
             if not name:
                 continue
             out.append(
